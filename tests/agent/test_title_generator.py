@@ -318,3 +318,205 @@ class TestRuntimeValidator:
             assert called.wait(timeout=10), "auto_title thread never ran"
             kwargs = mock_auto.call_args.kwargs
             assert kwargs["runtime_validator"] is _v
+
+
+class TestDisposableProbeDetection:
+    """Tests for _is_disposable_probe and auto-archive of PONG/smoke sessions."""
+
+    @pytest.mark.parametrize("req", [
+        "Say PONG",
+        "Say only: PONG",
+        "Say only the word: PONG",
+        "Say only the word PONG",
+        "Say only the word PONG. Do not explain.",
+        "Say only the word PONG. No tools, no explanation. Just PONG.",
+        "Say only the word PONG. Do not call any tools. Do not do anything else.",
+        "Reply with exactly: PONG",
+        "Reply exactly: PONG",
+        "Reply only: PONG",
+        "reply with exactly: pong",
+        "say PONG",
+    ])
+    def test_is_pong_probe_request_matches_variants(self, req):
+        from agent.title_generator import _is_pong_probe_request
+        assert _is_pong_probe_request(req) is True
+
+    @pytest.mark.parametrize("req", [
+        "Always archive chats that have the session say pong",
+        "Why do chats say PONG?",
+        "Implement PONG handling for the gateway",
+        "Please debug why PONG isn't being sent",
+        "Fix the PONG auto-archive workflow",
+        "How do I configure PONG probes?",
+        "Explain what the smoke test HERMES_DEFAULT_SMOKE_OK does",
+        "",
+        "Hello, can you help me?",
+        "What is PONG?",
+    ])
+    def test_is_pong_probe_request_rejects_real_work(self, req):
+        from agent.title_generator import _is_pong_probe_request
+        assert _is_pong_probe_request(req) is False
+
+    @pytest.mark.parametrize("req", [
+        "Reply exactly: HERMES_DEFAULT_SMOKE_OK",
+        "Reply with exactly: HERMES_MOA_SMOKE_OK",
+        "Respond only: HERMES_CHEAP_SMOKE_OK",
+    ])
+    def test_is_smoke_probe_request_matches(self, req):
+        from agent.title_generator import _is_smoke_probe_request
+        assert _is_smoke_probe_request(req) is True
+
+    @pytest.mark.parametrize("resp", [
+        "PONG",
+        "pong",
+        "Session ID: abc-123\n\nPONG",
+        "Session ID: abc-123\nPONG",
+    ])
+    def test_is_pong_probe_response_matches(self, resp):
+        from agent.title_generator import _is_pong_probe_response
+        assert _is_pong_probe_response(resp) is True
+
+    @pytest.mark.parametrize("resp", [
+        "PONG. I'm here and responsive.",
+        "PONG!\n\nLet me know what you need.",
+        "Session ID: abc\n\nPong. I'm here.",
+        "",
+        "The answer is PONG",
+    ])
+    def test_is_pong_probe_response_rejects_non_bare(self, resp):
+        from agent.title_generator import _is_pong_probe_response
+        assert _is_pong_probe_response(resp) is False
+
+    @pytest.mark.parametrize("resp", [
+        "HERMES_DEFAULT_SMOKE_OK",
+        "Session ID: abc\n\nHERMES_MOA_SMOKE_OK",
+    ])
+    def test_is_smoke_probe_response_matches(self, resp):
+        from agent.title_generator import _is_smoke_probe_response
+        assert _is_smoke_probe_response(resp) is True
+
+    def test_is_disposable_probe_pong(self):
+        from agent.title_generator import _is_disposable_probe
+        assert _is_disposable_probe("Say only the word: PONG", "PONG") is True
+        assert _is_disposable_probe("Say only the word: PONG", "Session ID: x\n\nPONG") is True
+
+    def test_is_disposable_probe_smoke(self):
+        from agent.title_generator import _is_disposable_probe
+        assert _is_disposable_probe(
+            "Reply exactly: HERMES_DEFAULT_SMOKE_OK",
+            "HERMES_DEFAULT_SMOKE_OK",
+        ) is True
+
+    def test_is_disposable_probe_rejects_real_work(self):
+        from agent.title_generator import _is_disposable_probe
+        # Real discussion about PONG archiving — must NOT be treated as probe
+        assert _is_disposable_probe(
+            "Always archive chats that have the session say pong",
+            "I'll archive all PONG sessions.",
+        ) is False
+
+    def test_is_disposable_probe_requires_response(self):
+        """Probe sent but no/empty response — not disposable yet."""
+        from agent.title_generator import _is_disposable_probe
+        assert _is_disposable_probe("Say only the word: PONG", "") is False
+        assert _is_disposable_probe("Say only the word: PONG", None) is False  # type: ignore[arg-type]
+
+
+class TestMaybeAutoTitleArchivesProbes:
+    """maybe_auto_title() must archive disposable probe sessions."""
+
+    def test_archives_pong_probe_and_skips_title(self):
+        """A PONG probe session is archived and the title worker is NOT started."""
+        db = MagicMock()
+        db.set_session_archived = MagicMock(return_value=True)
+        history = [
+            {"role": "user", "content": "Say only the word: PONG"},
+            {"role": "assistant", "content": "PONG"},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(
+                db, "sess-1",
+                "Say only the word: PONG", "PONG",
+                history,
+            )
+            import time
+            time.sleep(0.1)
+            mock_auto.assert_not_called()
+        db.set_session_archived.assert_called_once_with("sess-1", True)
+
+    def test_archives_smoke_probe_and_skips_title(self):
+        db = MagicMock()
+        db.set_session_archived = MagicMock(return_value=True)
+        history = [
+            {"role": "user", "content": "Reply exactly: HERMES_DEFAULT_SMOKE_OK"},
+            {"role": "assistant", "content": "HERMES_DEFAULT_SMOKE_OK"},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(
+                db, "sess-1",
+                "Reply exactly: HERMES_DEFAULT_SMOKE_OK",
+                "HERMES_DEFAULT_SMOKE_OK",
+                history,
+            )
+            import time
+            time.sleep(0.1)
+            mock_auto.assert_not_called()
+        db.set_session_archived.assert_called_once_with("sess-1", True)
+
+    def test_does_not_archive_real_work_session(self):
+        """A real discussion mentioning PONG must NOT be archived."""
+        db = MagicMock()
+        history = [
+            {"role": "user", "content": "Always archive PONG sessions"},
+            {"role": "assistant", "content": "I'll set that up."},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(
+                db, "sess-1",
+                "Always archive PONG sessions", "I'll set that up.",
+                history,
+            )
+            assert called.wait(timeout=10)
+        db.set_session_archived.assert_not_called()
+
+    def test_archive_failure_does_not_crash(self):
+        """If set_session_archived raises, maybe_auto_title must not crash."""
+        db = MagicMock()
+        db.set_session_archived.side_effect = RuntimeError("DB locked")
+        history = [
+            {"role": "user", "content": "Say only the word: PONG"},
+            {"role": "assistant", "content": "PONG"},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            # Must not raise
+            maybe_auto_title(
+                db, "sess-1",
+                "Say only the word: PONG", "PONG",
+                history,
+            )
+            import time
+            time.sleep(0.1)
+            mock_auto.assert_not_called()
+
+    def test_pong_probe_with_session_banner_archives(self):
+        """PONG response with the Session ID banner is still recognized."""
+        db = MagicMock()
+        db.set_session_archived = MagicMock(return_value=True)
+        history = [
+            {"role": "user", "content": "Say only the word: PONG"},
+            {"role": "assistant", "content": "Session ID: sess-1\n\nPONG"},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(
+                db, "sess-1",
+                "Say only the word: PONG",
+                "Session ID: sess-1\n\nPONG",
+                history,
+            )
+            import time
+            time.sleep(0.1)
+            mock_auto.assert_not_called()
+        db.set_session_archived.assert_called_once_with("sess-1", True)
