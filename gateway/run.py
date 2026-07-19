@@ -94,6 +94,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
+    r"|summarizing\s+earlier\s+conversation\s+so\s+i\s+can\s+continue"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
     # Buffered attempt/overflow retry chatter replayed through _emit_status
