@@ -978,6 +978,17 @@ def run_doctor(args):
                 _resolve_auth_provider = None
                 pass
             try:
+                from hermes_cli.provider_catalog import provider_catalog as _provider_catalog
+                from hermes_cli.models import normalize_provider as _normalize_picker_provider
+
+                # The picker catalog is the supported provider universe. It
+                # includes credential-free virtual providers such as MoA that
+                # intentionally do not belong in PROVIDER_REGISTRY.
+                known_providers.update(item.slug for item in _provider_catalog())
+            except Exception:
+                _normalize_picker_provider = None
+                pass
+            try:
                 from hermes_cli.config import get_compatible_custom_providers as _compatible_custom_providers
                 from hermes_cli.providers import (
                     normalize_provider as _normalize_catalog_provider,
@@ -1012,6 +1023,8 @@ def run_doctor(args):
 
             valid_provider_ids = set(known_providers)
             provider_ids_to_accept = {provider} if provider else set()
+            if provider and _normalize_picker_provider is not None:
+                provider_ids_to_accept.add(_normalize_picker_provider(provider))
             if _normalize_catalog_provider is not None:
                 for known_provider in known_providers:
                     try:
@@ -1031,7 +1044,7 @@ def run_doctor(args):
                 except Exception:
                     runtime_provider = provider
 
-            catalog_provider = provider
+            catalog_provider = None
             if (
                 provider
                 and _resolve_provider_full is not None
@@ -1043,9 +1056,8 @@ def run_doctor(args):
                     provider_ids_to_accept.add(catalog_provider)
 
             if provider and provider != "auto":
-                if catalog_provider is None or (
-                    known_providers
-                    and not (provider_ids_to_accept & valid_provider_ids)
+                if catalog_provider is None and not (
+                    provider_ids_to_accept & valid_provider_ids
                 ):
                     known_list = ", ".join(sorted(known_providers)) if known_providers else "(unavailable)"
                     _fail_and_issue(
@@ -2221,7 +2233,8 @@ def run_doctor(args):
             if r.status_code == 200:
                 return _ConnectivityResult(
                     "Anthropic API",
-                    [(color("✓", Colors.GREEN), "Anthropic API", "")],
+                    [(color("✓", Colors.GREEN), "Anthropic API",
+                      color("(models endpoint only; inference/credits not tested)", Colors.DIM))],
                     [],
                 )
             if r.status_code == 401:
