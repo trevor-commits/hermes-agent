@@ -31,6 +31,8 @@ support.
 
 import json
 import logging
+import re
+import time
 from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
@@ -76,6 +78,28 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+
+_CROSS_AGENT_SESSION_ID_PATTERNS = (
+    re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I),
+    re.compile(r"^019[0-9a-z]{20,}$", re.I),
+    re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$", re.I),
+)
+
+
+def _chat_source_redirect_hint(value: str) -> Optional[str]:
+    """Return a local routing hint when an ID-shaped session lookup misses."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    if not any(pattern.match(candidate) for pattern in _CROSS_AGENT_SESSION_ID_PATTERNS):
+        return None
+    return (
+        "This looks like a cross-agent session/chat ID. If Hermes session_search "
+        "does not resolve it, run `/Users/gillettes/.codex/scripts/chat-source "
+        f"describe {candidate}`. If that still misses, run "
+        "`/Users/gillettes/.codex/scripts/chat-source doctor` before concluding "
+        "the provider has no record."
+    )
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -392,24 +416,38 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     full, large ones return the first ``head`` and last ``tail`` messages with a
     pointer to scroll the middle.
     """
+    started = time.perf_counter()
     try:
         meta = db.get_session(session_id) or {}
     except Exception as e:
         logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
         meta = {}
     if not meta:
+        hint = _chat_source_redirect_hint(session_id)
+        if hint:
+            return tool_error(
+                f"session_id not found: {session_id}",
+                success=False,
+                chat_source_hint=hint,
+            )
         return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
-        rows = db.get_messages(session_id)
+        if hasattr(db, "get_message_edges"):
+            edge_view = db.get_message_edges(session_id, head=head, tail=tail)
+            rows = edge_view["rows"]
+            total = edge_view["total"]
+            truncated = edge_view["truncated"]
+        else:
+            rows = db.get_messages(session_id)
+            total = len(rows)
+            truncated = total > head + tail
+            rows = rows[:head] + rows[-tail:] if truncated else rows
     except Exception as e:
-        logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
+        logging.error("failed to load session edge view for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
 
-    shaped = [_shape_message(m) for m in rows]
-    total = len(shaped)
-    truncated = total > head + tail
-    window = shaped[:head] + shaped[-tail:] if truncated else shaped
+    window = [_shape_message(m) for m in rows]
 
     response = {
         "success": True,
@@ -431,6 +469,14 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
             f"Session has {total} messages; showing first {head} + last {tail}. "
             "Pass around_message_id (any id above) to scroll the middle."
         )
+    logging.debug(
+        "session_search read session_id=%s total=%s returned=%s truncated=%s elapsed_ms=%.3f",
+        session_id,
+        total,
+        len(window),
+        truncated,
+        (time.perf_counter() - started) * 1000,
+    )
     return json.dumps(response, ensure_ascii=False)
 
 
@@ -995,7 +1041,10 @@ SESSION_SEARCH_SCHEMA = {
         "source currently contains. If the original source is inaccessible, say so "
         "and why before falling back to session history. Do not conclude 'not found' "
         "or 'no prior correspondence' from session_search alone when a direct source "
-        "was provided.\n\n"
+        "was provided. For Claude/Codex/Cursor/Hermes/Copilot chat IDs, use "
+        "`/Users/gillettes/.codex/scripts/chat-source describe <id>` first; use "
+        "`chat-source find <keywords>` when no exact ID is known and `chat-source "
+        "doctor` before treating a provider as absent.\n\n"
         "FOUR CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"

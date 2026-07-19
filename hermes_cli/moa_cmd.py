@@ -79,8 +79,17 @@ def _print_config(config: dict[str, Any]) -> None:
     cfg = normalize_moa_config(config.get("moa") if isinstance(config, dict) else {})
     print("Mixture of Agents presets")
     print(f"Default: {cfg['default_preset']}")
-    active = cfg.get("active_preset") or "(off)"
-    print(f"Active in config: {active}")
+    model = config.get("model") if isinstance(config, dict) else None
+    active = ""
+    active_detail = ""
+    if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() == "moa":
+        selected = str(model.get("default") or model.get("model") or "").strip()
+        preset = cfg["presets"].get(selected)
+        if preset is not None:
+            active = selected
+            if not preset.get("enabled", True):
+                active_detail = " (references disabled; aggregator only)"
+    print(f"Active in config: {active or '(off)'}{active_detail}")
     for name, preset in cfg["presets"].items():
         marker = "*" if name == cfg["default_preset"] else " "
         print(f"\n{marker} {name}")
