@@ -2,9 +2,14 @@
 
 Runs asynchronously after the first response is delivered so it never
 adds latency to the user-facing reply.
+
+Also auto-archives disposable probe sessions (strict PONG / smoke-token
+checks) so they never clutter the session list or consume an LLM title
+request. See :func:`_is_disposable_probe`.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -38,6 +43,120 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Write the title in {language}. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+# ── Synthetic bookkeeping message detection ───────────────────────────
+# Compression handoff messages, model-change announcements, and task-list
+# preservation notices arrive as role=user rows in the conversation history.
+# Using them verbatim produces garbage titles like "[CONTEXT COMPACTION …]".
+# These patterns detect them so they are skipped during title generation.
+
+_SYNTHETIC_USER_PATTERNS = (
+    re.compile(r"^\s*\[CONTEXT COMPACTION\b", re.IGNORECASE),
+    re.compile(r"^\s*\[PRIOR CONTEXT\b", re.IGNORECASE),
+    re.compile(r"^\s*\[System:\s*The active model for this chat has changed\b", re.IGNORECASE),
+    re.compile(r"^\s*\[Your active task list was preserved across context compression\]", re.IGNORECASE),
+)
+
+
+def _is_synthetic_title_source(text: str) -> bool:
+    """Return True for injected bookkeeping messages that should not title chats."""
+    snippet = (text or "").strip()
+    if not snippet:
+        return True
+    return any(pattern.search(snippet) for pattern in _SYNTHETIC_USER_PATTERNS)
+
+
+# ── Disposable probe detection ────────────────────────────────────────
+# Probes (PONG checks, smoke-token checks) are sessions created only to
+# verify the agent is alive. They should be archived automatically rather
+# than titled and shown in the session list.
+#
+# Detection is deliberately NARROW: the request regex identifies messages
+# that are probe-like ("Say PONG", "Reply exactly: HERMES_SMOKE_OK"). The
+# true gate is the RESPONSE check — it must be a bare token. A real
+# discussion about PONG would never elicit a bare "PONG" response. This
+# two-part test (probe-like request + bare response) is what keeps it safe.
+
+_DISPOSABLE_PONG_REQUEST_RE = re.compile(
+    r"""^\s*
+    (?:say|reply|respond|return|output|print)
+    (?:\s+with)?
+    (?:\s+(?:only|exactly))*
+    \s*(?:(?:the\s+)?word\b)?
+    \s*:?\s*[\"']?pong[\"']?
+    \s*[.!]?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_DISPOSABLE_SMOKE_TOKEN_RE = re.compile(r"^HERMES_[A-Z0-9_]+_SMOKE_OK$", re.IGNORECASE)
+_DISPOSABLE_SMOKE_REQUEST_RE = re.compile(
+    r"""^\s*
+    (?:say|reply|respond|return|output|print)
+    (?:\s+with)?
+    (?:\s+(?:only|exactly))*
+    \s*(?:(?:the\s+)?(?:token|text|string|word)\b)?
+    \s*:?\s*[\"']?(HERMES_[A-Z0-9_]+_SMOKE_OK)[\"']?
+    \s*[.!]?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Sources that bypass title generation and auto-archive — forward-compatible
+# fast path for any future code that explicitly tags probe sessions.
+_SOURCE_BYPASS_SOURCES = frozenset({"probe", "health", "keepalive"})
+
+
+def _strip_probe_response_banner(text: str) -> str:
+    """Remove Hermes' first-response ``Session ID: …`` banner from probe replies."""
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^Session ID:\s*\S+\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned.strip("`").strip()
+
+
+def _is_pong_probe_request(text: str) -> bool:
+    """True for narrow disposable probe like 'say only the word PONG'."""
+    return bool(_DISPOSABLE_PONG_REQUEST_RE.match((text or "").strip()))
+
+
+def _is_pong_probe_response(text: str) -> bool:
+    """True when the assistant response is only PONG, allowing light markup."""
+    return _strip_probe_response_banner(text).upper() == "PONG"
+
+
+def _is_smoke_probe_request(text: str) -> bool:
+    """True for narrow Hermes smoke probes like HERMES_DEFAULT_SMOKE_OK."""
+    return bool(_DISPOSABLE_SMOKE_REQUEST_RE.match((text or "").strip()))
+
+
+def _is_smoke_probe_response(text: str) -> bool:
+    """True when the assistant response is only a Hermes smoke-test token."""
+    return bool(_DISPOSABLE_SMOKE_TOKEN_RE.match(_strip_probe_response_banner(text)))
+
+
+def _is_disposable_probe(user_message: str, assistant_response: str) -> bool:
+    """True if the first exchange is a disposable probe (PONG or smoke token).
+
+    Requires BOTH a probe-like request AND a bare expected response, so a
+    probe that was sent but not yet answered is NOT archived (the user may
+    still be interacting).
+    """
+    return (
+        _is_pong_probe_request(user_message) and _is_pong_probe_response(assistant_response)
+    ) or (
+        _is_smoke_probe_request(user_message) and _is_smoke_probe_response(assistant_response)
+    )
+
+
+def _first_real_user_message(conversation_history: list) -> Optional[str]:
+    """Find the first non-bookkeeping user message in the persisted history."""
+    for msg in conversation_history or []:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = str(msg.get("content") or "")
+        if not _is_synthetic_title_source(content):
+            return content
+    return None
 
 
 def _title_language() -> str:
@@ -343,19 +462,70 @@ def maybe_auto_title(
     Only generates a title when:
     - This appears to be the first user→assistant exchange
     - No title is already set
+
+    Also auto-archives disposable probe sessions (PONG / smoke-token checks)
+    so they never receive a title or clutter the session list.
     """
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
-    if user_msg_count > 2:
+    # Count REAL user messages in history to detect the first meaningful
+    # exchange. Compression handoffs and runtime bookkeeping messages can arrive
+    # as role=user rows; using them verbatim produces garbage titles like
+    # "Your active task list was...". Skip title generation until we see a real
+    # user request, and use that request as the title source.
+    real_user_messages = [
+        str(m.get("content") or "")
+        for m in (conversation_history or [])
+        if isinstance(m, dict)
+        and m.get("role") == "user"
+        and not _is_synthetic_title_source(str(m.get("content") or ""))
+    ]
+    if len(real_user_messages) > 2:
+        return
+    real_user_message = real_user_messages[0] if real_user_messages else None
+    if real_user_message is None:
+        if _is_synthetic_title_source(user_message):
+            return
+        real_user_message = user_message
+
+    # Source-field fast path: sessions explicitly tagged with a bypass source
+    # (probe, health, keepalive) skip title generation and auto-archive.
+    try:
+        row = session_db.get_session(session_id)
+        if row:
+            session_source = str(row.get("source", "")).strip()
+            if session_source in _SOURCE_BYPASS_SOURCES:
+                set_archived = getattr(session_db, "set_session_archived", None)
+                if set_archived is not None:
+                    set_archived(session_id, True)
+                    logger.debug("Auto-archived %s source session: %s", session_source, session_id)
+                return
+    except Exception:
+        pass  # best-effort — if we can't read source, fall through to regex
+
+    # Auto-archive disposable probe sessions (PONG / smoke-token checks)
+    # before spending an LLM title request on them. Detection is strict:
+    # both a probe-like request and a bare expected response are required.
+    # Runs on the caller thread (cheap, no I/O) so the probe is archived
+    # before the user sees it titled in the session list.
+    if _is_disposable_probe(real_user_message, assistant_response):
+        try:
+            set_archived = getattr(session_db, "set_session_archived", None)
+            if set_archived is not None:
+                set_archived(session_id, True)
+                logger.debug("Auto-archived disposable probe session: %s", session_id)
+            else:
+                logger.debug(
+                    "Disposable probe detected for %s but session_db lacks "
+                    "set_session_archived; not archiving",
+                    session_id,
+                )
+        except Exception:
+            logger.debug("Failed to archive disposable probe session", exc_info=True)
         return
 
-    # Config read comes after the cheap first-exchange guard so the file
+    # Config read comes after the guards so the file
     # isn't touched on every subsequent turn of a long session.
     if not _auto_title_enabled():
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
@@ -363,7 +533,7 @@ def maybe_auto_title(
 
     thread = threading.Thread(
         target=auto_title_session,
-        args=(session_db, session_id, user_message, assistant_response),
+        args=(session_db, session_id, real_user_message, assistant_response),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

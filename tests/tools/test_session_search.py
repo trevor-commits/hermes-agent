@@ -8,6 +8,7 @@ Three calling shapes:
 All run zero LLM calls.
 """
 import json
+import logging
 import time
 
 import pytest
@@ -16,6 +17,7 @@ from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
+    _chat_source_redirect_hint,
     _format_timestamp,
     _is_compacted_message,
     _is_compression_ended,
@@ -108,6 +110,17 @@ class TestSchema:
         assert "direct source" in desc
         assert "session_search as secondary" in desc
         assert "not found" in desc
+        assert "chat-source describe" in desc
+        assert "chat-source doctor" in desc
+
+    def test_cross_agent_id_hint_is_available(self):
+        hint = _chat_source_redirect_hint("15d4d81e-e088-44e2-b5ff-e6fa2188db22")
+        assert hint is not None
+        assert "chat-source describe" in hint
+        assert "chat-source doctor" in hint
+
+    def test_cross_agent_id_hint_ignores_plain_words(self):
+        assert _chat_source_redirect_hint("ghost") is None
 
 
 class TestHiddenSources:
@@ -479,6 +492,16 @@ class TestReadShape:
     def test_read_unknown_session_errors(self, db):
         result = json.loads(session_search(session_id="ghost", db=db))
         assert result["success"] is False
+        assert "chat_source_hint" not in result
+
+    def test_read_unknown_cross_agent_id_points_to_chat_source(self, db):
+        result = json.loads(session_search(
+            session_id="15d4d81e-e088-44e2-b5ff-e6fa2188db22",
+            db=db,
+        ))
+        assert result["success"] is False
+        assert "chat-source describe" in result["chat_source_hint"]
+        assert "chat-source doctor" in result["chat_source_hint"]
 
     def test_read_truncates_large_session(self, db):
         db.create_session("s_big", source="cli")
@@ -490,6 +513,52 @@ class TestReadShape:
         assert result["message_count"] == 50
         assert result["truncated"] is True
         assert len(result["messages"]) == 30  # head 20 + tail 10
+
+    def test_read_emits_debug_timing(self, db, caplog):
+        db.create_session("s_timed", source="cli")
+        db.append_message("s_timed", role="user", content="timed read")
+
+        with caplog.at_level(logging.DEBUG):
+            result = json.loads(session_search(session_id="s_timed", db=db))
+
+        assert result["success"] is True
+        assert "session_search read" in caplog.text
+        assert "session_id=s_timed" in caplog.text
+        assert "elapsed_ms=" in caplog.text
+
+    def test_read_uses_bounded_edge_loader_instead_of_full_transcript(self):
+        class EdgeOnlyDB:
+            def get_session(self, session_id):
+                assert session_id == "s_big"
+                return {
+                    "started_at": 1700000000,
+                    "source": "cli",
+                    "model": "test-model",
+                    "title": "Large transcript",
+                }
+
+            def get_message_edges(self, session_id, head=20, tail=10):
+                assert session_id == "s_big"
+                assert (head, tail) == (20, 10)
+                return {
+                    "rows": [
+                        {"id": i, "role": "user", "content": f"m{i}", "timestamp": i}
+                        for i in list(range(1, 21)) + list(range(91, 101))
+                    ],
+                    "total": 100,
+                    "truncated": True,
+                }
+
+            def get_messages(self, session_id):  # pragma: no cover - must not be called
+                raise AssertionError("read shape loaded the full transcript")
+
+        result = json.loads(session_search(session_id="s_big", db=EdgeOnlyDB()))
+
+        assert result["success"] is True
+        assert result["mode"] == "read"
+        assert result["message_count"] == 100
+        assert result["truncated"] is True
+        assert [m["id"] for m in result["messages"]] == list(range(1, 21)) + list(range(91, 101))
 
 
 # =========================================================================

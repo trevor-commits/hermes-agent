@@ -2747,6 +2747,28 @@ class TestDeleteAndExport:
         assert export["source"] == "cli"
         assert len(export["messages"]) == 2
 
+    def test_get_message_edges_loads_only_head_and_tail(self, db):
+        db.create_session(session_id="s_big", source="cli")
+        for i in range(50):
+            db.append_message("s_big", role="user", content=f"m{i}")
+
+        result = db.get_message_edges("s_big", head=3, tail=2)
+
+        assert result["total"] == 50
+        assert result["truncated"] is True
+        assert [m["content"] for m in result["rows"]] == ["m0", "m1", "m2", "m48", "m49"]
+
+    def test_get_message_edges_returns_full_small_session(self, db):
+        db.create_session(session_id="s_small", source="cli")
+        for i in range(4):
+            db.append_message("s_small", role="user", content=f"m{i}")
+
+        result = db.get_message_edges("s_small", head=3, tail=2)
+
+        assert result["total"] == 4
+        assert result["truncated"] is False
+        assert [m["content"] for m in result["rows"]] == ["m0", "m1", "m2", "m3"]
+
     def test_export_nonexistent(self, db):
         assert db.export_session("nope") is None
 
