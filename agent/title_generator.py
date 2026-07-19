@@ -15,6 +15,12 @@ Provenance (``derived`` < ``llm`` < ``user``) is enforced by the storage layer,
 so stage 2 can only ever replace stage 1, and neither can replace a name the
 user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
+
+Disposable probe sessions (strict PONG / smoke-token checks, or an explicit
+``probe`` / ``health`` / ``keepalive`` session source) are auto-archived
+instead of titled. Titling now runs at turn start, before a reply exists, so
+archive keys off the narrow request regex plus source tags. See
+:func:`_is_pong_probe_request` and :func:`_is_disposable_probe`.
 """
 
 import json
@@ -143,6 +149,108 @@ _MACHINE_PREFIXES = (
     # tui_gateway.server._MODEL_SWITCH_MARKER_PREFIX.
     "[System: The active model for this chat has changed to ",
 )
+
+
+# Disposable probes (PONG checks, smoke-token checks) exist only to verify the
+# agent is alive. They should be archived rather than titled and shown in the
+# session list.
+#
+# Detection is deliberately NARROW: the request regex identifies messages that
+# are probe-like ("Say PONG", "Reply exactly: HERMES_SMOKE_OK"). A real
+# discussion about PONG ("Why do chats say PONG?") does not match. Titling
+# now runs at turn start, before the assistant reply, so maybe_auto_title
+# archives on this request match (or an explicit session source tag). The
+# two-part request+response helper remains for callers that already have the
+# reply.
+_DISPOSABLE_PONG_REQUEST_RE = re.compile(
+    r"""^\s*
+    (?:say|reply|respond|return|output|print)
+    (?:\s+with)?
+    (?:\s+(?:only|exactly))*
+    \s*(?:(?:the\s+)?word\b)?
+    \s*:?\s*[\"']?pong[\"']?
+    \s*[.!]?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_DISPOSABLE_SMOKE_TOKEN_RE = re.compile(r"^HERMES_[A-Z0-9_]+_SMOKE_OK$", re.IGNORECASE)
+_DISPOSABLE_SMOKE_REQUEST_RE = re.compile(
+    r"""^\s*
+    (?:say|reply|respond|return|output|print)
+    (?:\s+with)?
+    (?:\s+(?:only|exactly))*
+    \s*(?:(?:the\s+)?(?:token|text|string|word)\b)?
+    \s*:?\s*[\"']?(HERMES_[A-Z0-9_]+_SMOKE_OK)[\"']?
+    \s*[.!]?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_SOURCE_BYPASS_SOURCES = frozenset({"probe", "health", "keepalive"})
+
+
+def _strip_probe_response_banner(text: str) -> str:
+    """Remove Hermes' first-response ``Session ID: …`` banner from probe replies."""
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^Session ID:\s*\S+\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned.strip("`").strip()
+
+
+def _is_pong_probe_request(text: str) -> bool:
+    """True for a narrow disposable probe like 'say only the word PONG'."""
+    return bool(_DISPOSABLE_PONG_REQUEST_RE.match((text or "").strip()))
+
+
+def _is_pong_probe_response(text: str) -> bool:
+    """True when the assistant response is only PONG, allowing light markup."""
+    return _strip_probe_response_banner(text).upper() == "PONG"
+
+
+def _is_smoke_probe_request(text: str) -> bool:
+    """True for a narrow Hermes smoke probe like HERMES_DEFAULT_SMOKE_OK."""
+    return bool(_DISPOSABLE_SMOKE_REQUEST_RE.match((text or "").strip()))
+
+
+def _is_smoke_probe_response(text: str) -> bool:
+    """True when the assistant response is only a Hermes smoke-test token."""
+    return bool(_DISPOSABLE_SMOKE_TOKEN_RE.match(_strip_probe_response_banner(text)))
+
+
+def _is_disposable_probe(user_message: str, assistant_response: str) -> bool:
+    """True if the first exchange is a disposable probe (PONG or smoke token).
+
+    Requires BOTH a probe-like request AND a bare expected response, so a
+    probe that was sent but not yet answered is not archived by this helper.
+    """
+    return (
+        _is_pong_probe_request(user_message) and _is_pong_probe_response(assistant_response)
+    ) or (
+        _is_smoke_probe_request(user_message) and _is_smoke_probe_response(assistant_response)
+    )
+
+
+def _is_probe_like_request(text: str) -> bool:
+    """True when the opening user text is itself a disposable probe request."""
+    return _is_pong_probe_request(text) or _is_smoke_probe_request(text)
+
+
+def _archive_session_best_effort(session_db, session_id: str, *, reason: str) -> None:
+    """Archive *session_id* if the store supports it. Never raises."""
+    try:
+        set_archived = getattr(session_db, "set_session_archived", None)
+        if set_archived is None:
+            logger.debug(
+                "Disposable probe detected for %s (%s) but session_db lacks "
+                "set_session_archived; not archiving",
+                session_id,
+                reason,
+            )
+            return
+        set_archived(session_id, True)
+        logger.debug("Auto-archived disposable probe session (%s): %s", reason, session_id)
+    except Exception:
+        logger.debug("Failed to archive disposable probe session", exc_info=True)
 
 
 def _title_language() -> str:
@@ -695,8 +803,35 @@ def maybe_auto_title(
 
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
+
+    Disposable PONG / smoke-token probes, and sessions tagged ``probe`` /
+    ``health`` / ``keepalive``, are archived instead of titled so they never
+    clutter the session list or spend an LLM title request.
     """
     if not session_db or not session_id or not user_message:
+        return
+
+    try:
+        row = session_db.get_session(session_id)
+        if row:
+            session_source = str(row.get("source", "") or "").strip()
+            if session_source in _SOURCE_BYPASS_SOURCES:
+                _archive_session_best_effort(
+                    session_db, session_id, reason=f"source={session_source}"
+                )
+                return
+    except Exception:
+        pass
+
+    last_assistant = ""
+    for msg in reversed(conversation_history or []):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            last_assistant = str(msg.get("content") or "")
+            break
+    if _is_probe_like_request(user_message) or (
+        last_assistant and _is_disposable_probe(user_message, last_assistant)
+    ):
+        _archive_session_best_effort(session_db, session_id, reason="probe-request")
         return
 
     # Count the real questions behind us to detect the opening turn.
