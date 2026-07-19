@@ -4083,16 +4083,47 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_stdio_log_paths(log_dir: Path, label: str) -> tuple[Path, Path]:
+    """Return launchd StandardOut/Error paths that launchd itself can open.
+
+    launchd opens stdio files *before* exec. When HERMES_HOME (and thus
+    ``log_dir``) resolves onto a removable ``/Volumes/...`` path, those opens
+    fail with exit 78 / EX_CONFIG and KeepAlive crash-loops with empty logs.
+    Move launchd stdio onto the internal disk in that case; the gateway's own
+    Python logger can still write rich logs under HERMES_HOME/logs.
+    """
+    resolved = Path(log_dir).expanduser()
+    try:
+        resolved = resolved.resolve()
+    except Exception:
+        pass
+    if str(resolved).startswith("/Volumes/"):
+        internal = Path.home() / "Library" / "Logs" / "hermes"
+        internal.mkdir(parents=True, exist_ok=True)
+        return (
+            internal / f"{label}.out.log",
+            internal / f"{label}.error.log",
+        )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return (Path(log_dir) / "gateway.log", Path(log_dir) / "gateway.error.log")
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
+    # EXCEPTION (macOS + removable HERMES_HOME): launchd cannot reliably use a
+    # WorkingDirectory on /Volumes (same class of failure as T7 stdio exit 78).
+    # Prefer the internal install root when HERMES_HOME is on an external volume.
+    hermes_home_path = get_hermes_home().resolve()
+    hermes_home = str(hermes_home_path)
     working_dir = _stable_service_working_dir()
-    hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    if hermes_home.startswith("/Volumes/"):
+        working_dir = str(PROJECT_ROOT)
+    log_dir = hermes_home_path / "logs"
     label = get_launchd_label()
+    stdout_path, stderr_path = _launchd_stdio_log_paths(log_dir, label)
     profile_arg = _profile_arg(hermes_home)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
@@ -4177,10 +4208,10 @@ def generate_launchd_plist() -> str:
     <integer>25</integer>
 
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
+    <string>{stdout_path}</string>
     
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{stderr_path}</string>
 </dict>
 </plist>
 """
