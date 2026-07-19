@@ -120,7 +120,7 @@ class _FakeAgent:
     def _cleanup_dead_connections(self):
         return False
 
-    def _emit_status(self, _msg):
+    def _emit_status(self, _msg, **_kwargs):
         pass
 
     def _replay_compression_warning(self):
