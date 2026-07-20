@@ -2688,13 +2688,6 @@ async function checkUpdates() {
       }
     }
 
-    // Passive SSH-official checks only know tip SHAs (ls-remote) — never
-    // fabricate a "1 commit behind". Recover the exact count via the GitHub
-    // compare API when possible; otherwise behind stays null ("update
-    // available, count unknown") and updateAvailable carries the signal.
-    // ahead_by === 0 with differing tips means the remote tip is reachable
-    // from our HEAD — a local carried commit sitting AHEAD, not behind:
-    // flagging that as an update nudges the user into wiping their work.
     const tipsEqual = Boolean(currentSha && currentSha === targetSha)
 
     const sshBehind = tipsEqual
