@@ -2489,11 +2489,22 @@ async function checkUpdates() {
       }
     }
 
+    // Keepers / local branches: HEAD tip != upstream tip even when fully
+    // up-to-date. Count missing commits after a quiet fetch (same semantics
+    // as the non-SSH path below).
+    let behind = currentSha && currentSha === targetSha ? 0 : 1
+    if (behind === 1) {
+      await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+      const countStr = await git(['rev-list', '--count', `HEAD..origin/${branch}`])
+      const n = Number.parseInt(countStr, 10)
+      if (Number.isFinite(n)) behind = n
+    }
+
     return {
       supported: true,
       branch,
       currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : 1,
+      behind,
       currentSha,
       targetSha,
       commits: [],
