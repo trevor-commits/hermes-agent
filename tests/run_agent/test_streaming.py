@@ -746,6 +746,12 @@ class TestStreamingFallback:
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_exhausted_transient_stream_error_propagates(self, mock_close, mock_create):
         """Transient stream errors retry first, then propagate after retries exhausted."""
+        from agent.root_task_budget import (
+            RootCallContext,
+            RootTaskBudget,
+            reset_root_call_context,
+            set_root_call_context,
+        )
         from run_agent import AIAgent
         import httpx
 
@@ -764,11 +770,26 @@ class TestStreamingFallback:
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
 
-        with pytest.raises(httpx.ConnectError, match="socket closed"):
-            agent._interruptible_streaming_api_call({})
+        events = []
+        budget = RootTaskBudget(
+            root_turn_id="stream-retries", max_total=3, closure_reserve=0,
+            receipt_sink=events.append,
+        )
+        token = set_root_call_context(
+            RootCallContext(budget=budget, session_id="session-stream", role="parent")
+        )
+        try:
+            with pytest.raises(httpx.ConnectError, match="socket closed"):
+                agent._interruptible_streaming_api_call({})
+        finally:
+            reset_root_call_context(token)
 
         # Should have retried 3 times (default HERMES_STREAM_RETRIES=2 → 3 attempts)
         assert mock_client.chat.completions.create.call_count == 3
+        assert budget.used == 3
+        assert [event["status"] for event in events] == [
+            "started", "failed", "started", "failed", "started", "failed",
+        ]
         assert mock_close.call_count >= 1
 
     @patch("run_agent.AIAgent._create_request_openai_client")
@@ -1915,6 +1936,12 @@ class TestBedrockIamStreamingFallback:
 
     def test_iam_denial_falls_back_inline_and_disables_streaming(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock tests")
+        from agent.root_task_budget import (
+            RootCallContext,
+            RootTaskBudget,
+            reset_root_call_context,
+            set_root_call_context,
+        )
         from botocore.exceptions import ClientError
 
         agent = self._make_bedrock_agent()
@@ -1938,15 +1965,30 @@ class TestBedrockIamStreamingFallback:
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
         }
 
-        with patch(
-            "agent.bedrock_adapter._get_bedrock_runtime_client",
-            return_value=client,
-        ):
-            response = agent._interruptible_streaming_api_call(
-                {"modelId": agent.model, "messages": []}
-            )
+        events = []
+        budget = RootTaskBudget(
+            root_turn_id="bedrock-fallback", max_total=2, closure_reserve=0,
+            receipt_sink=events.append,
+        )
+        token = set_root_call_context(
+            RootCallContext(budget=budget, session_id="session-bedrock", role="parent")
+        )
+        try:
+            with patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ):
+                response = agent._interruptible_streaming_api_call(
+                    {"modelId": agent.model, "messages": []}
+                )
+        finally:
+            reset_root_call_context(token)
 
         client.converse.assert_called_once()
+        assert budget.used == 2
+        assert [event["status"] for event in events] == [
+            "started", "failed", "started", "succeeded",
+        ]
         assert response.choices[0].message.content == "hi"
         assert getattr(agent, "_disable_streaming", False) is True
 

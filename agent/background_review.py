@@ -749,6 +749,8 @@ def _run_review_in_thread(
     *,
     review_memory: bool = False,
     review_skills: bool = False,
+    root_budget: Any = None,
+    origin_root_turn_id: str = "",
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -786,10 +788,7 @@ def _run_review_in_thread(
             f"{int(started_at * 1000)}-{uuid.uuid4().hex[:12]}"
         ),
         "session_id": str(getattr(agent, "session_id", "") or ""),
-        "root_turn_id": str(
-            getattr(getattr(agent, "root_task_budget", None), "root_turn_id", "")
-            or ""
-        ),
+        "root_turn_id": str(origin_root_turn_id or getattr(root_budget, "root_turn_id", "") or ""),
         "review_memory": bool(review_memory),
         "review_skills": bool(review_skills),
         "max_iterations": review_limit,
@@ -800,7 +799,6 @@ def _run_review_in_thread(
         # Review is optional and cannot enter the capacity reserved for parent
         # integration/verification. Skip before constructing another agent when
         # no optional physical-call slot remains.
-        root_budget = getattr(agent, "root_task_budget", None)
         optional_remaining = getattr(root_budget, "optional_remaining", None)
         if isinstance(optional_remaining, int) and optional_remaining < 1:
             receipt["status"] = "skipped"
@@ -902,7 +900,7 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
-                root_task_budget=getattr(agent, "root_task_budget", None),
+                root_task_budget=root_budget,
                 **_fork_kwargs,
             )
             review_agent._root_task_role = "background_review"
@@ -1140,7 +1138,6 @@ def _run_review_in_thread(
         receipt["duration_seconds"] = round(
             receipt["finished_at"] - started_at, 3
         )
-        root_budget = getattr(agent, "root_task_budget", None)
         if root_budget is not None and hasattr(root_budget, "snapshot"):
             try:
                 receipt["root_budget"] = root_budget.snapshot()
@@ -1171,6 +1168,17 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    origin_budget = getattr(agent, "root_task_budget", None)
+    origin_root_turn_id = str(getattr(origin_budget, "root_turn_id", "") or "")
+    if origin_budget is not None:
+        from agent.root_task_budget import ScopedRootTaskBudget
+
+        origin_budget = ScopedRootTaskBudget(
+            origin_budget,
+            scope_name="background_review",
+            max_calls=_background_review_max_iterations(),
+        )
+
     def _target() -> None:
         _run_review_in_thread(
             agent,
@@ -1178,6 +1186,8 @@ def spawn_background_review_thread(
             prompt,
             review_memory=review_memory,
             review_skills=review_skills,
+            root_budget=origin_budget,
+            origin_root_turn_id=origin_root_turn_id,
         )
 
     return _target, prompt

@@ -3657,6 +3657,7 @@ class _RootBudgetCompletionsProxy:
             model=str(kwargs.get("model") or self._model),
             reasoning=self._reasoning_config,
             fallback_path=self._fallback_path,
+            defer_stream=bool(kwargs.get("stream")),
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -3692,10 +3693,20 @@ def _with_root_call_budget(
 ) -> Any:
     if client is None or isinstance(client, _RootBudgetClientProxy):
         return client
+    receipt_provider = str(provider or "").strip()
+    if receipt_provider in {"", "auto", "custom"}:
+        try:
+            from agent.model_metadata import _infer_provider_from_url
+
+            inferred = _infer_provider_from_url(str(getattr(client, "base_url", "") or ""))
+            if inferred:
+                receipt_provider = inferred
+        except Exception:
+            pass
     completions = _RootBudgetCompletionsProxy(
         client.chat.completions,
         task=task,
-        provider=provider,
+        provider=receipt_provider or provider,
         model=model,
         reasoning_config=reasoning_config,
         fallback_path=fallback_path,

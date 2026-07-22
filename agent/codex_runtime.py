@@ -691,9 +691,34 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    reservation = None
+
+    def _reserve_physical_turn() -> None:
+        nonlocal reservation
+        if reservation is not None:
+            return
+        from agent.root_task_budget import reserve_agent_model_call
+
+        reservation = reserve_agent_model_call(agent, task="main")
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            on_physical_call_start=_reserve_physical_turn,
+        )
+        if reservation is not None:
+            if getattr(turn, "error", None) or getattr(turn, "interrupted", False):
+                reservation.finish(
+                    "failed",
+                    error=RuntimeError(
+                        str(getattr(turn, "error", None) or "turn interrupted")
+                    ),
+                )
+            else:
+                reservation.finish("succeeded", response=turn)
     except Exception as exc:
+        if reservation is not None:
+            reservation.finish("failed", error=exc)
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -1262,9 +1287,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs = dict(api_kwargs)
         stream_kwargs["stream"] = True
 
+        from agent.root_task_budget import reserve_agent_model_call
+        reservation = reserve_agent_model_call(agent)
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            if reservation is not None:
+                reservation.finish("failed", error=exc)
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -1272,6 +1301,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(), exc,
                 )
                 continue
+            raise
+        except BaseException as exc:
+            if reservation is not None:
+                reservation.finish("failed", error=exc)
             raise
 
         # Claim the delta sink for THIS attempt (#65991) — parity with the
@@ -1299,6 +1332,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
             if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
+                if reservation is not None:
+                    reservation.finish("succeeded", response=event_stream)
                 return event_stream
 
             try:
@@ -1320,6 +1355,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if reservation is not None:
+                    reservation.finish("failed", error=exc)
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1339,7 +1376,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                 )
 
+            if reservation is not None:
+                reservation.finish("succeeded", response=final)
             return final
+        except BaseException as exc:
+            if reservation is not None:
+                reservation.finish("failed", error=exc)
+            raise
         finally:
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):

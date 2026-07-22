@@ -1953,6 +1953,7 @@ from gateway.platforms.base import (
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
+    complete_durable_processing,
     merge_pending_message_event,
     utf16_len,
 )
@@ -13856,6 +13857,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._refresh_agent_cache_message_count(
                 session_key, session_entry.session_id
             )
+            # The model turn and every transcript/session write are durable at
+            # this boundary. Resolve a claimed synthetic completion here—not
+            # when the adapter merely observes a normal handler return, which
+            # also covers stale results deliberately discarded before writes.
+            complete_durable_processing(
+                event,
+                bool(
+                    agent_result.get("completed") is True
+                    and not agent_result.get("failed")
+                    and not agent_result.get("partial")
+                    and not agent_result.get("error")
+                    and not agent_result.get("interrupted")
+                    and not is_context_overflow_failure
+                    and not hidden_reasoning_incomplete
+                ),
+            )
 
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
@@ -17256,10 +17273,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Routing must come from the queued event itself, not from whatever
         foreground message happened to be active when the queue was drained.
-        Returns ``True`` after adapter acceptance, ``False`` after a retryable
-        adapter failure, and ``None`` when the event has no gateway route. This
-        is not a transactional boundary: a process crash after adapter
-        acceptance can still cause durable at-least-once replay.
+        Returns ``True`` only after adapters that support the durable callback
+        report model-turn/transcript completion. Scheduling acceptance alone is
+        never used as the durable acknowledgement boundary.
         """
         source = self._build_process_event_source(evt)
         if not source:
@@ -17278,6 +17294,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         try:
             metadata = {}
+            processing_future = None
+            if getattr(adapter, "supports_durable_processing_completion", False):
+                loop = asyncio.get_running_loop()
+                processing_future = loop.create_future()
+
+                def _processing_complete(succeeded: bool) -> None:
+                    def _set_result() -> None:
+                        if not processing_future.done():
+                            processing_future.set_result(bool(succeeded))
+
+                    loop.call_soon_threadsafe(_set_result)
+
+                metadata["_durable_processing_completion"] = _processing_complete
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
@@ -17317,6 +17346,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
+            if processing_future is not None:
+                if not await processing_future:
+                    return False
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)

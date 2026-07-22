@@ -1592,37 +1592,11 @@ def run_conversation(
                             )
                         return agent._interruptible_api_call(next_api_kwargs)
 
-                    # The MoA facade is a virtual orchestration call. Its real
-                    # reference/aggregator provider calls are charged inside
-                    # auxiliary_client; charging this outer wrapper too would
-                    # double-count one physical fan-out.
-                    if agent.provider == "moa":
-                        return _physical_call()
-
-                    from agent.root_task_budget import (
-                        execute_model_call as _execute_budgeted_model_call,
-                        get_root_call_context,
-                    )
-
-                    _root_ctx = get_root_call_context()
-                    _root_role = _root_ctx.role if _root_ctx is not None else "parent"
-                    _root_scope = "parent" if _root_role == "parent" else _root_role
-                    _root_task = "main" if _root_role == "parent" else _root_role
-                    _fallback_path = (
-                        f"fallback:{agent.provider or 'unknown'}"
-                        if getattr(agent, "_fallback_activated", False)
-                        else "primary"
-                    )
-                    return _execute_budgeted_model_call(
-                        _physical_call,
-                        context=_root_ctx,
-                        scope=_root_scope,
-                        task=_root_task,
-                        provider=agent.provider or "unknown",
-                        model=agent.model or "unknown",
-                        reasoning=getattr(agent, "reasoning_config", None),
-                        fallback_path=_fallback_path,
-                    )
+                    # Physical attempts are charged inside the transport
+                    # dispatchers.  Keeping the wrapper here would collapse
+                    # their internal stream reconnects and Bedrock fallbacks
+                    # into one logical iteration receipt.
+                    return _physical_call()
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

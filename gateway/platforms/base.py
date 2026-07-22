@@ -37,6 +37,18 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
+def complete_durable_processing(event, succeeded: bool) -> bool:
+    """Resolve a synthetic model-turn claim exactly once at persistence."""
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    callback = metadata.pop("_durable_processing_completion", None)
+    if not callable(callback):
+        return False
+    callback(bool(succeeded))
+    return True
+
+
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
@@ -2317,6 +2329,7 @@ def _strip_media_directives(text: str) -> str:
 
 
 class BasePlatformAdapter(ABC):
+    supports_durable_processing_completion = True
     """
     Base class for platform adapters.
     
@@ -5050,6 +5063,9 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
 
+        def _complete_internal_delivery(succeeded: bool) -> None:
+            complete_durable_processing(event, succeeded)
+
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
         # Fall back to a new Event only if the entry was removed externally.
@@ -5089,6 +5105,12 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            # GatewayRunner consumes this callback with True only after its
+            # transcript/session writes. If a normal handler return did not
+            # cross that boundary (for example a stale generation discarded
+            # its result), resolve False so the durable claim becomes
+            # retryable instead of leaving its waiter pending forever.
+            _complete_internal_delivery(False)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5505,9 +5527,11 @@ class BasePlatformAdapter(ABC):
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
+            _complete_internal_delivery(False)
             raise
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            _complete_internal_delivery(False)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

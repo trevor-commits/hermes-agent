@@ -186,6 +186,40 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     assert acknowledgements == ["deleg_duplicate"]
 
 
+def test_gateway_ack_waits_for_durable_processing_completion(
+    monkeypatch, isolated_registry,
+):
+    """R1-F09: adapter scheduling alone is not durable delivery proof."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_durable_turn")
+    _persist_pending_completion(event)
+    phases = []
+
+    class DurableAdapter:
+        supports_durable_processing_completion = True
+
+        async def handle_message(self, injected):
+            phases.append("scheduled")
+            callback = injected.metadata["_durable_processing_completion"]
+            phases.append("persisted")
+            callback(True)
+
+    original_complete = async_delegation.complete_completion_delivery
+
+    def complete(delegation_id, claim_id):
+        phases.append("acked")
+        return original_complete(delegation_id, claim_id)
+
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", complete)
+    runner = _runner(DurableAdapter())
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+    assert phases == ["scheduled", "persisted", "acked"]
+
+
 def _persist_pending_completion(event):
     from tools import async_delegation
 

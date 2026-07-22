@@ -3861,6 +3861,40 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_exhausted_root_budget_reuses_latest_assistant_content(self, agent):
+        """R1-F08: closure cannot spend beyond the aggregate root cap."""
+        from agent.root_task_budget import (
+            RootCallContext,
+            RootTaskBudget,
+            reset_root_call_context,
+            set_root_call_context,
+        )
+
+        budget = RootTaskBudget(
+            root_turn_id="root-exhausted", max_total=1, closure_reserve=0,
+        )
+        budget.begin_call(
+            scope="parent", session_id="session-1", task="main", role="parent",
+            provider="test", model="test", reasoning=None, fallback_path="primary",
+        ).finish("succeeded")
+        agent.client.chat.completions.create.side_effect = AssertionError(
+            "summary model call must not bypass the exhausted root budget"
+        )
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {"role": "assistant", "content": "latest durable result"},
+        ]
+        token = set_root_call_context(
+            RootCallContext(budget=budget, session_id="session-1", role="parent")
+        )
+        try:
+            result = agent._handle_max_iterations(messages, 60)
+        finally:
+            reset_root_call_context(token)
+
+        assert result == "latest durable result"
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp

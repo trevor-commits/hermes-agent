@@ -10484,11 +10484,20 @@ def _notification_poller_loop(
         if _claim is None:
             with session["history_lock"]:
                 session["running"] = False
+                _release_notification_model_wake_locked(session, _wake_key)
             continue
+        def _finish_delivery(succeeded, _evt=evt, _claim_id=_claim, _wake=_wake_key):
+            if succeeded:
+                complete_event_delivery(_evt, _claim_id)
+            else:
+                release_event_delivery(_evt, _claim_id)
+                with session["history_lock"]:
+                    _release_notification_model_wake_locked(session, _wake)
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, turn)
-            complete_event_delivery(evt, _claim)
+            _run_prompt_submit(
+                rid, sid, session, turn, on_complete=_finish_delivery,
+            )
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -10571,11 +10580,20 @@ def _notification_poller_loop(
         if _claim is None:
             with session["history_lock"]:
                 session["running"] = False
+                _release_notification_model_wake_locked(session, _wake_key)
             continue
+        def _finish_delivery(succeeded, _evt=evt, _claim_id=_claim, _wake=_wake_key):
+            if succeeded:
+                complete_event_delivery(_evt, _claim_id)
+            else:
+                release_event_delivery(_evt, _claim_id)
+                with session["history_lock"]:
+                    _release_notification_model_wake_locked(session, _wake)
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, turn)
-            complete_event_delivery(evt, _claim)
+            _run_prompt_submit(
+                rid, sid, session, turn, on_complete=_finish_delivery,
+            )
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -10673,7 +10691,9 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid, sid: str, session: dict, text: Any, *, on_complete=None,
+) -> None:
     from tools.process_registry import is_synthetic_system_event_turn
 
     synthetic_system_event = text if is_synthetic_system_event_turn(text) else None
@@ -10708,6 +10728,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         one_turn_restore = session.pop("one_turn_model_restore", None)
+        turn_persisted = False
+        history_persisted = False
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10926,6 +10948,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_persisted = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -10994,6 +11017,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
+            # A claimed synthetic completion is durable only when the turn
+            # completed successfully and the exact history version was saved.
+            # Normal-return errors and visible-but-unsaved mismatch responses
+            # remain retryable.
+            turn_persisted = bool(
+                history_persisted
+                and isinstance(result, dict)
+                and result.get("completed") is True
+                and not result.get("failed")
+                and not result.get("partial")
+                and not result.get("error")
+                and not result.get("interrupted")
+            )
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -11184,6 +11220,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
+            if callable(on_complete):
+                try:
+                    on_complete(turn_persisted)
+                except Exception:
+                    logger.debug("notification completion callback failed", exc_info=True)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -11279,7 +11320,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 if _claim is None:
                     with session["history_lock"]:
                         session["running"] = False
+                        _release_notification_model_wake_locked(session, _wake_key)
                     continue
+                def _finish_delivery(
+                    succeeded, _evt_value=_evt, _claim_id=_claim, _wake=_wake_key,
+                ):
+                    if succeeded:
+                        complete_event_delivery(_evt_value, _claim_id)
+                    else:
+                        release_event_delivery(_evt_value, _claim_id)
+                        with session["history_lock"]:
+                            _release_notification_model_wake_locked(session, _wake)
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(
@@ -11287,8 +11338,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         sid,
                         session,
                         turn,
+                        on_complete=_finish_delivery,
                     )
-                    complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(

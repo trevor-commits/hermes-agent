@@ -903,6 +903,12 @@ def test_run_codex_stream_multiple_commentary_items_are_not_reemitted(monkeypatc
 
 def test_run_codex_stream_retry_deduplicates_multiple_commentary_items(monkeypatch):
     import httpx
+    from agent.root_task_budget import (
+        RootCallContext,
+        RootTaskBudget,
+        reset_root_call_context,
+        set_root_call_context,
+    )
 
     agent = _build_agent(monkeypatch)
     delivered = []
@@ -956,11 +962,25 @@ def test_run_codex_stream_retry_deduplicates_multiple_commentary_items(monkeypat
         ])
 
     agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
-
-    response = agent._run_codex_stream(_codex_request_kwargs())
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="codex-retry", max_total=2, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    token = set_root_call_context(
+        RootCallContext(budget=budget, session_id="session-retry", role="parent")
+    )
+    try:
+        response = agent._run_codex_stream(_codex_request_kwargs())
+    finally:
+        reset_root_call_context(token)
 
     assert response.status == "completed"
     assert calls["count"] == 2
+    assert budget.used == 2
+    assert [event["status"] for event in events] == [
+        "started", "failed", "started", "succeeded",
+    ]
     assert delivered == ["First update.", "Second update."]
 
 

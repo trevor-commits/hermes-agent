@@ -295,6 +295,11 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+`auxiliary.background_review.max_iterations` caps physical review calls
+(including summary, retry, and fallback attempts; default `4`). The review
+also spends from the root-turn aggregate captured when the review is spawned,
+so a later foreground turn cannot replace or expand its allowance.
+
 ## Controlling skill writes (`skills.write_approval`)
 
 Skills use the same on/off gate, but the review UX differs because a

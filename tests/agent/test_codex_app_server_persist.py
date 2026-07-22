@@ -76,6 +76,131 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_app_server_turn_charges_shared_root_budget():
+    """R1-F02: the early-return Codex runtime cannot bypass root receipts."""
+    from agent.root_task_budget import (
+        RootCallContext,
+        RootTaskBudget,
+        reset_root_call_context,
+        set_root_call_context,
+    )
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="codex-root", max_total=2, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    agent = _make_agent(session_db=None)
+
+    def physical_turn(*, on_physical_call_start=None, **_kwargs):
+        assert on_physical_call_start is not None
+        on_physical_call_start()
+        return _make_turn()
+
+    agent._codex_session.run_turn.side_effect = physical_turn
+    agent.provider = "openai-codex"
+    agent.model = "gpt-5.6-codex"
+    agent.reasoning_config = {"effort": "high"}
+    token = set_root_call_context(
+        RootCallContext(budget=budget, session_id="sess-codex", role="parent")
+    )
+    try:
+        run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+    finally:
+        reset_root_call_context(token)
+
+    assert budget.used == 1
+    assert [event["status"] for event in events] == ["started", "succeeded"]
+    assert events[-1]["task"] == "main"
+
+
+def test_codex_app_server_startup_failure_does_not_charge_or_succeed():
+    """R1-F02: no turn/start dispatch means no physical-call receipt."""
+    from agent.root_task_budget import (
+        RootCallContext,
+        RootTaskBudget,
+        reset_root_call_context,
+        set_root_call_context,
+    )
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="codex-startup", max_total=2, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    agent = _make_agent(session_db=None)
+    failed = _make_turn()
+    failed.error = "startup failed"
+    failed.final_text = ""
+    agent._codex_session.run_turn.return_value = failed
+    token = set_root_call_context(
+        RootCallContext(budget=budget, session_id="sess-codex", role="parent")
+    )
+    try:
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+    finally:
+        reset_root_call_context(token)
+
+    assert result["completed"] is False
+    assert budget.used == 0
+    assert events == []
+
+
+def test_codex_app_server_failed_physical_turn_records_failed_receipt():
+    """R1-F02: a dispatched turn that returns an error cannot receipt success."""
+    from agent.root_task_budget import (
+        RootCallContext,
+        RootTaskBudget,
+        reset_root_call_context,
+        set_root_call_context,
+    )
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="codex-failed", max_total=2, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    agent = _make_agent(session_db=None)
+
+    def failed_turn(*, on_physical_call_start=None, **_kwargs):
+        assert on_physical_call_start is not None
+        on_physical_call_start()
+        failed = _make_turn()
+        failed.error = "turn failed"
+        failed.final_text = ""
+        return failed
+
+    agent._codex_session.run_turn.side_effect = failed_turn
+    token = set_root_call_context(
+        RootCallContext(budget=budget, session_id="sess-codex", role="parent")
+    )
+    try:
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+    finally:
+        reset_root_call_context(token)
+
+    assert result["completed"] is False
+    assert [event["status"] for event in events] == ["started", "failed"]
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()

@@ -9616,7 +9616,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         from tools.async_delegation import (
             claim_event_delivery,
-            complete_event_delivery,
             release_event_delivery,
         )
 
@@ -9636,19 +9635,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._notification_model_wake_keys = retained
             if wake_key and wake_key in retained:
                 continue
-            if wake_key:
-                retained[wake_key] = None
-                while len(retained) > 512:
-                    retained.pop(next(iter(retained)))
 
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
+            if wake_key:
+                retained[wake_key] = None
+                while len(retained) > 512:
+                    retained.pop(next(iter(retained)))
             queued_message = (
                 build_process_notification_turn(event)
                 if event.get("type") == "async_delegation"
                 else synthetic_message
             )
+            if isinstance(queued_message, dict) and claim:
+                queued_message["_delivery_claim"] = {
+                    "event": event,
+                    "claim_id": claim,
+                }
             try:
                 self._pending_input.put(queued_message)
             except Exception:
@@ -9656,8 +9660,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     retained.pop(wake_key, None)
                 release_event_delivery(event, claim)
                 raise
-            else:
-                complete_event_delivery(event, claim)
+
+    def _finalize_process_notification_delivery(
+        self, synthetic_turn: Any, *, succeeded: bool,
+    ) -> None:
+        """Ack only after the claimed synthetic turn has been persisted."""
+        if not isinstance(synthetic_turn, dict):
+            return
+        claim = synthetic_turn.pop("_delivery_claim", None)
+        if not isinstance(claim, dict):
+            return
+        event = claim.get("event")
+        claim_id = str(claim.get("claim_id") or "")
+        if not isinstance(event, dict) or not claim_id:
+            return
+        from tools.async_delegation import (
+            complete_event_delivery,
+            release_event_delivery,
+        )
+
+        if succeeded:
+            complete_event_delivery(event, claim_id)
+        else:
+            release_event_delivery(event, claim_id)
+            wake_key = str(synthetic_turn.get("idempotency_key") or "")
+            retained = getattr(self, "_notification_model_wake_keys", None)
+            if isinstance(retained, dict) and wake_key:
+                retained.pop(wake_key, None)
+
+    def _run_chat_for_process_loop(
+        self, synthetic_turn: Any, user_input: Any, *, images: Any,
+    ) -> Any:
+        """Run one CLI turn and finalize a synthetic claim from durable proof."""
+        try:
+            response = self.chat(user_input, images=images)
+        except BaseException:
+            self._finalize_process_notification_delivery(
+                synthetic_turn, succeeded=False,
+            )
+            raise
+        self._finalize_process_notification_delivery(
+            synthetic_turn,
+            succeeded=bool(getattr(self, "_last_chat_turn_persisted", False)),
+        )
+        return response
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -12031,6 +12077,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._last_chat_turn_persisted = False
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -12539,6 +12586,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            self._last_chat_turn_persisted = bool(
+                isinstance(result, dict)
+                and result.get("completed") is True
+                and not result.get("failed")
+                and not result.get("partial")
+                and not result.get("error")
+                and not result.get("interrupted")
+            )
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -15398,7 +15453,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self._run_chat_for_process_loop(
+                            _synthetic_system_event,
+                            user_input,
+                            images=submit_images or None,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

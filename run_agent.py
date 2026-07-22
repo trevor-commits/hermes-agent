@@ -6588,6 +6588,7 @@ class AIAgent:
         from agent.root_task_budget import (
             RootCallContext,
             RootTaskBudget,
+            ScopedRootTaskBudget,
             durable_receipt_sink,
             reset_root_call_context,
             resolve_root_budget_limits,
@@ -6618,7 +6619,9 @@ class AIAgent:
         # it through ContextVar propagation too.
         inherited_root = bool(getattr(self, "_root_task_budget_inherited", False))
         root_budget = getattr(self, "root_task_budget", None)
-        if not inherited_root or not isinstance(root_budget, RootTaskBudget):
+        if not inherited_root or not isinstance(
+            root_budget, (RootTaskBudget, ScopedRootTaskBudget)
+        ):
             try:
                 from hermes_cli.config import load_config
 

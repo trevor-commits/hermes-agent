@@ -22,7 +22,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -158,9 +158,15 @@ class ModelCallReservation:
             event["status"] = status
             event["finished_at"] = time.time()
             if response is not None:
+                actual_provider = str(getattr(response, "provider", "") or "").strip()
                 actual_model = str(getattr(response, "model", "") or "").strip()
+                actual_reasoning = getattr(response, "reasoning", None)
+                if actual_provider:
+                    event["provider"] = actual_provider
                 if actual_model:
                     event["model"] = actual_model
+                if actual_reasoning is not None:
+                    event["reasoning"] = _json_safe_reasoning(actual_reasoning)
                 event.update(_usage_fields(response))
             if error is not None:
                 event["error_type"] = type(error).__name__
@@ -275,6 +281,68 @@ class RootTaskBudget:
             }
 
 
+class ScopedRootTaskBudget:
+    """Immutable per-activity view that also charges an origin root budget.
+
+    Optional activities such as background review need a physical-attempt cap
+    of their own.  Keeping the origin budget as a constructor value prevents a
+    later parent turn from silently rebinding the child to a different root.
+    """
+
+    def __init__(
+        self,
+        parent: RootTaskBudget,
+        *,
+        scope_name: str,
+        max_calls: int,
+    ):
+        self._parent = parent
+        self.root_turn_id = parent.root_turn_id
+        self.max_total = max(1, int(max_calls))
+        self.closure_reserve = 0
+        self.scope_name = str(scope_name or "scoped")
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def begin_call(self, **kwargs: Any) -> ModelCallReservation:
+        normalized_scope = str(kwargs.get("scope") or self.scope_name)
+        with self._lock:
+            if self._used >= self.max_total:
+                raise RootBudgetExhausted(
+                    root_turn_id=self.root_turn_id,
+                    scope=normalized_scope,
+                    used=self._used,
+                    limit=self.max_total,
+                )
+            reservation = self._parent.begin_call(**kwargs)
+            self._used += 1
+            return reservation
+
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return max(0, self.max_total - self._used)
+
+    @property
+    def optional_remaining(self) -> int:
+        return min(self.remaining, self._parent.optional_remaining)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "root_turn_id": self.root_turn_id,
+            "scope": self.scope_name,
+            "used": self.used,
+            "max_total": self.max_total,
+            "remaining": self.remaining,
+            "origin": self._parent.snapshot(),
+        }
+
+
 @dataclass(frozen=True)
 class RootCallContext:
     budget: RootTaskBudget
@@ -356,6 +424,7 @@ def execute_model_call(
     model: str,
     reasoning: Any = None,
     fallback_path: str = "primary",
+    defer_stream: bool = False,
 ) -> Any:
     """Execute one sync or async physical call with budget + receipt handling."""
     context = context or get_root_call_context()
@@ -390,8 +459,148 @@ def execute_model_call(
 
         return _await_and_finish()
 
+    if defer_stream:
+        # Some OpenAI-compatible adapters ignore ``stream=True`` and return a
+        # completed response object with ``choices``. Preserve that supported
+        # fallback instead of forcing it through ``iter()``. Any genuine
+        # wrapper-construction failure is terminally receipted before raising.
+        if hasattr(result, "choices"):
+            reservation.finish("succeeded", response=result)
+            return result
+        try:
+            return _ReceiptStream(result, reservation)
+        except BaseException as error:
+            reservation.finish("failed", error=error)
+            raise
+
     reservation.finish("succeeded", response=result)
     return result
+
+
+def execute_agent_model_call(
+    agent: Any,
+    call: Callable[[], Any],
+    *,
+    task: Optional[str] = None,
+    fallback_path: Optional[str] = None,
+    defer_stream: bool = False,
+) -> Any:
+    """Charge one physical attempt using the active agent runtime identity."""
+    context = get_root_call_context()
+    if context is None:
+        return call()
+    role = str(context.role or "parent")
+    scope = "parent" if role == "parent" else role
+    resolved_task = task or ("main" if role == "parent" else role)
+    resolved_fallback = fallback_path or (
+        f"fallback:{getattr(agent, 'provider', None) or 'unknown'}"
+        if getattr(agent, "_fallback_activated", False)
+        else "primary"
+    )
+    return execute_model_call(
+        call,
+        context=context,
+        scope=scope,
+        task=resolved_task,
+        provider=getattr(agent, "provider", None) or "unknown",
+        model=getattr(agent, "model", None) or "unknown",
+        reasoning=getattr(agent, "reasoning_config", None),
+        fallback_path=resolved_fallback,
+        defer_stream=defer_stream,
+    )
+
+
+def reserve_agent_model_call(
+    agent: Any,
+    *,
+    task: Optional[str] = None,
+    fallback_path: Optional[str] = None,
+) -> Optional[ModelCallReservation]:
+    """Reserve one attempt for a transport that must finish it manually."""
+    context = get_root_call_context()
+    if context is None:
+        return None
+    role = str(context.role or "parent")
+    scope = "parent" if role == "parent" else role
+    return context.budget.begin_call(
+        scope=scope,
+        session_id=context.session_id,
+        task=task or ("main" if role == "parent" else role),
+        role=role,
+        provider=getattr(agent, "provider", None) or "unknown",
+        model=getattr(agent, "model", None) or "unknown",
+        reasoning=getattr(agent, "reasoning_config", None),
+        fallback_path=fallback_path or (
+            f"fallback:{getattr(agent, 'provider', None) or 'unknown'}"
+            if getattr(agent, "_fallback_activated", False)
+            else "primary"
+        ),
+    )
+
+
+class _ReceiptStream(Iterator[Any]):
+    """Finish a receipt when a returned provider stream actually terminates."""
+
+    def __init__(self, stream: Any, reservation: ModelCallReservation):
+        self._stream = stream
+        self._iterator = iter(stream)
+        self._reservation = reservation
+        self._last_item: Any = None
+        self._closed = False
+
+    def __iter__(self) -> "_ReceiptStream":
+        return self
+
+    def __next__(self) -> Any:
+        try:
+            item = next(self._iterator)
+        except StopIteration:
+            self._reservation.finish("succeeded", response=self._last_item)
+            self._closed = True
+            raise
+        except BaseException as error:
+            self._reservation.finish("failed", error=error)
+            self._closed = True
+            raise
+        self._last_item = item
+        return item
+
+    def close(self) -> None:
+        close_fn = getattr(self._stream, "close", None)
+        try:
+            if callable(close_fn):
+                close_fn()
+        except BaseException as error:
+            self._reservation.finish("failed", error=error)
+            self._closed = True
+            raise
+        if not self._closed:
+            self._reservation.finish(
+                "failed", error=RuntimeError("provider stream closed before completion")
+            )
+            self._closed = True
+
+    def __enter__(self) -> "_ReceiptStream":
+        enter = getattr(self._stream, "__enter__", None)
+        if callable(enter):
+            entered = enter()
+            self._iterator = iter(entered)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> Any:
+        exit_fn = getattr(self._stream, "__exit__", None)
+        try:
+            outcome = exit_fn(exc_type, exc, tb) if callable(exit_fn) else None
+        finally:
+            if exc is not None:
+                self._reservation.finish("failed", error=exc)
+            elif not self._closed:
+                self._reservation.finish("succeeded", response=self._last_item)
+            self._closed = True
+        return outcome
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
 
 
 __all__ = [
@@ -399,8 +608,11 @@ __all__ = [
     "RootBudgetExhausted",
     "RootCallContext",
     "RootTaskBudget",
+    "ScopedRootTaskBudget",
     "durable_receipt_sink",
     "execute_model_call",
+    "execute_agent_model_call",
+    "reserve_agent_model_call",
     "get_root_call_context",
     "reset_root_call_context",
     "resolve_root_budget_limits",

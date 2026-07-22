@@ -1859,6 +1859,9 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,
+            # Physical model-call cap for this review, including summary,
+            # retry, and fallback attempts. The review also spends from the
+            # immutable root-turn aggregate captured when it is spawned.
             "max_iterations": 4,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)

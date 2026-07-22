@@ -157,6 +157,27 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_handler_return_does_not_ack_before_runner_persistence(self):
+        """R1-F09: a stale/discarded normal return must remain retryable."""
+        adapter = DummyTelegramAdapter()
+        outcomes = []
+
+        async def handler(_event):
+            return None
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_event("-1001", "17585")
+        event.metadata = {"_durable_processing_completion": outcomes.append}
+
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert outcomes == [False]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_total_send_failure_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

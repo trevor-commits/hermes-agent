@@ -281,7 +281,11 @@ def test_auxiliary_client_proxy_charges_each_physical_retry():
 
 def test_agent_wrapper_resets_parent_root_but_preserves_inherited_child(monkeypatch):
     import agent.conversation_loop as conversation_loop
-    from agent.root_task_budget import RootTaskBudget, get_root_call_context
+    from agent.root_task_budget import (
+        RootTaskBudget,
+        ScopedRootTaskBudget,
+        get_root_call_context,
+    )
     from run_agent import AIAgent
 
     observed = []
@@ -329,6 +333,128 @@ def test_agent_wrapper_resets_parent_root_but_preserves_inherited_child(monkeypa
 
     AIAgent.run_conversation(child, "delegated work")
 
+    scoped = ScopedRootTaskBudget(
+        inherited, scope_name="background_review", max_calls=4,
+    )
+    review = object.__new__(AIAgent)
+    review.session_id = "review-session"
+    review._parent_session_id = "parent-session"
+    review._session_db = None
+    review.max_iterations = 4
+    review.root_task_budget = scoped
+    review._root_task_budget_inherited = True
+    review._root_task_role = "background_review"
+
+    AIAgent.run_conversation(review, "review work")
+
     assert observed[0][0] is not observed[1][0]
     assert observed[0][1] == observed[1][1] == "parent"
     assert observed[2] == (inherited, "delegate")
+    assert observed[3] == (scoped, "background_review")
+
+
+def test_scoped_budget_caps_physical_attempts_and_keeps_origin_identity():
+    """R1-F04/F05: a review keeps its origin root and four-call physical cap."""
+    from agent.root_task_budget import (
+        RootBudgetExhausted,
+        RootTaskBudget,
+        ScopedRootTaskBudget,
+    )
+
+    origin = RootTaskBudget(root_turn_id="origin-root", max_total=20, closure_reserve=2)
+    scoped = ScopedRootTaskBudget(origin, scope_name="background_review", max_calls=4)
+
+    for _ in range(4):
+        scoped.begin_call(scope="background_review", **_metadata(role="background_review"))
+    with pytest.raises(RootBudgetExhausted):
+        scoped.begin_call(scope="background_review", **_metadata(role="background_review"))
+
+    assert scoped.root_turn_id == "origin-root"
+    assert scoped.used == 4
+    assert origin.used == 4
+
+
+def test_stream_receipt_finishes_only_after_stream_consumption():
+    """R1-F07: a streaming MoA receipt cannot succeed at iterator creation."""
+    from agent.root_task_budget import RootCallContext, RootTaskBudget, execute_model_call
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="root-stream", max_total=2, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    context = RootCallContext(budget=budget, session_id="s", role="moa_aggregator")
+
+    def chunks():
+        yield SimpleNamespace(model="actual-moa-model", usage=None, value="one")
+        raise RuntimeError("stream broke")
+
+    stream = execute_model_call(
+        chunks,
+        context=context,
+        scope="parent",
+        task="moa_aggregator",
+        provider="auto",
+        model="requested",
+        defer_stream=True,
+    )
+    assert [event["status"] for event in events] == ["started"]
+    assert next(stream).value == "one"
+    with pytest.raises(RuntimeError, match="stream broke"):
+        next(stream)
+    assert [event["status"] for event in events] == ["started", "failed"]
+
+
+def test_deferred_stream_preserves_completed_non_iterable_response():
+    """R1-F07/F17: adapters may return a completed response on stream paths."""
+    from agent.root_task_budget import RootCallContext, RootTaskBudget, execute_model_call
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="root-completed", max_total=1, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    context = RootCallContext(budget=budget, session_id="s", role="parent")
+    response = SimpleNamespace(choices=[], model="completed-model", usage=None)
+
+    observed = execute_model_call(
+        lambda: response,
+        context=context,
+        scope="parent",
+        task="main",
+        provider="test",
+        model="requested",
+        defer_stream=True,
+    )
+
+    assert observed is response
+    assert [event["status"] for event in events] == ["started", "succeeded"]
+
+
+def test_terminal_receipt_records_actual_provider_model_and_reasoning():
+    """R1-F06: terminal route metadata reflects the billed response."""
+    from agent.root_task_budget import RootCallContext, RootTaskBudget, execute_model_call
+
+    events = []
+    budget = RootTaskBudget(
+        root_turn_id="root-route", max_total=1, closure_reserve=0,
+        receipt_sink=events.append,
+    )
+    context = RootCallContext(budget=budget, session_id="s", role="parent")
+    response = SimpleNamespace(
+        model="actual-model", provider="actual-provider",
+        reasoning={"effort": "medium"}, usage=None,
+    )
+    execute_model_call(
+        lambda: response,
+        context=context,
+        scope="parent",
+        task="main",
+        provider="auto",
+        model="requested",
+        reasoning={"effort": "high"},
+    )
+
+    assert events[-1]["provider"] == "actual-provider"
+    assert events[-1]["model"] == "actual-model"
+    assert events[-1]["reasoning"] == {"effort": "medium"}

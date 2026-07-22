@@ -3209,9 +3209,11 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, *, on_complete=None):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
+        if on_complete is not None:
+            on_complete(True)
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
     server._sessions.update(
@@ -3318,7 +3320,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -3359,7 +3361,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -3425,7 +3427,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -7135,6 +7137,75 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_history_mismatch_reports_delivery_unpersisted(monkeypatch):
+    """R1-F10: a visible but unsaved response cannot complete the claim."""
+    session_ref = {"s": None}
+
+    class _RacyAgent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            with session_ref["s"]["history_lock"]:
+                session_ref["s"]["history_version"] += 1
+            return {
+                "final_response": "agent reply",
+                "messages": [{"role": "assistant", "content": "agent reply"}],
+                "completed": True,
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    session = _session(agent=_RacyAgent())
+    session_ref["s"] = session
+    outcomes = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+    monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+
+    server._run_prompt_submit(
+        "1", "sid", session, "hi", on_complete=outcomes.append,
+    )
+
+    assert outcomes == [False]
+
+
+def test_prompt_submit_error_reports_delivery_unpersisted(monkeypatch):
+    """R1-F10: a normal-return error result cannot complete the claim."""
+    class _ErrorAgent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            return {
+                "final_response": "",
+                "messages": [],
+                "completed": False,
+                "failed": True,
+                "error": "provider failed",
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    session = _session(agent=_ErrorAgent())
+    outcomes = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+    monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+
+    server._run_prompt_submit(
+        "1", "sid", session, "hi", on_complete=outcomes.append,
+    )
+
+    assert outcomes == [False]
+
+
 def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
     """prompt.submit must sanitize corrupted user text before run_conversation."""
     captured: dict[str, str] = {}
@@ -10226,8 +10297,11 @@ def test_notification_poller_async_completion_is_one_compact_system_event_and_on
     sess = _session(session_key=session_key)
     server._sessions["sid_async_once"] = sess
 
-    def _dispatch(_rid, _sid, session, turn):
+    callbacks = []
+
+    def _dispatch(_rid, _sid, session, turn, *, on_complete=None):
         turns.append(turn)
+        callbacks.append(on_complete)
         with session["history_lock"]:
             session["running"] = False
 
@@ -10237,8 +10311,10 @@ def test_notification_poller_async_completion_is_one_compact_system_event_and_on
     monkeypatch.setattr(
         "tools.async_delegation.claim_event_delivery", lambda *_args: "claim"
     )
+    completed = []
     monkeypatch.setattr(
-        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+        "tools.async_delegation.complete_event_delivery",
+        lambda *args: completed.append(args),
     )
 
     event = {
@@ -10267,6 +10343,9 @@ def test_notification_poller_async_completion_is_one_compact_system_event_and_on
         assert len(turns) == 1
         assert turns[0]["idempotency_key"] == "async-delegation:deleg_tui_once"
         assert "FULL PRIVATE RESULT" in turns[0]["model_text"]
+        assert completed == []
+        callbacks[0](True)
+        assert len(completed) == 1
         assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid_async_once", None)
@@ -10468,10 +10547,12 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, *, on_complete=None):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
+        if on_complete is not None:
+            on_complete(True)
 
     sess = _session()
     server._sessions["sid_watch_dedup"] = sess

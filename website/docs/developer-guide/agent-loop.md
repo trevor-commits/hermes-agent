@@ -182,8 +182,10 @@ These tools modify agent state directly and return synthetic tool results withou
 The agent tracks iterations via `IterationBudget`:
 
 - Default: 90 iterations (configurable via `agent.max_turns`)
-- Each agent gets its own budget. Subagents get independent budgets capped at `delegation.max_iterations` (default 50) — total iterations across parent + subagents can exceed the parent's cap
-- At 100%, the agent stops and returns a summary of work done
+- `agent.root_max_iterations` bounds physical model calls across the parent, subagents, auxiliary work, retries, fallbacks, and background review for one root turn. `auto` derives the aggregate from the parent limit plus one configured delegate allowance.
+- `delegation.max_iterations` (default 50) remains a per-subagent loop cap, but it does not create an independent allowance beyond the root aggregate.
+- `agent.root_closure_reserve` preserves final capacity for parent integration and verification; delegates and optional work cannot spend it.
+- At 100%, the agent returns the best existing assistant result or a deterministic incomplete result when no aggregate capacity remains for a summary call.
 
 ### Fallback Model
 
@@ -194,7 +196,7 @@ When the primary model fails (429 rate limit, 5xx server error, 401/403 auth err
 3. On success, continue the conversation with the new provider
 4. On 401/403, attempt credential refresh before failing over
 
-The fallback system also covers auxiliary tasks independently — vision, compression, and web extraction each have their own fallback chain configurable via the `auxiliary.*` config section.
+Vision, compression, web extraction, and other auxiliary tasks can select their own fallback chains through `auxiliary.*`. Every physical fallback attempt still charges the same root-turn aggregate.
 
 ## Compression and Persistence
 

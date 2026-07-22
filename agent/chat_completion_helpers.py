@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import uuid
+from contextvars import copy_context
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -399,7 +400,11 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        from agent.root_task_budget import execute_agent_model_call
+        return execute_agent_model_call(
+            agent,
+            lambda: agent._anthropic_messages_create(api_kwargs, client=request_client),
+        )
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -415,7 +420,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            from agent.root_task_budget import execute_agent_model_call
+            raw_response = execute_agent_model_call(
+                agent, lambda: client.converse(**api_kwargs)
+            )
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -429,7 +437,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    from agent.root_task_budget import execute_agent_model_call
+    return execute_agent_model_call(
+        agent, lambda: request_client.chat.completions.create(**api_kwargs)
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -755,7 +766,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    _call_context = copy_context()
+    t = threading.Thread(target=lambda: _call_context.run(_call), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -2083,11 +2095,23 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
-                summary_response = agent._anthropic_messages_create(_ant_kw)
+                from agent.root_task_budget import execute_agent_model_call
+                summary_response = execute_agent_model_call(
+                    agent,
+                    lambda: agent._anthropic_messages_create(_ant_kw),
+                    task="iteration_limit_summary",
+                )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                from agent.root_task_budget import execute_agent_model_call
+                summary_response = execute_agent_model_call(
+                    agent,
+                    lambda: agent._ensure_primary_openai_client(
+                        reason="iteration_limit_summary"
+                    ).chat.completions.create(**summary_kwargs),
+                    task="iteration_limit_summary",
+                )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
@@ -2113,7 +2137,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
-                retry_response = agent._anthropic_messages_create(_ant_kw2)
+                from agent.root_task_budget import execute_agent_model_call
+                retry_response = execute_agent_model_call(
+                    agent,
+                    lambda: agent._anthropic_messages_create(_ant_kw2),
+                    task="iteration_limit_summary_retry",
+                )
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
             else:
@@ -2130,7 +2159,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
+                from agent.root_task_budget import execute_agent_model_call
+                summary_response = execute_agent_model_call(
+                    agent,
+                    lambda: agent._ensure_primary_openai_client(
+                        reason="iteration_limit_summary_retry"
+                    ).chat.completions.create(**summary_kwargs),
+                    task="iteration_limit_summary_retry",
+                )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
 
@@ -2145,6 +2181,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
+        from agent.root_task_budget import RootBudgetExhausted
+
+        if isinstance(e, RootBudgetExhausted):
+            if messages and messages[-1].get("content") == summary_request:
+                messages.pop()
+            for existing in reversed(messages):
+                if existing.get("role") != "assistant":
+                    continue
+                candidate = flatten_message_text(existing.get("content")).strip()
+                if candidate:
+                    return candidate
+            return (
+                "I reached the aggregate model-call limit before a final "
+                "summary could be generated. The task result is incomplete."
+            )
         logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
@@ -2317,9 +2368,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
                 client = _get_bedrock_runtime_client(region)
+                from agent.root_task_budget import (
+                    execute_agent_model_call,
+                    reserve_agent_model_call,
+                )
+                stream_reservation = reserve_agent_model_call(agent)
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
                 except Exception as _bedrock_exc:
+                    if stream_reservation is not None:
+                        stream_reservation.finish("failed", error=_bedrock_exc)
                     # IAM policies scoped to bedrock:InvokeModel only (no
                     # InvokeModelWithResponseStream) reject converse_stream()
                     # with AccessDeniedException. That denial is permanent for
@@ -2340,7 +2398,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             type(_bedrock_exc).__name__,
                         )
                         result["response"] = normalize_converse_response(
-                            client.converse(**api_kwargs)
+                            execute_agent_model_call(
+                                agent, lambda: client.converse(**api_kwargs)
+                            )
                         )
                         return
                     # Evict the cached client on stale-connection failures
@@ -2366,18 +2426,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
-                result["response"] = stream_converse_with_callbacks(
-                    raw_response,
-                    on_text_delta=_on_text if agent._has_stream_consumers() else None,
-                    on_tool_start=_on_tool,
-                    on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
-                    on_interrupt_check=lambda: agent._interrupt_requested,
-                    on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
-                )
+                try:
+                    result["response"] = stream_converse_with_callbacks(
+                        raw_response,
+                        on_text_delta=_on_text if agent._has_stream_consumers() else None,
+                        on_tool_start=_on_tool,
+                        on_reasoning_delta=_on_reasoning if agent.reasoning_callback or agent.stream_delta_callback else None,
+                        on_interrupt_check=lambda: agent._interrupt_requested,
+                        on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
+                    )
+                except BaseException as stream_error:
+                    if stream_reservation is not None:
+                        stream_reservation.finish("failed", error=stream_error)
+                    raise
+                else:
+                    if stream_reservation is not None:
+                        stream_reservation.finish("succeeded", response=result["response"])
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        _bedrock_context = copy_context()
+        t = threading.Thread(
+            target=lambda: _bedrock_context.run(_bedrock_call), daemon=True
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -2679,7 +2750,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        from agent.root_task_budget import execute_agent_model_call
+        stream = execute_agent_model_call(
+            agent,
+            lambda: request_client.chat.completions.create(**stream_kwargs),
+            defer_stream=True,
+        )
         # Claim the delta sink for THIS attempt (#65991). If a prior attempt's
         # stream is somehow still alive (a stale-stream reconnect whose socket
         # abort raced), this claim supersedes it so its late chunks are fenced
@@ -3249,7 +3325,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        from agent.root_task_budget import execute_agent_model_call
+                        result["response"] = execute_agent_model_call(
+                            agent, lambda: _call_anthropic(request_client)
+                        )
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
                     return  # success
@@ -3612,7 +3691,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    _call_context = copy_context()
+    t = threading.Thread(target=lambda: _call_context.run(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
