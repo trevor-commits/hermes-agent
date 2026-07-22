@@ -3434,6 +3434,12 @@ def _evict_cached_client_instance(target: Any) -> bool:
     """
     if target is None:
         return False
+    # Root-call accounting wraps auxiliary clients per invocation; the cache
+    # still owns the underlying client identity. Do not use a generic getattr
+    # here: MagicMock and provider SDK clients may synthesize arbitrary
+    # ``_client`` attributes and would cease matching their cache entry.
+    if isinstance(target, _RootBudgetClientProxy):
+        target = target._client
     evicted = False
     with _client_cache_lock:
         for key in list(_client_cache.keys()):
@@ -3571,6 +3577,110 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     return False
 
 
+class _RootBudgetCompletionsProxy:
+    """Intercept auxiliary ``create`` calls at the physical provider seam."""
+
+    def __init__(
+        self,
+        completions: Any,
+        *,
+        task: Optional[str],
+        provider: Optional[str],
+        model: Optional[str],
+        reasoning_config: Optional[dict],
+        fallback_path: str,
+    ):
+        self._completions = completions
+        self._task = task or "auxiliary"
+        self._provider = provider or "unknown"
+        self._model = model or "unknown"
+        self._reasoning_config = reasoning_config
+        self._fallback_path = fallback_path
+
+    def create(self, *args, **kwargs):
+        from agent.root_task_budget import (
+            RootCallContext,
+            execute_model_call,
+            get_root_call_context,
+        )
+
+        context = get_root_call_context()
+        if context is None:
+            return self._completions.create(*args, **kwargs)
+
+        task = self._task
+        role = task if task in {"moa_reference", "moa_aggregator"} else f"auxiliary:{task}"
+        call_context = RootCallContext(
+            budget=context.budget,
+            session_id=context.session_id,
+            role=role,
+        )
+        # Compression is required to let an oversized parent continue; vision
+        # can be the user's requested answer; the MoA aggregator is the parent
+        # integration call. Those may use the protected closure reserve when
+        # invoked by the root parent. Other auxiliaries and all child/background
+        # callers stop before it.
+        essential_parent_tasks = {"compression", "vision", "moa_aggregator"}
+        scope = (
+            "parent"
+            if context.role == "parent" and task in essential_parent_tasks
+            else role
+        )
+        return execute_model_call(
+            lambda: self._completions.create(*args, **kwargs),
+            context=call_context,
+            scope=scope,
+            task=task,
+            provider=self._provider,
+            model=str(kwargs.get("model") or self._model),
+            reasoning=self._reasoning_config,
+            fallback_path=self._fallback_path,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._completions, name)
+
+
+class _RootBudgetChatProxy:
+    def __init__(self, chat: Any, completions: _RootBudgetCompletionsProxy):
+        self._chat = chat
+        self.completions = completions
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+class _RootBudgetClientProxy:
+    def __init__(self, client: Any, completions: _RootBudgetCompletionsProxy):
+        self._client = client
+        self.chat = _RootBudgetChatProxy(client.chat, completions)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def _with_root_call_budget(
+    client: Any,
+    *,
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    reasoning_config: Optional[dict],
+    fallback_path: str,
+) -> Any:
+    if client is None or isinstance(client, _RootBudgetClientProxy):
+        return client
+    completions = _RootBudgetCompletionsProxy(
+        client.chat.completions,
+        task=task,
+        provider=provider,
+        model=model,
+        reasoning_config=reasoning_config,
+        fallback_path=fallback_path,
+    )
+    return _RootBudgetClientProxy(client, completions)
+
+
 def _retry_same_provider_sync(
     *,
     task: Optional[str],
@@ -3610,6 +3720,15 @@ def _retry_same_provider_sync(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+
+    retry_client = _with_root_call_budget(
+        retry_client,
+        task=task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        reasoning_config=reasoning_config,
+        fallback_path="retry:same-provider",
+    )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -3669,6 +3788,15 @@ async def _retry_same_provider_async(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+
+    retry_client = _with_root_call_budget(
+        retry_client,
+        task=task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        reasoning_config=reasoning_config,
+        fallback_path="retry:same-provider",
+    )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -3871,6 +3999,14 @@ def _call_fallback_candidate_sync(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
+    fb_client = _with_root_call_budget(
+        fb_client,
+        task=task,
+        provider=fb_label,
+        model=fb_model,
+        reasoning_config=reasoning_config,
+        fallback_path=fb_label or "fallback",
+    )
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3888,6 +4024,14 @@ def _call_fallback_candidate_sync(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                retry_client = _with_root_call_budget(
+                    retry_client,
+                    task=task,
+                    provider=fb_provider,
+                    model=retry_model or fb_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path=f"retry:{fb_label or fb_provider}",
+                )
                 try:
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
@@ -3937,6 +4081,14 @@ async def _call_fallback_candidate_async(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
+    fb_client = _with_root_call_budget(
+        fb_client,
+        task=task,
+        provider=fb_label,
+        model=fb_model,
+        reasoning_config=reasoning_config,
+        fallback_path=fb_label or "fallback",
+    )
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3955,6 +4107,14 @@ async def _call_fallback_candidate_async(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                retry_client = _with_root_call_budget(
+                    retry_client,
+                    task=task,
+                    provider=fb_provider,
+                    model=retry_model or fb_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path=f"retry:{fb_label or fb_provider}",
+                )
                 try:
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
@@ -7050,6 +7210,19 @@ def call_llm(
                      task, resolved_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
+    client = _with_root_call_budget(
+        client,
+        task=task,
+        provider=resolved_provider,
+        model=final_model,
+        reasoning_config=reasoning_config,
+        fallback_path=(
+            str(resolved_provider)
+            if "fallback" in str(resolved_provider or "").lower()
+            else "primary"
+        ),
+    )
+
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
@@ -7249,6 +7422,14 @@ def call_llm(
                 )
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
+                refreshed_client = _with_root_call_budget(
+                    refreshed_client,
+                    task=task,
+                    provider="nous",
+                    model=refreshed_model or final_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path="retry:nous-credential-refresh",
+                )
                 try:
                     return _validate_llm_response(
                         refreshed_client.chat.completions.create(**kwargs), task)
@@ -7278,6 +7459,14 @@ def call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
+                refreshed_client = _with_root_call_budget(
+                    refreshed_client,
+                    task=task,
+                    provider="nous",
+                    model=refreshed_model or final_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path="retry:nous-auth-refresh",
+                )
                 return _validate_llm_response(
                     refreshed_client.chat.completions.create(**kwargs), task)
 
@@ -7669,6 +7858,18 @@ async def async_call_llm(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    client = _with_root_call_budget(
+        client,
+        task=task,
+        provider=resolved_provider,
+        model=final_model,
+        reasoning_config=reasoning_config,
+        fallback_path=(
+            str(resolved_provider)
+            if "fallback" in str(resolved_provider or "").lower()
+            else "primary"
+        ),
+    )
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -7811,6 +8012,14 @@ async def async_call_llm(
                 )
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
+                refreshed_client = _with_root_call_budget(
+                    refreshed_client,
+                    task=task,
+                    provider="nous",
+                    model=refreshed_model or final_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path="retry:nous-credential-refresh",
+                )
                 try:
                     return _validate_llm_response(
                         await refreshed_client.chat.completions.create(**kwargs), task)
@@ -7839,6 +8048,14 @@ async def async_call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
+                refreshed_client = _with_root_call_budget(
+                    refreshed_client,
+                    task=task,
+                    provider="nous",
+                    model=refreshed_model or final_model,
+                    reasoning_config=reasoning_config,
+                    fallback_path="retry:nous-auth-refresh",
+                )
                 return _validate_llm_response(
                     await refreshed_client.chat.completions.create(**kwargs), task)
 

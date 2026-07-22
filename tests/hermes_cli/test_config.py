@@ -2112,6 +2112,12 @@ class TestDelegationCapUnificationMigration:
     def test_default_config_has_no_max_async_children(self):
         assert "max_async_children" not in DEFAULT_CONFIG["delegation"]
 
+    def test_default_config_has_quality_first_delegation_preflight(self):
+        delegation = DEFAULT_CONFIG["delegation"]
+        assert delegation["require_decomposable"] is True
+        assert delegation["tool_profile"] == "auto"
+        assert delegation["max_context_chars"] == 24000
+
 
 class TestConfigNormalizationDoesNotOverwriteUserValues:
     """Regression tests for #27354."""

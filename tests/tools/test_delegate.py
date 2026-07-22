@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
 import threading
 import time
 import types
@@ -30,7 +31,10 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _bound_delegation_context,
     _extract_output_tail,
+    _preflight_delegation,
+    _select_delegation_tool_profile,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -154,6 +158,137 @@ class TestChildSystemPrompt(unittest.TestCase):
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_requires_concrete_evidence_and_uncertainty(self):
+        prompt = _build_child_system_prompt("Audit the parser")
+        self.assertIn("EVIDENCE CONTRACT", prompt)
+        self.assertIn("commands and results", prompt)
+        self.assertIn("unverified", prompt)
+
+
+class TestDelegationPreflight(unittest.TestCase):
+    def test_rejects_vague_pass_through_goal(self):
+        parent = _make_mock_parent()
+        prepared, metadata, error = _preflight_delegation(
+            [{"goal": "Do it"}],
+            parent_agent=parent,
+            cfg={"require_decomposable": True},
+        )
+
+        self.assertEqual(prepared, [])
+        self.assertEqual(metadata["status"], "rejected")
+        self.assertIn("decomposable", error.lower())
+        self.assertIn("task 0", error.lower())
+
+    def test_read_only_audit_gets_non_mutating_profile(self):
+        profile, toolsets, preserve_mcp = _select_delegation_tool_profile(
+            "Audit and summarize the parser implementation",
+            "Read the named files and report findings only.",
+            cfg={"tool_profile": "auto"},
+        )
+
+        self.assertEqual(profile, "inspection")
+        self.assertEqual(toolsets, ["delegation_inspection"])
+        self.assertFalse(preserve_mcp)
+
+        import model_tools
+
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = {item["function"]["name"] for item in definitions}
+        self.assertTrue(names & {"read_file", "search_files", "web_search"})
+        self.assertTrue(
+            names.isdisjoint(
+                {
+                    "terminal",
+                    "process",
+                    "write_file",
+                    "patch",
+                    "browser_click",
+                    "browser_type",
+                    "memory",
+                    "delegate_task",
+                }
+            )
+        )
+
+    def test_coding_goal_gets_coding_profile(self):
+        profile, toolsets, preserve_mcp = _select_delegation_tool_profile(
+            "Implement and test the parser fix",
+            "Modify parser.py and run its focused tests.",
+            cfg={"tool_profile": "auto"},
+        )
+
+        self.assertEqual(profile, "coding")
+        self.assertIn("terminal", toolsets)
+        self.assertIn("file", toolsets)
+        self.assertTrue(preserve_mcp)
+
+    def test_explicit_inherit_profile_is_available_for_justified_broad_work(self):
+        profile, toolsets, preserve_mcp = _select_delegation_tool_profile(
+            "Coordinate the specialized integration",
+            None,
+            cfg={"tool_profile": "inherit"},
+        )
+
+        self.assertEqual(profile, "inherit")
+        self.assertIsNone(toolsets)
+        self.assertTrue(preserve_mcp)
+
+    def test_oversized_context_is_spilled_and_bounded(self):
+        original = "head\n" + ("middle-data\n" * 200) + "tail\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "hermes_constants.get_hermes_dir",
+                return_value=__import__("pathlib").Path(tmp),
+            ):
+                bounded, metadata = _bound_delegation_context(
+                    original,
+                    task_index=2,
+                    max_chars=240,
+                )
+
+        self.assertLess(len(bounded), len(original))
+        self.assertIn("CONTEXT BOUNDED", bounded)
+        self.assertIn("Full delegated context saved to:", bounded)
+        self.assertEqual(metadata["original_chars"], len(original))
+        self.assertEqual(metadata["bounded"], True)
+        self.assertTrue(metadata["spill_path"])
+
+    def test_budget_capacity_gate_requires_one_optional_call_per_child(self):
+        from agent.root_task_budget import RootTaskBudget
+
+        parent = _make_mock_parent()
+        parent.root_task_budget = RootTaskBudget(
+            root_turn_id="root-budget-gate",
+            max_total=4,
+            closure_reserve=2,
+        )
+        for index in range(2):
+            parent.root_task_budget.begin_call(
+                scope="auxiliary",
+                session_id="parent",
+                task=f"seed-{index}",
+                role="auxiliary",
+                provider="test",
+                model="test",
+            ).finish("succeeded")
+
+        prepared, metadata, error = _preflight_delegation(
+            [
+                {"goal": "Audit parser behavior"},
+                {"goal": "Review parser tests"},
+            ],
+            parent_agent=parent,
+            cfg={"require_decomposable": True},
+        )
+
+        self.assertEqual(prepared, [])
+        self.assertEqual(metadata["status"], "rejected")
+        self.assertIn("optional root-budget capacity", error)
 
 
 class TestStripBlockedTools(unittest.TestCase):

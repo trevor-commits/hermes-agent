@@ -1581,11 +1581,45 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+
+                    def _physical_call():
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
+
+                    # The MoA facade is a virtual orchestration call. Its real
+                    # reference/aggregator provider calls are charged inside
+                    # auxiliary_client; charging this outer wrapper too would
+                    # double-count one physical fan-out.
+                    if agent.provider == "moa":
+                        return _physical_call()
+
+                    from agent.root_task_budget import (
+                        execute_model_call as _execute_budgeted_model_call,
+                        get_root_call_context,
+                    )
+
+                    _root_ctx = get_root_call_context()
+                    _root_role = _root_ctx.role if _root_ctx is not None else "parent"
+                    _root_scope = "parent" if _root_role == "parent" else _root_role
+                    _root_task = "main" if _root_role == "parent" else _root_role
+                    _fallback_path = (
+                        f"fallback:{agent.provider or 'unknown'}"
+                        if getattr(agent, "_fallback_activated", False)
+                        else "primary"
+                    )
+                    return _execute_budgeted_model_call(
+                        _physical_call,
+                        context=_root_ctx,
+                        scope=_root_scope,
+                        task=_root_task,
+                        provider=agent.provider or "unknown",
+                        model=agent.model or "unknown",
+                        reasoning=getattr(agent, "reasoning_config", None),
+                        fallback_path=_fallback_path,
+                    )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2632,6 +2666,10 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from agent.root_task_budget import RootBudgetExhausted
+
+                if isinstance(api_error, RootBudgetExhausted):
+                    raise
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -5878,6 +5916,20 @@ def run_conversation(
                 break
             
         except Exception as e:
+            from agent.root_task_budget import RootBudgetExhausted
+
+            if isinstance(e, RootBudgetExhausted):
+                _turn_exit_reason = "root_model_call_budget_exhausted"
+                final_response = (
+                    "I reached the aggregate model-call limit for this task. "
+                    "I stopped optional work before making another provider "
+                    "call; the completed work and evidence remain available."
+                )
+                messages.append({"role": "assistant", "content": final_response})
+                agent._emit_status(
+                    "⚠️ Aggregate task budget exhausted — stopped further model calls"
+                )
+                break
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.

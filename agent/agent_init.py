@@ -473,6 +473,7 @@ def init_agent(
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
+    root_task_budget=None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
@@ -534,9 +535,14 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
-    # Shared iteration budget — parent creates, children inherit.
-    # Consumed by every LLM turn across parent + all subagents.
+    # Local logical-iteration budget. Parent and children retain independent
+    # loop caps; root_task_budget below supplies the aggregate physical cap.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+    # Aggregate physical-call budget is created at the start of a root user
+    # turn. Delegate/background children receive the exact same object.
+    agent.root_task_budget = root_task_budget
+    agent._root_task_budget_inherited = root_task_budget is not None
+    agent._root_task_role = "delegate" if platform == "subagent" else "parent"
     agent.tool_delay = tool_delay
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging

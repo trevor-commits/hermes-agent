@@ -486,6 +486,7 @@ class AIAgent:
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
+        root_task_budget=None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
@@ -562,6 +563,7 @@ class AIAgent:
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
+            root_task_budget=root_task_budget,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
@@ -3595,7 +3597,7 @@ class AIAgent:
         when it was killed, and by the periodic "still working" notifications.
         """
         elapsed = time.time() - self._last_activity_ts
-        return {
+        summary = {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
@@ -3605,6 +3607,13 @@ class AIAgent:
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
         }
+        root_budget = getattr(self, "root_task_budget", None)
+        if root_budget is not None and hasattr(root_budget, "snapshot"):
+            try:
+                summary["root_task_budget"] = root_budget.snapshot()
+            except Exception:
+                pass
+        return summary
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
@@ -6574,6 +6583,14 @@ class AIAgent:
             set_accounting_context,
         )
         from agent.conversation_loop import run_conversation
+        from agent.root_task_budget import (
+            RootCallContext,
+            RootTaskBudget,
+            durable_receipt_sink,
+            reset_root_call_context,
+            resolve_root_budget_limits,
+            set_root_call_context,
+        )
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -6590,6 +6607,49 @@ class AIAgent:
         # (issue #23270).
         acct_token = set_accounting_context(
             getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        )
+
+        # Every root user turn gets one aggregate physical-call budget. Child
+        # agents inherit the same object, while their local IterationBudget
+        # remains independent. This is intentionally created outside the
+        # conversation loop so auxiliary calls and background threads inherit
+        # it through ContextVar propagation too.
+        inherited_root = bool(getattr(self, "_root_task_budget_inherited", False))
+        root_budget = getattr(self, "root_task_budget", None)
+        if not inherited_root or not isinstance(root_budget, RootTaskBudget):
+            try:
+                from hermes_cli.config import load_config
+
+                root_config = load_config() or {}
+            except Exception:
+                root_config = {}
+            root_max, root_reserve = resolve_root_budget_limits(
+                parent_max_iterations=getattr(self, "max_iterations", 90),
+                config=root_config,
+            )
+            receipt_sink = durable_receipt_sink
+            if (
+                os.environ.get("PYTEST_CURRENT_TEST")
+                and not os.environ.get("HERMES_MODEL_CALL_RECEIPTS")
+            ):
+                receipt_sink = None
+            root_budget = RootTaskBudget(
+                root_turn_id=(
+                    f"{getattr(self, 'session_id', None) or 'session'}:root:"
+                    f"{uuid.uuid4().hex[:12]}"
+                ),
+                max_total=root_max,
+                closure_reserve=root_reserve,
+                receipt_sink=receipt_sink,
+            )
+            self.root_task_budget = root_budget
+        root_role = str(getattr(self, "_root_task_role", "parent") or "parent")
+        root_token = set_root_call_context(
+            RootCallContext(
+                budget=root_budget,
+                session_id=getattr(self, "session_id", None) or "",
+                role=root_role,
+            )
         )
         from agent.auxiliary_client import scoped_runtime_main
 
@@ -6611,6 +6671,7 @@ class AIAgent:
                     moa_config=moa_config,
                 )
             finally:
+                reset_root_call_context(root_token)
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

@@ -1128,6 +1128,17 @@ DEFAULT_CONFIG = {
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
         "verify_on_stop": "auto",
+        # Aggregate physical model-call budget for one root user turn. "auto"
+        # derives the parent max_iterations plus one configured delegate
+        # allowance: one useful specialist fits, while multiple children,
+        # retries, auxiliary work, background review, and MoA share a real
+        # ceiling instead of multiplying independent limits.
+        "root_max_iterations": "auto",
+        # Final aggregate capacity reserved for parent integration and
+        # verification. "auto" is a small proportional reserve (8 calls at
+        # the default 90+50 aggregate). Delegates and optional work cannot
+        # enter it; the parent can.
+        "root_closure_reserve": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -1848,6 +1859,7 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,
+            "max_iterations": 4,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
@@ -2383,8 +2395,22 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
+        # Require a concrete, self-contained task rather than vague pass-through
+        # goals such as "do it" or "same as above". Rejections explain what the
+        # parent must add before retrying.
+        "require_decomposable": True,
+        # Task-shaped child capabilities. "auto" selects a genuinely read-only
+        # inspection profile for audits/research, a coding profile for mutation,
+        # and a small terminal/file/web baseline otherwise. Set "inherit" only
+        # when specialized work genuinely needs all parent capabilities.
+        "tool_profile": "auto",
+        # Bound context written directly into a child prompt. Oversized context
+        # is preserved under cache/delegation with a path in the prompt; the
+        # child sees a head+tail window and can read the full file if needed.
+        # 0 disables this source-character ceiling.
+        "max_context_chars": 24000,
+        "max_iterations": 50,  # per-subagent local loop cap. Physical calls also
+                               # charge the root task's shared aggregate budget.
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death
@@ -3575,7 +3601,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # =============================================================================
@@ -6481,6 +6507,11 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "delegation.max_concurrent_children now caps background "
                     "delegations too."
                 )
+
+    # ── Version 33 → 34: aggregate root-call budget defaults ──
+    # No values are materialized. load_config() deep-merges the conservative
+    # auto limits from DEFAULT_CONFIG, preserving lean user files and any
+    # explicit limits a user adds later.
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a

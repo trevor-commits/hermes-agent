@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -584,6 +585,7 @@ def _preserve_parent_mcp_toolsets(
 
 
 DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_MAX_CONTEXT_CHARS = 24000
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -614,6 +616,249 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+_VAGUE_DELEGATION_GOALS = frozenset(
+    {
+        "do it",
+        "do this",
+        "handle it",
+        "handle this",
+        "help",
+        "help me",
+        "continue",
+        "keep going",
+        "work on it",
+        "work on this",
+        "same as above",
+        "something",
+        "anything",
+        "whatever",
+        "do everything",
+    }
+)
+_MUTATING_GOAL_RE = re.compile(
+    r"\b(implement|fix|edit|change|create|modify|refactor|update|build|"
+    r"commit|delete|remove|install|migrate|patch|write|ship|test|debug)\b",
+    re.IGNORECASE,
+)
+_INSPECTION_GOAL_RE = re.compile(
+    r"\b(audit|review|inspect|analy[sz]e|research|summari[sz]e|compare|"
+    r"find|explain|extract|survey|inventory|report)\b",
+    re.IGNORECASE,
+)
+
+
+def _goal_is_decomposable(goal: str) -> bool:
+    """Reject only clearly context-dependent pass-through delegation goals.
+
+    The gate is intentionally conservative: it prevents the common waste case
+    where a parent forwards an unresolved pronoun or its entire task, without
+    rejecting concise but concrete goals such as ``Run tests`` or ``Audit X``.
+    Semantic task quality is still reinforced by the model-facing schema and
+    the evidence contract in the child prompt.
+    """
+    normalized = " ".join(str(goal or "").strip().lower().split())
+    return bool(normalized) and normalized not in _VAGUE_DELEGATION_GOALS
+
+
+def _select_delegation_tool_profile(
+    goal: str,
+    context: Optional[str],
+    *,
+    cfg: Dict[str, Any],
+) -> tuple[str, Optional[List[str]], bool]:
+    """Return ``(profile, toolsets, preserve_parent_mcp)`` for one task.
+
+    ``auto`` is quality-first: implementation gets the normal coding surface;
+    unmistakably read-only work gets an enforced non-mutating inspection
+    surface; other work gets the small terminal/file/web baseline. Operators
+    can explicitly choose ``inherit`` when a specialized task genuinely needs
+    every parent capability.
+    """
+    requested = str(cfg.get("tool_profile", "auto") or "auto").strip().lower()
+    aliases = {"broad": "inherit", "read_only": "inspection", "readonly": "inspection"}
+    requested = aliases.get(requested, requested)
+    if requested not in {"auto", "inherit", "inspection", "coding", "balanced"}:
+        logger.warning(
+            "Unknown delegation.tool_profile=%r; using task-shaped auto profile",
+            requested,
+        )
+        requested = "auto"
+
+    combined = f"{goal or ''}\n{context or ''}"
+    if requested == "auto":
+        if _MUTATING_GOAL_RE.search(combined):
+            requested = "coding"
+        elif _INSPECTION_GOAL_RE.search(combined):
+            requested = "inspection"
+        else:
+            requested = "balanced"
+
+    if requested == "inherit":
+        return requested, None, True
+    if requested == "inspection":
+        # Arbitrary MCP bundles can contain mutation-capable tools, so a true
+        # read-only profile must not silently append them.
+        return requested, ["delegation_inspection"], False
+    if requested == "coding":
+        return (
+            requested,
+            [
+                "terminal",
+                "file",
+                "web",
+                "browser",
+                "skills",
+                "todo",
+                "vision",
+                "code_execution",
+            ],
+            True,
+        )
+    return requested, list(DEFAULT_TOOLSETS), False
+
+
+def _spill_delegation_context(task_index: int, context: str) -> Optional[str]:
+    """Persist full delegated context with user-only permissions."""
+    try:
+        import datetime as _dt
+        from hermes_constants import get_hermes_dir
+
+        cache_dir = get_hermes_dir("cache/delegation", "delegation_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = cache_dir / f"subagent-context-{task_index}-{stamp}.txt"
+        path.write_text(context, encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return str(path)
+    except Exception:
+        logger.debug("Failed to spill delegated context", exc_info=True)
+        return None
+
+
+def _bound_delegation_context(
+    context: Optional[str],
+    *,
+    task_index: int,
+    max_chars: int,
+) -> tuple[Optional[str], Dict[str, Any]]:
+    """Bound model-visible context while preserving the full source on disk."""
+    if context is None:
+        return None, {"bounded": False, "original_chars": 0, "spill_path": None}
+    text = str(context)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, {
+            "bounded": False,
+            "original_chars": len(text),
+            "spill_path": None,
+        }
+
+    spill_path = _spill_delegation_context(task_index, text)
+    # Keep both the task framing at the start and constraints/outcomes often
+    # placed at the end. The footer is intentionally outside the source slice.
+    head_chars = max(80, int(max_chars * 0.7))
+    tail_chars = max(40, max_chars - head_chars)
+    head = text[:head_chars]
+    tail = text[-tail_chars:]
+    footer = [
+        "",
+        "-------- [CONTEXT BOUNDED] --------",
+        f"Showing head and tail of {len(text):,} source characters.",
+    ]
+    if spill_path:
+        footer.append(f"Full delegated context saved to: {spill_path}")
+        footer.append(
+            "Read the full file only if the bounded context is insufficient; "
+            "do not assume omitted details."
+        )
+    else:
+        footer.append("Full context spill failed; report omitted details as unverified.")
+    bounded = head + "\n\n[... bounded middle omitted ...]\n\n" + tail + "\n".join(footer)
+    return bounded, {
+        "bounded": True,
+        "original_chars": len(text),
+        "spill_path": spill_path,
+    }
+
+
+def _preflight_delegation(
+    task_list: List[Dict[str, Any]],
+    *,
+    parent_agent: Any,
+    cfg: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
+    """Validate fan-out value/capacity and prepare bounded task packets."""
+    metadata: Dict[str, Any] = {
+        "status": "accepted",
+        "require_decomposable": is_truthy_value(
+            cfg.get("require_decomposable"), default=True
+        ),
+        "tasks": [],
+    }
+
+    budget = getattr(parent_agent, "root_task_budget", None)
+    optional_remaining = getattr(budget, "optional_remaining", None)
+    if isinstance(optional_remaining, int):
+        metadata["root_budget"] = getattr(budget, "snapshot", lambda: {})()
+        if optional_remaining < len(task_list):
+            metadata["status"] = "rejected"
+            return [], metadata, (
+                "Delegation preflight rejected: insufficient optional root-budget "
+                f"capacity for {len(task_list)} child task(s); "
+                f"{optional_remaining} call slot(s) remain before the parent closure reserve."
+            )
+    else:
+        metadata["root_budget"] = {"enforced": False}
+
+    try:
+        max_context_chars = int(
+            cfg.get("max_context_chars", DEFAULT_MAX_CONTEXT_CHARS)
+        )
+    except (TypeError, ValueError):
+        max_context_chars = DEFAULT_MAX_CONTEXT_CHARS
+    max_context_chars = max(0, max_context_chars)
+
+    prepared: List[Dict[str, Any]] = []
+    for index, raw_task in enumerate(task_list):
+        goal = str(raw_task.get("goal", "")).strip()
+        if metadata["require_decomposable"] and not _goal_is_decomposable(goal):
+            metadata["status"] = "rejected"
+            return [], metadata, (
+                f"Delegation preflight rejected task {index}: goal is not a "
+                "decomposable, self-contained assignment. Name the concrete "
+                "artifact/question, scope, constraints, and expected evidence."
+            )
+
+        bounded_context, context_meta = _bound_delegation_context(
+            raw_task.get("context"),
+            task_index=index,
+            max_chars=max_context_chars,
+        )
+        profile, toolsets, preserve_mcp = _select_delegation_tool_profile(
+            goal,
+            bounded_context,
+            cfg=cfg,
+        )
+        task = dict(raw_task)
+        task["goal"] = goal
+        task["context"] = bounded_context
+        task["_delegate_toolsets"] = toolsets
+        task["_delegate_preserve_mcp"] = preserve_mcp
+        task["_delegate_profile"] = profile
+        prepared.append(task)
+        metadata["tasks"].append(
+            {
+                "task_index": index,
+                "tool_profile": profile,
+                "context": context_meta,
+                "evidence_contract": True,
+            }
+        )
+
+    return prepared, metadata, None
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +940,14 @@ def _build_child_system_prompt(
         "- What you found or accomplished\n"
         "- Any files you created or modified\n"
         "- Any issues encountered\n\n"
+        "EVIDENCE CONTRACT:\n"
+        "- Support factual completion claims with concrete evidence such as "
+        "absolute file paths, commands and results, test counts, IDs, URLs, or "
+        "read-back output.\n"
+        "- Clearly separate what you directly verified from what is inferred or "
+        "unverified.\n"
+        "- Do not claim an external write, commit, push, deployment, or runtime "
+        "change succeeded without a verifiable receipt.\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Keep your final summary tight: lead with outcomes, prefer bullet "
@@ -1085,6 +1338,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    preserve_mcp_toolsets: Optional[bool] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1145,7 +1399,12 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        should_preserve_mcp = (
+            _get_inherit_mcp_toolsets()
+            if preserve_mcp_toolsets is None
+            else bool(preserve_mcp_toolsets)
+        )
+        if should_preserve_mcp:
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
@@ -1220,10 +1479,9 @@ def _build_child_agent(
         session_ref=child_session_ref,
     )
 
-    # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
-    # total iterations across parent + subagents can exceed the parent's
-    # max_iterations.  The user controls the per-subagent cap in config.yaml.
+    # Each subagent keeps a local iteration cap while all of its physical model
+    # calls also charge the parent's shared root_task_budget below. The local
+    # cap catches child loops; the aggregate cap prevents fan-out multiplication.
 
     child_thinking_cb = None
     if child_progress_cb:
@@ -1398,7 +1656,8 @@ def _build_child_agent(
         ),
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
+        iteration_budget=None,  # local logical cap remains fresh per subagent
+        root_task_budget=getattr(parent_agent, "root_task_budget", None),
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
@@ -2502,16 +2761,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2546,6 +2795,22 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    task_list, preflight_metadata, preflight_error = _preflight_delegation(
+        task_list,
+        parent_agent=parent_agent,
+        cfg=cfg,
+    )
+    if preflight_error:
+        return tool_error(preflight_error)
+
+    # Resolve credentials only after preflight accepts the work, so a vague or
+    # unfundable optional fan-out cannot trigger provider resolution/fallback
+    # side effects before being rejected.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2589,9 +2854,9 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # The model cannot choose capabilities. Preflight derives a
+                # bounded operator-controlled profile from the concrete task.
+                toolsets=t.get("_delegate_toolsets"),
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -2605,6 +2870,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                preserve_mcp_toolsets=t.get("_delegate_preserve_mcp"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2887,6 +3153,7 @@ def delegate_task(
         combined: Dict[str, Any] = {
             "results": results,
             "total_duration_seconds": total_duration,
+            "preflight": preflight_metadata,
         }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
@@ -3000,10 +3267,10 @@ def delegate_task(
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
-            context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
+            context=(task_list[0].get("context") if len(task_list) == 1 else None),
+            # Metadata only. Actual child capabilities were already assembled
+            # from each task's preflight profile above.
+            toolsets=[t.get("_delegate_profile") for t in task_list],
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
@@ -3038,6 +3305,7 @@ def delegate_task(
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
                 "note": note,
+                "preflight": preflight_metadata,
             }
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)

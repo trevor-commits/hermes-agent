@@ -28,6 +28,26 @@ from agent.thread_scoped_output import thread_scoped_silence
 logger = logging.getLogger(__name__)
 
 
+def _background_review_max_iterations() -> int:
+    """Return the configured review cap, hard-bounded to four calls."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+        review = (
+            aux.get("background_review")
+            if isinstance(aux.get("background_review"), dict)
+            else {}
+        )
+        value = int(review.get("max_iterations", 4))
+    except (TypeError, ValueError, OSError):
+        value = 4
+    except Exception:
+        value = 4
+    return max(1, min(4, value))
+
+
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
 #
@@ -711,7 +731,7 @@ def _run_review_in_thread(
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=16,
+                max_iterations=_background_review_max_iterations(),
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
@@ -724,8 +744,10 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                root_task_budget=getattr(agent, "root_task_budget", None),
                 **_fork_kwargs,
             )
+            review_agent._root_task_role = "background_review"
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps

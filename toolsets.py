@@ -194,6 +194,22 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "delegation_inspection": {
+        "description": (
+            "Read-only inspection tools for delegated audits and research: "
+            "read/search files, web retrieval, skill reading, session search, "
+            "and vision. Excludes shell execution, file writes, browser actions, "
+            "memory writes, and recursive delegation."
+        ),
+        "tools": [
+            "read_file", "search_files",
+            "web_search", "web_extract",
+            "skills_list", "skill_view",
+            "session_search", "vision_analyze",
+        ],
+        "includes": [],
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
