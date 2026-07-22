@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import json
+import inspect
 import re
 import concurrent.futures
 import base64
@@ -4123,6 +4124,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Stable completion identities already accepted for one autonomous
+        # model wake. Bounded so a long-lived CLI cannot grow without limit.
+        self._notification_model_wake_keys: dict[str, None] = {}
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -7108,6 +7112,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         for msg in self.conversation_history:
             role = msg.get("role", "unknown")
+            effect_disposition = str(msg.get("effect_disposition") or "")
+            is_async_system_event = (
+                role == "user"
+                and effect_disposition.startswith("async_completion_event:")
+            )
 
             if role == "tool":
                 hidden_tool_messages += 1
@@ -7121,6 +7130,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             content = msg.get("content")
             content_text = "" if content is None else str(content)
+
+            if is_async_system_event:
+                _cli_visible_print(f"\n  [System #{visible_index}]")
+                _cli_visible_print(
+                    f"    {content_text[:preview_limit]}{'...' if len(content_text) > preview_limit else ''}"
+                )
+                continue
 
             if role == "user":
                 _cli_visible_print(f"\n  [You #{visible_index}]{_ts_suffix(msg)}")
@@ -9593,10 +9609,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session identity when draining so another window cannot claim and mark
         delivered a completion that belongs to this one.
         """
-        from tools.process_registry import process_registry
+        from tools.process_registry import (
+            async_completion_idempotency_key,
+            build_process_notification_turn,
+            process_registry,
+        )
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            release_event_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -9604,11 +9625,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
+            wake_key = (
+                async_completion_idempotency_key(event)
+                if event.get("type") == "async_delegation"
+                else ""
+            )
+            retained = getattr(self, "_notification_model_wake_keys", None)
+            if not isinstance(retained, dict):
+                retained = {}
+                self._notification_model_wake_keys = retained
+            if wake_key and wake_key in retained:
+                continue
+            if wake_key:
+                retained[wake_key] = None
+                while len(retained) > 512:
+                    retained.pop(next(iter(retained)))
+
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            queued_message = (
+                build_process_notification_turn(event)
+                if event.get("type") == "async_delegation"
+                else synthetic_message
+            )
+            try:
+                self._pending_input.put(queued_message)
+            except Exception:
+                if wake_key:
+                    retained.pop(wake_key, None)
+                release_event_delivery(event, claim)
+                raise
+            else:
+                complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -11961,6 +12010,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        from tools.process_registry import is_synthetic_system_event_turn
+
+        _synthetic_system_event = (
+            message if is_synthetic_system_event_turn(message) else None
+        )
+        _system_event_display = ""
+        _system_event_effect = None
+        if _synthetic_system_event:
+            _system_event_display = str(
+                _synthetic_system_event.get("display_text") or "Background result ready"
+            )
+            _system_event_effect = str(
+                _synthetic_system_event.get("effect_disposition") or ""
+            ) or None
+            message = str(_synthetic_system_event.get("model_text") or "")
+
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
         # this to True. Early returns (credential refresh failure, etc.)
@@ -12046,7 +12111,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
-        if isinstance(message, str) and "@" in message:
+        if (
+            _synthetic_system_event is None
+            and isinstance(message, str)
+            and "@" in message
+        ):
             try:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
@@ -12075,6 +12144,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+            if _synthetic_system_event:
+                _system_event_display = _sanitize_surrogates(_system_event_display)
 
         # Keep the exact CLI input dict available until turn-start persistence.
         # Copy the completed agent transcript before appending: otherwise this
@@ -12092,7 +12163,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._persist_user_message_idx = None
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
-            staged_user_message = {"role": "user", "content": message}
+            agent._persist_user_effect_disposition = _system_event_effect
+            staged_user_message = {
+                "role": "user",
+                "content": (
+                    _system_event_display
+                    if _synthetic_system_event
+                    else message
+                ),
+            }
+            if _synthetic_system_event:
+                staged_user_message["api_content"] = message
+                staged_user_message["effect_disposition"] = _system_event_effect
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
@@ -12180,7 +12262,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # model responds concisely. The prefix is API-call-local only —
             # run_conversation persists the original clean user message.
             _voice_prefix = ""
-            if self._voice_mode and isinstance(message, str):
+            if (
+                _synthetic_system_event is None
+                and self._voice_mode
+                and isinstance(message, str)
+            ):
                 _voice_prefix = (
                     "[Voice input — respond concisely and conversationally, "
                     "2-3 sentences max. No code blocks or markdown.] "
@@ -12242,21 +12328,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # close-path marker follows the same dict into turn setup rather
                 # than producing a second noted user row (#63766).
                 _persist_clean_user_message = (
-                    message if (_voice_prefix or agent_message != message) else None
+                    _system_event_display
+                    if _synthetic_system_event
+                    else (
+                        message if (_voice_prefix or agent_message != message) else None
+                    )
                 )
                 _one_turn_model_restore = getattr(
                     self, "_pending_one_turn_model_restore", None
                 )
                 self._pending_one_turn_model_restore = None
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=_persist_clean_user_message,
-                        moa_config=_moa_cfg,
-                    )
+                    _run_kwargs = {
+                        "user_message": agent_message,
+                        "conversation_history": self.conversation_history[:-1],
+                        "stream_callback": stream_callback,
+                        "task_id": self.session_id,
+                        "persist_user_message": _persist_clean_user_message,
+                        "moa_config": _moa_cfg,
+                    }
+                    try:
+                        _run_params = inspect.signature(
+                            self.agent.run_conversation
+                        ).parameters
+                        if (
+                            _synthetic_system_event
+                            and "persist_user_effect_disposition" in _run_params
+                        ):
+                            _run_kwargs["persist_user_effect_disposition"] = (
+                                _system_event_effect
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    result = self.agent.run_conversation(**_run_kwargs)
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -12455,7 +12559,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             response = result.get("final_response", "") if result else ""
 
             # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
+            if (
+                _synthetic_system_event is None
+                and response
+                and result
+                and not result.get("failed")
+                and not result.get("partial")
+            ):
                 try:
                     from agent.title_generator import maybe_auto_title
                     # Route title-generation failures through the agent's
@@ -15185,6 +15295,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if not user_input:
                         continue
 
+                    from tools.process_registry import is_synthetic_system_event_turn
+
+                    _synthetic_system_event = (
+                        user_input
+                        if is_synthetic_system_event_turn(user_input)
+                        else None
+                    )
+
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
@@ -15261,7 +15379,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
                     print()
-                    self._print_user_message_preview(user_input)
+                    if _synthetic_system_event:
+                        _cprint(
+                            f"{_DIM}{_synthetic_system_event.get('display_text', 'Background result ready')}{_RST}"
+                        )
+                    else:
+                        self._print_user_message_preview(user_input)
                     
                     # Show image attachment count
                     if submit_images:
@@ -15313,10 +15436,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # continuation prompt back into _pending_input so the
                         # next loop iteration picks it up naturally (and any
                         # user input that arrives in between still preempts).
-                        try:
-                            self._maybe_continue_goal_after_turn()
-                        except Exception as _goal_exc:
-                            logging.debug("goal continuation hook failed: %s", _goal_exc)
+                        if _synthetic_system_event is None:
+                            try:
+                                self._maybe_continue_goal_after_turn()
+                            except Exception as _goal_exc:
+                                logging.debug("goal continuation hook failed: %s", _goal_exc)
 
                         # Continuous voice: auto-restart recording after agent responds.
                         # Dispatch to a daemon thread so play_beep (sd.wait) and

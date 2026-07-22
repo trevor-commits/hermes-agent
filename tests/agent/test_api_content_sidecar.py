@@ -357,6 +357,38 @@ class TestFlushOverrideSidecar:
         finally:
             db.close()
 
+    def test_async_system_event_round_trips_compact_content_full_api_and_marker(
+        self, tmp_path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-system-event"
+        db.create_session(session_id=sid, source="cli")
+        try:
+            agent = self._make_agent(db, sid)
+            full = "[ASYNC DELEGATION COMPLETE]\nFULL PRIVATE RESULT"
+            compact = "✅ Background result ready · release audit"
+            marker = "async_completion_event:deleg_release"
+            messages = [
+                {
+                    "role": "user",
+                    "content": full,
+                    "api_content": full,
+                    "effect_disposition": marker,
+                }
+            ]
+            agent._persist_user_message_idx = 0
+            agent._persist_user_message_override = compact
+            agent._persist_user_message_timestamp = None
+
+            agent._flush_messages_to_session_db(messages, None)
+
+            persisted = db.get_messages_as_conversation(sid)[0]
+            assert persisted["content"] == compact
+            assert persisted["api_content"] == full
+            assert persisted["effect_disposition"] == marker
+        finally:
+            db.close()
+
     def test_stamped_sidecar_wins_over_override_derivation(self, tmp_path):
         """When the prologue already stamped api_content (injections), the
         flush must keep those bytes — they are what actually went out."""

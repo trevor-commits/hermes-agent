@@ -1417,6 +1417,27 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
 
+def test_history_to_messages_rehydrates_async_completion_as_system_event():
+    history = [
+        {
+            "role": "user",
+            "content": "✅ Background result ready · audit release",
+            "api_content": "[SYSTEM EVENT]\nfull hidden result",
+            "effect_disposition": "async_completion_event:deleg_123",
+        },
+        {"role": "assistant", "content": "I integrated the result."},
+    ]
+
+    assert server._history_to_messages(history) == [
+        {
+            "role": "system",
+            "text": "✅ Background result ready · audit release",
+            "event_type": "async_completion",
+            "idempotency_key": "async-delegation:deleg_123",
+        },
+        {"role": "assistant", "text": "I integrated the result."},
+    ]
+
 def test_history_to_messages_keeps_reasoning_only_assistant_turn():
     # A thinking-only assistant turn (reasoning present, no visible text) is
     # persisted and recallable, but was dropped from the resumed session view
@@ -10183,6 +10204,67 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_async_completion_is_one_compact_system_event_and_one_wake(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+    emitted = []
+    session_key = "agent:main:tui:dm:async-once"
+    sess = _session(session_key=session_key)
+    server._sessions["sid_async_once"] = sess
+
+    def _dispatch(_rid, _sid, session, turn):
+        turns.append(turn)
+        with session["history_lock"]:
+            session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _dispatch)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery", lambda *_args: "claim"
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+    )
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_tui_once",
+        "session_key": session_key,
+        "status": "completed",
+        "goal": "Audit release",
+        "summary": "FULL PRIVATE RESULT",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    isolated_queue.put(dict(event))
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_async_once", sess)
+
+        status_calls = [args for args in emitted if args[0] == "status.update"]
+        assert len(status_calls) == 1
+        assert status_calls[0][2]["kind"] == "system_event"
+        assert status_calls[0][2]["text"].startswith("✅ Background result ready")
+        assert "FULL PRIVATE RESULT" not in status_calls[0][2]["text"]
+        assert len(turns) == 1
+        assert turns[0]["idempotency_key"] == "async-delegation:deleg_tui_once"
+        assert "FULL PRIVATE RESULT" in turns[0]["model_text"]
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid_async_once", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
 
 
 def test_notification_poller_skips_consumed(monkeypatch):

@@ -210,6 +210,24 @@ def test_persist_user_message_becomes_original():
     assert ctx.messages[-1]["content"] == "api-prefixed"
 
 
+def test_synthetic_system_event_keeps_full_api_payload_behind_compact_transcript():
+    agent = _FakeAgent()
+    ctx = _build(
+        agent,
+        user_message="[SYSTEM EVENT]\nfull background result payload",
+        persist_user_message="✅ Background result ready · audit release",
+        persist_user_effect_disposition="async_completion_event:deleg_123",
+    )
+
+    msg = ctx.messages[-1]
+    assert msg["content"].startswith("[SYSTEM EVENT]")
+    assert msg["api_content"] == msg["content"]
+    assert msg["effect_disposition"] == "async_completion_event:deleg_123"
+    assert ctx.original_user_message == "✅ Background result ready · audit release"
+    assert agent._user_turn_count == 0
+    assert agent._is_user_initiated_turn is False
+
+
 def test_pending_cli_message_carries_durable_marker_to_new_turn_dict():
     """A close-persisted CLI input must not be written again by turn start."""
     agent = _FakeAgent()
@@ -450,4 +468,3 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-

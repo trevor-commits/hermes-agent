@@ -2031,6 +2031,72 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+ASYNC_COMPLETION_EFFECT_PREFIX = "async_completion_event:"
+_SYNTHETIC_SYSTEM_EVENT_KEY = "_hermes_system_event"
+
+
+def async_completion_idempotency_key(evt: dict) -> str:
+    """Return the producer-stable key for one async completion event."""
+    explicit = str(evt.get("idempotency_key") or "").strip()
+    if explicit:
+        return explicit
+    delegation_id = str(evt.get("delegation_id") or "unknown").strip()
+    return f"async-delegation:{delegation_id}"
+
+
+def async_completion_effect_disposition(evt: dict) -> str:
+    """Return the durable transcript marker for an async system event."""
+    delegation_id = str(evt.get("delegation_id") or "unknown").strip()
+    return f"{ASYNC_COMPLETION_EFFECT_PREFIX}{delegation_id}"
+
+
+def _compact_async_goal(value: object, limit: int = 88) -> str:
+    goal = " ".join(str(value or "").split()) or "background delegation"
+    if len(goal) <= limit:
+        return goal
+    return goal[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _format_async_delegation_display(evt: dict) -> str:
+    """Render a compact human-visible system event.
+
+    The full task source and result stay in the model payload and durable
+    ``api_content`` sidecar. This string is deliberately short because it is
+    shown in transcript/status surfaces rather than treated as user prose.
+    """
+    status = str(evt.get("status") or "completed").lower()
+    success = status in {"completed", "success"}
+    icon = "✅" if success else "⚠️"
+    label = "Background result ready" if success else f"Background result {status}"
+    delegation_id = str(evt.get("delegation_id") or "unknown")
+    short_id = delegation_id[-10:] if len(delegation_id) > 10 else delegation_id
+
+    if evt.get("is_batch") or isinstance(evt.get("results"), list):
+        results = evt.get("results") or []
+        goals = evt.get("goals") or []
+        count = len(results) if results else len(goals)
+        passed = sum(
+            1
+            for result in results
+            if str(result.get("status") or "").lower() in {"completed", "success"}
+        )
+        detail = (
+            f"{passed}/{count} tasks succeeded" if results else f"{count} tasks"
+        )
+        duration = evt.get("total_duration_seconds")
+        if duration is not None:
+            detail += f" · {duration}s"
+    else:
+        detail = _compact_async_goal(evt.get("goal"))
+        duration = evt.get("duration_seconds")
+        api_calls = evt.get("api_calls")
+        if duration is not None:
+            detail += f" · {duration}s"
+        if api_calls:
+            detail += f" · {api_calls} call{'s' if api_calls != 1 else ''}"
+    return f"{icon} {label} · {detail} · {short_id}"
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2069,6 +2135,7 @@ def _format_async_delegation(evt: dict) -> str:
         total_dur = evt.get("total_duration_seconds", duration)
         lines = [
             f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+            "This is an internal system event, not a new user request.",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
             "has finished. All ran in parallel and waited on each other; their "
             "consolidated results are below. You may have moved on since "
@@ -2132,6 +2199,7 @@ def _format_async_delegation(evt: dict) -> str:
 
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        "This is an internal system event, not a new user request.",
         "A background subagent you dispatched earlier has finished. You may "
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
@@ -2168,6 +2236,39 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append("Partial output:")
             lines.append(summary)
     return "\n".join(lines)
+
+
+def format_process_notification_display(evt: dict) -> "str | None":
+    """Format the human-visible notification, compacting async completions."""
+    if evt.get("type") == "async_delegation":
+        return _format_async_delegation_display(evt)
+    return format_process_notification(evt)
+
+
+def build_process_notification_turn(evt: dict):
+    """Build the model/display split for a queued completion.
+
+    Ordinary process notifications retain their historical string shape.
+    Async completions return a private envelope: consumers pass ``model_text``
+    to the agent, persist/render ``display_text``, and retain the effect marker
+    so reload can render a system event without sending a mid-history
+    ``role=system`` row to strict providers.
+    """
+    model_text = format_process_notification(evt)
+    if evt.get("type") != "async_delegation" or not model_text:
+        return model_text
+    return {
+        _SYNTHETIC_SYSTEM_EVENT_KEY: True,
+        "event_type": "async_completion",
+        "idempotency_key": async_completion_idempotency_key(evt),
+        "effect_disposition": async_completion_effect_disposition(evt),
+        "display_text": _format_async_delegation_display(evt),
+        "model_text": model_text,
+    }
+
+
+def is_synthetic_system_event_turn(value: object) -> bool:
+    return isinstance(value, dict) and value.get(_SYNTHETIC_SYSTEM_EVENT_KEY) is True
 
 
 def format_process_notification(evt: dict) -> "str | None":

@@ -388,6 +388,51 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
     assert synth_event.source.thread_id == "24296"
 
 
+@pytest.mark.asyncio
+async def test_async_completion_injection_uses_system_event_envelope(monkeypatch, tmp_path):
+    """Gateway delivery keeps the full model payload hidden behind a compact,
+    durable system-event receipt with a stable idempotency identity."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:dm:123"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="1",
+            user_name="Trevor",
+        )
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_gateway_123",
+        "session_key": "agent:main:telegram:dm:123",
+        "parent_session_id": "session-parent",
+        "goal": "Audit the release",
+        "status": "completed",
+        "summary": "FULL PRIVATE RESULT",
+        "duration_seconds": 4,
+    }
+
+    await runner._inject_watch_notification("legacy full text", evt)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    event_meta = synth_event.metadata["synthetic_system_event"]
+    assert synth_event.internal is True
+    assert synth_event.message_id == "async-delegation:deleg_gateway_123"
+    assert "FULL PRIVATE RESULT" in synth_event.text
+    assert event_meta["display_text"].startswith("✅ Background result ready")
+    assert "FULL PRIVATE RESULT" not in event_meta["display_text"]
+    assert event_meta["effect_disposition"] == (
+        "async_completion_event:deleg_gateway_123"
+    )
+    assert event_meta["idempotency_key"] == synth_event.message_id
+    assert synth_event.metadata["gateway_session_id"] == "session-parent"
+
+
 def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypatch, tmp_path):
     runner = _build_runner(monkeypatch, tmp_path, "all")
 

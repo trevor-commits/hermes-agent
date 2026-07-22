@@ -42,9 +42,48 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     cli._drain_process_notifications("cli-idle")
 
     assert calls == [("visible-session", True)]
-    assert cli._pending_input.get_nowait() == "completion payload"
+    queued = cli._pending_input.get_nowait()
+    assert queued["_hermes_system_event"] is True
+    assert queued["idempotency_key"] == "async-delegation:deleg_visible"
+    assert queued["display_text"].startswith("✅ Background result ready")
+    assert "internal system event" in queued["model_text"].lower()
     assert claimed == [(event, "cli-idle")]
     assert completed == [(event, "claim-token")]
+
+
+def test_cli_completion_drain_allows_only_one_model_wake_per_delegation(monkeypatch):
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_once",
+        "session_key": "visible-session",
+        "status": "completed",
+        "summary": "done",
+    }
+
+    class FakeRegistry:
+        def drain_notifications(self, *, session_key="", owns_event=None):
+            assert session_key == "visible-session"
+            assert owns_event(event)
+            return [(event, "first"), (dict(event), "duplicate")]
+
+    claimed = []
+    monkeypatch.setattr("tools.process_registry.process_registry", FakeRegistry())
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda evt, consumer: claimed.append((evt, consumer)) or "claim-token",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+    )
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert cli._pending_input.qsize() == 1
+    assert len(claimed) == 1
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

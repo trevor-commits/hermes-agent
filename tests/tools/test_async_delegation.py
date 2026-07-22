@@ -16,7 +16,13 @@ import time
 import pytest
 
 from tools import async_delegation as ad
-from tools.process_registry import process_registry, format_process_notification
+from tools.process_registry import (
+    ASYNC_COMPLETION_EFFECT_PREFIX,
+    build_process_notification_turn,
+    format_process_notification,
+    format_process_notification_display,
+    process_registry,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +147,8 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["session_key"] == "agent:main:cli:dm:local"
     assert evt["parent_session_id"] == "20260703_parent_sid"
     assert evt["delegation_id"] == res["delegation_id"]
+    assert evt["idempotency_key"] == f"async-delegation:{res['delegation_id']}"
+    assert evt["synthetic_event"] == "async_completion"
 
 
 def test_rich_reinjection_block_is_self_contained():
@@ -168,6 +176,35 @@ def test_rich_reinjection_block_is_self_contained():
         "API calls: 7",
     ]:
         assert needle in text, f"missing {needle!r}"
+
+
+def test_async_completion_turn_has_compact_system_display_and_full_hidden_payload():
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_quality_123",
+        "goal": "Audit the release and verify every acceptance criterion",
+        "status": "completed",
+        "summary": "FULL RESULT: all verification evidence and detailed findings",
+        "api_calls": 4,
+        "duration_seconds": 12.5,
+        "model": "test-model",
+    }
+
+    display = format_process_notification_display(evt)
+    turn = build_process_notification_turn(evt)
+
+    assert display.startswith("✅ Background result ready")
+    assert "FULL RESULT" not in display
+    assert len(display) < 240
+    assert turn["_hermes_system_event"] is True
+    assert turn["event_type"] == "async_completion"
+    assert turn["display_text"] == display
+    assert "FULL RESULT" in turn["model_text"]
+    assert "internal system event" in turn["model_text"].lower()
+    assert turn["idempotency_key"] == "async-delegation:deleg_quality_123"
+    assert turn["effect_disposition"] == (
+        ASYNC_COMPLETION_EFFECT_PREFIX + "deleg_quality_123"
+    )
 
 
 def test_dispatch_rejected_at_capacity():
@@ -871,5 +908,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

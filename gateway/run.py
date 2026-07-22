@@ -11773,7 +11773,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                _event_metadata = getattr(event, "metadata", None) or {}
+                if not isinstance(_event_metadata, dict):
+                    _event_metadata = {}
+                _is_synthetic_system_event = isinstance(
+                    _event_metadata.get("synthetic_system_event"), dict
+                )
+                if _final_text.strip() and not _is_synthetic_system_event:
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -12477,6 +12483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
+        persist_user_effect_disposition = None
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -13198,12 +13205,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event,
-            source=source,
-            history=history,
-            session_key=session_key,
-        )
+        _event_metadata = getattr(event, "metadata", None) or {}
+        if not isinstance(_event_metadata, dict):
+            _event_metadata = {}
+        _system_event_metadata = _event_metadata.get("synthetic_system_event")
+        if isinstance(_system_event_metadata, dict):
+            # This event already contains a self-contained model payload. It is
+            # not user prose: bypass sender prefixes, reply context, timestamp
+            # rendering, attachment expansion, and @-reference processing.
+            message_text = str(event.text or "")
+            persist_user_message = str(
+                _system_event_metadata.get("display_text")
+                or "Background result ready"
+            )
+            persist_user_effect_disposition = str(
+                _system_event_metadata.get("effect_disposition") or ""
+            ) or None
+        else:
+            message_text = await self._prepare_profile_scoped_inbound_message_text(
+                event=event,
+                source=source,
+                history=history,
+                session_key=session_key,
+            )
         if message_text is None:
             return
 
@@ -13222,7 +13246,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_tz = _get_evt_tz()
             _evt_ts = getattr(event, "timestamp", None)
-            if message_text and isinstance(message_text, str):
+            if (
+                not isinstance(_system_event_metadata, dict)
+                and message_text
+                and isinstance(message_text, str)
+            ):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
                 persist_user_message = _clean_message_text
@@ -13268,7 +13296,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": (
+                    persist_user_message
+                    if persist_user_effect_disposition
+                    else message_text
+                )[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -13290,6 +13322,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_effect_disposition=persist_user_effect_disposition,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -17248,16 +17281,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            message_id = str(evt.get("message_id") or "").strip() or None
+            if evt.get("type") == "async_delegation":
+                from tools.process_registry import build_process_notification_turn
+
+                system_turn = build_process_notification_turn(evt)
+                if isinstance(system_turn, dict):
+                    synth_text = str(system_turn.get("model_text") or synth_text)
+                    metadata["synthetic_system_event"] = {
+                        "event_type": system_turn.get("event_type"),
+                        "idempotency_key": system_turn.get("idempotency_key"),
+                        "display_text": system_turn.get("display_text"),
+                        "effect_disposition": system_turn.get("effect_disposition"),
+                    }
+                    message_id = str(
+                        system_turn.get("idempotency_key") or message_id or ""
+                    ) or None
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=message_id,
                 metadata=metadata,
             )
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "%s notification — injecting for %s chat=%s thread=%s",
+                (
+                    "Async completion"
+                    if evt.get("type") == "async_delegation"
+                    else "Watch pattern"
+                ),
                 platform_name,
                 source.chat_id,
                 source.thread_id,
@@ -18915,6 +18969,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_user_message: Optional[Any] = None,
+        persist_user_effect_disposition: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -19189,10 +19245,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
+        _stored_user_message: Dict[str, Any] = {
+            "role": "user",
+            "content": (
+                persist_user_message
+                if persist_user_message is not None
+                else message
+            ),
+        }
+        if persist_user_message is not None and persist_user_message != message:
+            _stored_user_message["api_content"] = message
+        if persist_user_effect_disposition:
+            _stored_user_message["effect_disposition"] = (
+                persist_user_effect_disposition
+            )
+
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
-                {"role": "user", "content": message},
+                _stored_user_message,
                 {"role": "assistant", "content": full_response},
             ],
             "api_calls": 1,
@@ -19219,6 +19290,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_effect_disposition: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19237,6 +19309,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_effect_disposition=persist_user_effect_disposition,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19248,6 +19321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_effect_disposition=persist_user_effect_disposition,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19369,6 +19443,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_effect_disposition: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19393,6 +19468,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_user_message=persist_user_message,
+                persist_user_effect_disposition=persist_user_effect_disposition,
             )
 
         from run_agent import AIAgent
@@ -21208,6 +21285,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message so stale guidance never replays as user-authored text.
             _persist_user_message_override: Optional[Any] = persist_user_message
             _persist_user_timestamp_override: Optional[float] = persist_user_timestamp
+            _persist_user_effect_disposition_override: Optional[str] = (
+                persist_user_effect_disposition
+            )
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -21397,6 +21477,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                if _persist_user_effect_disposition_override:
+                    _conversation_kwargs["persist_user_effect_disposition"] = (
+                        _persist_user_effect_disposition_override
+                    )
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)

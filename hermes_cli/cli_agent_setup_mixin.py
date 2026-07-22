@@ -590,7 +590,15 @@ class CLIAgentSetupMixin:
                 text = _sanitize_display_text(text)
                 if len(text) > MAX_USER_LEN:
                     text = text[:MAX_USER_LEN] + "..."
-                entries.append(("user", text))
+                effect_disposition = str(msg.get("effect_disposition") or "")
+                entries.append(
+                    (
+                        "system_event"
+                        if effect_disposition.startswith("async_completion_event:")
+                        else "user",
+                        text,
+                    )
+                )
 
             elif role == "assistant":
                 text = "" if content is None else str(content)
@@ -680,6 +688,12 @@ class CLIAgentSetupMixin:
                 lines.append(msg_lines[0] + "\n", style="dim")
                 for ml in msg_lines[1:]:
                     lines.append(f"         {ml}\n", style="dim")
+            elif role == "system_event":
+                lines.append("  ◇ System: ", style=f"dim bold {_session_border_c}")
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="dim italic")
+                for ml in msg_lines[1:]:
+                    lines.append(f"            {ml}\n", style="dim italic")
             elif role == "assistant_last":
                 # Last assistant response shown in full, non-dim
                 lines.append("  ◆ Hermes: ", style=f"bold {_assistant_label_c}")

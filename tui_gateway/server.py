@@ -2112,6 +2112,8 @@ def _persist_branch_seed(session: dict) -> None:
         seed = [dict(msg) for msg in (session.get("history") or [])]
     if not seed:
         return
+    from agent.turn_context import extract_api_content_sidecar
+
     with _session_db(session) as db:
         if db is None:
             return
@@ -2121,6 +2123,11 @@ def _persist_branch_seed(session: dict) -> None:
                     session_id=key,
                     role=msg.get("role", "user"),
                     content=msg.get("content"),
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    api_content=extract_api_content_sidecar(msg),
+                    effect_disposition=msg.get("effect_disposition"),
                     # Preserve the parent's original message timestamps —
                     # append_message would otherwise stamp time.time() and the
                     # branch's copied history would all appear authored "now".
@@ -5636,6 +5643,8 @@ def _is_text_only_busy_payload(content: Any) -> bool:
 
 
 def _history_to_messages(history: list[dict]) -> list[dict]:
+    from tools.process_registry import ASYNC_COMPLETION_EFFECT_PREFIX
+
     messages = []
     tool_call_args = {}
 
@@ -5646,6 +5655,21 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in {"user", "assistant", "tool", "system"}:
             continue
         content_text = _coerce_message_text(m.get("content"))
+        effect_disposition = str(m.get("effect_disposition") or "")
+        if role == "user" and effect_disposition.startswith(
+            ASYNC_COMPLETION_EFFECT_PREFIX
+        ):
+            delegation_id = effect_disposition[len(ASYNC_COMPLETION_EFFECT_PREFIX) :]
+            if content_text.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "text": content_text,
+                        "event_type": "async_completion",
+                        "idempotency_key": f"async-delegation:{delegation_id}",
+                    }
+                )
+            continue
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -9308,6 +9332,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4090, limit_message)
     branch_name = params.get("name", "")
     try:
+        from agent.turn_context import extract_api_content_sidecar
+
         if branch_name:
             title = branch_name
         else:
@@ -9335,6 +9361,11 @@ def _(rid, params: dict) -> dict:
                 session_id=new_key,
                 role=msg.get("role", "user"),
                 content=msg.get("content"),
+                tool_name=msg.get("tool_name") or msg.get("name"),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+                api_content=extract_api_content_sidecar(msg),
+                effect_disposition=msg.get("effect_disposition"),
                 timestamp=msg.get("timestamp"),
             )
         db.set_session_title(new_key, title)
@@ -10021,6 +10052,44 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+def _notification_model_wake_key(evt: dict) -> str:
+    """Return the stable wake identity for an async completion, if any."""
+    if evt.get("type") != "async_delegation":
+        return ""
+    from tools.process_registry import async_completion_idempotency_key
+
+    return async_completion_idempotency_key(evt)
+
+
+def _reserve_notification_model_wake_locked(session: dict, key: str) -> bool:
+    """Reserve one model wake while the caller holds ``history_lock``."""
+    if not key:
+        return True
+    retained = session.setdefault("_notification_model_wake_keys", {})
+    if key in retained:
+        return False
+    retained[key] = None
+    while len(retained) > 512:
+        retained.pop(next(iter(retained)))
+    return True
+
+
+def _release_notification_model_wake_locked(session: dict, key: str) -> None:
+    if key:
+        session.get("_notification_model_wake_keys", {}).pop(key, None)
+
+
+def _reserve_notification_display_locked(session: dict, key: tuple) -> bool:
+    """Reserve one visible notification row across every delivery path."""
+    retained = session.setdefault("_notification_display_keys", {})
+    if key in retained:
+        return False
+    retained[key] = None
+    while len(retained) > 1024:
+        retained.pop(next(iter(retained)))
+    return True
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10034,9 +10103,12 @@ def _notification_poller_loop(
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
     """
-    from tools.process_registry import process_registry, format_process_notification
+    from tools.process_registry import (
+        build_process_notification_turn,
+        format_process_notification_display,
+        process_registry,
+    )
 
-    _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
@@ -10079,8 +10151,9 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
-        text = format_process_notification(evt)
-        if not text:
+        turn = build_process_notification_turn(evt)
+        display_text = format_process_notification_display(evt)
+        if not turn or not display_text:
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
@@ -10088,15 +10161,30 @@ def _notification_poller_loop(
         # while distinct watch_match events from the same process must remain
         # visible independently.
         _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
+        with session["history_lock"]:
+            _emit_display = _reserve_notification_display_locked(session, _dedup_key)
+        if _emit_display:
+            _emit(
+                "status.update",
+                sid,
+                {
+                    "kind": (
+                        "system_event"
+                        if evt.get("type") == "async_delegation"
+                        else "process"
+                    ),
+                    "text": display_text,
+                },
+            )
 
         _requeued = False
+        _wake_key = _notification_model_wake_key(evt)
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
+            elif not _reserve_notification_model_wake_locked(session, _wake_key):
+                continue
             else:
                 session["running"] = True
         if _requeued:
@@ -10106,16 +10194,18 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        rid = f"__notif__{int(time.time() * 1000)}"
+        rid = f"__notif__{_wake_key or int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(rid, sid, session, turn)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10126,6 +10216,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+                _release_notification_model_wake_locked(session, _wake_key)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -10159,31 +10250,49 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
-        text = format_process_notification(evt)
-        if not text:
+        turn = build_process_notification_turn(evt)
+        display_text = format_process_notification_display(evt)
+        if not turn or not display_text:
             continue
 
         _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
+        with session["history_lock"]:
+            _emit_display = _reserve_notification_display_locked(session, _dedup_key)
+        if _emit_display:
+            _emit(
+                "status.update",
+                sid,
+                {
+                    "kind": (
+                        "system_event"
+                        if evt.get("type") == "async_delegation"
+                        else "process"
+                    ),
+                    "text": display_text,
+                },
+            )
 
+        _wake_key = _notification_model_wake_key(evt)
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
+            if not _reserve_notification_model_wake_locked(session, _wake_key):
+                continue
             session["running"] = True
 
-        rid = f"__notif__{int(time.time() * 1000)}"
+        rid = f"__notif__{_wake_key or int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(rid, sid, session, turn)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10194,6 +10303,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+                _release_notification_model_wake_locked(session, _wake_key)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -10282,13 +10392,26 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+    from tools.process_registry import is_synthetic_system_event_turn
+
+    synthetic_system_event = text if is_synthetic_system_event_turn(text) else None
+    model_turn_text = (
+        synthetic_system_event.get("model_text", "")
+        if synthetic_system_event
+        else text
+    )
+    visible_turn_text = (
+        synthetic_system_event.get("display_text", "")
+        if synthetic_system_event
+        else text
+    )
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, visible_turn_text)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -10337,9 +10460,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _register_session_cwd(session)
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
-            prompt = text
+            prompt = model_turn_text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if synthetic_system_event is None and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
@@ -10453,8 +10576,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 "stream_callback": _stream,
             }
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
+                run_parameters = inspect.signature(agent.run_conversation).parameters
+                if "task_id" in run_parameters:
                     run_kwargs["task_id"] = session["session_key"]
+                if synthetic_system_event and "persist_user_message" in run_parameters:
+                    run_kwargs["persist_user_message"] = synthetic_system_event.get(
+                        "display_text", ""
+                    )
+                if (
+                    synthetic_system_event
+                    and "persist_user_effect_disposition" in run_parameters
+                ):
+                    run_kwargs["persist_user_effect_disposition"] = (
+                        synthetic_system_event.get("effect_disposition")
+                    )
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
@@ -10586,7 +10721,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            if (
+                synthetic_system_event is None
+                and status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+            ):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -10803,7 +10943,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # requeues every addressed event this session cannot positively claim;
         # the poller then delivers it to a live owner or drops an orphan.
         try:
-            from tools.process_registry import process_registry
+            from tools.process_registry import (
+                build_process_notification_turn,
+                format_process_notification_display,
+                process_registry,
+            )
 
             # Positive-proof ownership (compression-chain aware) — the same
             # fail-closed gate the poller uses, so the post-turn drain can't
@@ -10815,22 +10959,53 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            for index, (_evt, _synth) in enumerate(drained):
+                turn = build_process_notification_turn(_evt)
+                display_text = format_process_notification_display(_evt)
+                if not turn or not display_text:
+                    continue
+                _dedup_key = _notification_event_dedup_key(_evt)
+                _wake_key = _notification_model_wake_key(_evt)
                 with session["history_lock"]:
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
+                    if not _reserve_notification_model_wake_locked(session, _wake_key):
+                        continue
+                    _emit_display = _reserve_notification_display_locked(
+                        session, _dedup_key
+                    )
                     session["running"] = True
+                if _emit_display:
+                    _emit(
+                        "status.update",
+                        sid,
+                        {
+                            "kind": (
+                                "system_event"
+                                if _evt.get("type") == "async_delegation"
+                                else "process"
+                            ),
+                            "text": display_text,
+                        },
+                    )
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        f"__notif__{_wake_key or int(time.time() * 1000)}",
+                        sid,
+                        session,
+                        turn,
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
@@ -10841,6 +11016,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                        _release_notification_model_wake_locked(session, _wake_key)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

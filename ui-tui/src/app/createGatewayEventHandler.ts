@@ -765,6 +765,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        if (p.kind === 'system_event') {
+          // Async completions are semantic system events, not user prose and
+          // not transient activity. Keep the compact receipt in transcript;
+          // the model receives the full payload through the gateway sidecar.
+          sys(p.text)
+          setStatus('background result ready')
+          restoreStatusAfter(6000)
+
+          return
+        }
+
         setStatus(p.text)
 
         if (p.kind === 'compressing') {

@@ -328,6 +328,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    persist_user_effect_disposition: Optional[str] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -418,6 +419,7 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._persist_user_effect_disposition = persist_user_effect_disposition
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
@@ -505,6 +507,25 @@ def build_turn_context(
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
 
+    is_async_system_event = bool(
+        persist_user_effect_disposition
+        and str(persist_user_effect_disposition).startswith(
+            "async_completion_event:"
+        )
+    )
+    if persist_user_effect_disposition:
+        # Strict providers reject a mid-history role=system row. Keep the wire
+        # role as user, mark its semantic role durably, and preserve the full
+        # API payload behind the compact transcript value. Replay substitutes
+        # api_content while UI renderers map the effect marker to a system event.
+        user_msg["effect_disposition"] = str(persist_user_effect_disposition)[:240]
+        if (
+            isinstance(user_message, str)
+            and isinstance(persist_user_message, str)
+            and user_message != persist_user_message
+        ):
+            user_msg["api_content"] = user_message
+
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
@@ -512,7 +533,12 @@ def build_turn_context(
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:
         prior_user_turns = sum(
-            1 for m in conversation_history if m.get("role") == "user"
+            1
+            for m in conversation_history
+            if m.get("role") == "user"
+            and not str(m.get("effect_disposition") or "").startswith(
+                "async_completion_event:"
+            )
         )
         if prior_user_turns > 0:
             agent._user_turn_count = prior_user_turns
@@ -527,10 +553,11 @@ def build_turn_context(
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if not is_async_system_event:
+        agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
-    agent._is_user_initiated_turn = True
+    agent._is_user_initiated_turn = not is_async_system_event
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -546,7 +573,8 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not is_async_system_event
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -558,7 +586,7 @@ def build_turn_context(
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
+    if reaction_callback is not None and not is_async_system_event:
         try:
             from agent.reactions import detect_reaction
 

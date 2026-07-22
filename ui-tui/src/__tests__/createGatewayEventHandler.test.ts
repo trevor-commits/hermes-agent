@@ -180,6 +180,28 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('⏸ goal paused')
   })
 
+  it('persists async completion receipts as compact system events', () => {
+    vi.useFakeTimers()
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+    const receipt = '✅ Background result ready · audit release · deleg_123'
+
+    try {
+      onEvent({
+        payload: { kind: 'system_event', text: receipt },
+        type: 'status.update'
+      } as any)
+
+      expect(ctx.system.sys).toHaveBeenCalledWith(receipt)
+      expect(getUiState().status).toBe('background result ready')
+
+      vi.advanceTimersByTime(6001)
+      expect(getUiState().status).toBe('ready')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('surfaces self-improvement review summaries as a persistent system line', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

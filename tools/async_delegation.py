@@ -248,6 +248,8 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
+                "synthetic_event": "async_completion",
+                "idempotency_key": f"async-delegation:{delegation_id}",
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
@@ -660,6 +662,8 @@ def _push_completion_event(
     evt = {
         "type": "async_delegation",
         "delegation_id": record.get("delegation_id"),
+        "synthetic_event": "async_completion",
+        "idempotency_key": f"async-delegation:{record.get('delegation_id')}",
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
@@ -842,6 +846,8 @@ def _finalize_batch(
     evt = {
         "type": "async_delegation",
         "delegation_id": delegation_id,
+        "synthetic_event": "async_completion",
+        "idempotency_key": f"async-delegation:{delegation_id}",
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
