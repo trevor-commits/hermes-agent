@@ -804,7 +804,7 @@ class TestBuildContextFilesPrompt:
         assert "ESLint" in result
 
     def test_agents_md_top_level_only(self, tmp_path):
-        """AGENTS.md is loaded from cwd only — subdirectory copies are ignored."""
+        """A nested AGENTS.md is not applicable when cwd is the repo root."""
         (tmp_path / "AGENTS.md").write_text("Top level instructions.")
         sub = tmp_path / "src"
         sub.mkdir()
@@ -812,6 +812,46 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Top level" in result
         assert "Src-specific" not in result
+
+    def test_agents_md_discovers_git_root_from_nested_cwd(self, tmp_path):
+        """The repository contract remains active from a nested workspace."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Repository-wide instructions.")
+        nested = tmp_path / "src" / "package"
+        nested.mkdir(parents=True)
+
+        result = build_context_files_prompt(cwd=str(nested))
+
+        assert "Repository-wide instructions" in result
+
+    def test_agents_md_loads_applicable_chain_root_to_cwd(self, tmp_path):
+        """Parent instructions load first so a closer file can refine them."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "AGENTS.md").write_text("Repository-wide instructions.")
+        nested = tmp_path / "services" / "api"
+        nested.mkdir(parents=True)
+        (nested / "AGENTS.md").write_text("API-specific instructions.")
+
+        result = build_context_files_prompt(cwd=str(nested))
+
+        assert result.index("Repository-wide instructions") < result.index(
+            "API-specific instructions"
+        )
+
+    def test_agents_md_stops_at_git_root(self, tmp_path):
+        """An AGENTS.md above the repository cannot gain prompt authority."""
+        (tmp_path / "AGENTS.md").write_text("Outside instructions.")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        (repo / "AGENTS.md").write_text("Repository instructions.")
+        nested = repo / "src"
+        nested.mkdir()
+
+        result = build_context_files_prompt(cwd=str(nested))
+
+        assert "Repository instructions" in result
+        assert "Outside instructions" not in result
 
     # --- .hermes.md / HERMES.md discovery ---
 
@@ -1704,5 +1744,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

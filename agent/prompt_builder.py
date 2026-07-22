@@ -1930,22 +1930,58 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
 
 
 def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
-    """AGENTS.md — top-level only (no recursive walk)."""
-    for name in ["AGENTS.md", "agents.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
+    """Load every AGENTS.md applicable to *cwd_path*, root to closest.
+
+    Inside a git repository, repository-root instructions and any nested
+    instructions on the path to the working directory are cumulative.  Files
+    below the working directory are not applicable.  Outside a repository we
+    inspect only the working directory so an unrelated parent cannot acquire
+    system-prompt authority.
+    """
+    git_root = _find_git_root(cwd_path)
+    current = cwd_path.resolve()
+    search_dirs = [current]
+    if git_root is not None:
+        search_dirs = []
+        for directory in [current, *current.parents]:
+            search_dirs.append(directory)
+            if directory == git_root:
+                break
+        search_dirs.reverse()
+
+    sections: list[str] = []
+    loaded_paths: list[str] = []
+    for directory in search_dirs:
+        candidate = next(
+            (
+                directory / name
+                for name in ("AGENTS.md", "agents.md")
+                if (directory / name).is_file()
+            ),
+            None,
+        )
+        if candidate is not None:
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, name)
-                    result = f"## {name}\n\n{content}"
-                    return _truncate_content(
-                        result, "AGENTS.md", context_length=context_length,
-                        read_path=str(candidate),
-                    )
+                    try:
+                        label = str(candidate.relative_to(git_root or current))
+                    except ValueError:
+                        label = candidate.name
+                    content = _scan_context_content(content, label)
+                    sections.append(f"## {label}\n\n{content}")
+                    loaded_paths.append(str(candidate))
             except Exception as e:
                 logger.debug("Could not read %s: %s", candidate, e)
-    return ""
+
+    if not sections:
+        return ""
+    return _truncate_content(
+        "\n\n".join(sections),
+        "applicable AGENTS.md files",
+        context_length=context_length,
+        read_path=", ".join(loaded_paths),
+    )
 
 
 def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
@@ -2010,7 +2046,7 @@ def build_context_files_prompt(
 
     Priority (first found wins — only ONE project context type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
+      2. AGENTS.md / agents.md   (applicable git-root-to-cwd chain)
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 

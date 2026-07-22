@@ -17,6 +17,11 @@ def test_coding_guidance_advertises_persistent_terminal_state():
     assert "instead of re-sourcing it before every test command" in cc.CODING_AGENT_GUIDANCE
 
 
+def test_coding_guidance_defers_state_moves_to_repository_authority():
+    assert "repository-specific instructions are authoritative" in cc.CODING_AGENT_GUIDANCE
+    assert "When those instructions are silent" in cc.CODING_AGENT_GUIDANCE
+
+
 def _git_init(path):
     env = {
         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
