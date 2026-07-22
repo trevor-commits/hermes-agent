@@ -30,11 +30,18 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     exercise the deferred build itself opt back in with
     ``@pytest.mark.real_agent_prewarm``.
     """
-    if request.node.get_closest_marker("real_agent_prewarm"):
+    focus_map = getattr(server, "_focus_owner_by_transport", None)
+    if focus_map is not None:
+        focus_map.clear()
+    try:
+        if request.node.get_closest_marker("real_agent_prewarm"):
+            yield
+            return
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
         yield
-        return
-    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
-    yield
+    finally:
+        if focus_map is not None:
+            focus_map.clear()
 
 
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
@@ -10971,21 +10978,28 @@ def _idle_evictable_session(now):
     old = now - 10 * 3600  # well past the 6h TTL
     return {
         "running": False,
+        "durable": True,
         "agent_ready": ready,
         "transport": server._detached_ws_transport,  # dead/detached
         "last_active": old,
         "created_at": old,
+        "history_lock": threading.Lock(),
+        "session_key": "durable-session",
     }
 
 
 def test_session_is_evictable_when_idle_dead_and_quiescent(monkeypatch):
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
     now = time.time()
     assert server._session_is_evictable("s", _idle_evictable_session(now), now) is True
 
 
 def test_session_not_evictable_violating_each_exemption(monkeypatch):
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
     now = time.time()
     live_transport = type("T", (), {"_closed": False})()
 
@@ -11010,12 +11024,296 @@ def test_session_not_evictable_violating_each_exemption(monkeypatch):
     assert server._session_is_evictable("s", _idle_evictable_session(now), now) is False
 
 
+def test_safe_unload_rejects_queued_inflight_delegated_and_nonresumable(monkeypatch):
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
+    now = time.time()
+
+    queued = _idle_evictable_session(now) | {
+        "queued_prompt": {"text": "run next", "transport": object()}
+    }
+    assert server._session_is_safe_to_unload("queued", queued, now) is False
+
+    inflight = _idle_evictable_session(now) | {
+        "inflight_turn": {"user": "unfinished", "assistant": "", "streaming": True}
+    }
+    assert server._session_is_safe_to_unload("inflight", inflight, now) is False
+
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: True)
+    assert server._session_is_safe_to_unload(
+        "delegated", _idle_evictable_session(now), now
+    ) is False
+
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    nonresumable = _idle_evictable_session(now) | {"durable": False}
+    assert server._session_is_safe_to_unload("draft", nonresumable, now) is False
+
+
+def test_focus_ownership_is_per_transport_and_cleared_on_disconnect(monkeypatch):
+    now = time.time()
+    server._sessions.clear()
+    server._sessions.update(
+        {
+            "a": _idle_evictable_session(now),
+            "b": _idle_evictable_session(now) | {"session_key": "durable-b"},
+        }
+    )
+    t1, t2 = object(), object()
+    try:
+        assert server._mark_session_focused("a", t1) is True
+        assert server._mark_session_focused("b", t2) is True
+        assert server._session_is_focused("a") is True
+        assert server._session_is_focused("b") is True
+
+        # Switching one client must release only that client's old focus;
+        # another live client can continue protecting its own focused session.
+        assert server._mark_session_focused("b", t1) is True
+        assert server._session_is_focused("a") is False
+        assert server._session_is_focused("b") is True
+        server._clear_transport_focus(t2)
+        assert server._session_is_focused("b") is True
+        server._clear_transport_focus(t1)
+        assert server._session_is_focused("b") is False
+    finally:
+        server._sessions.clear()
+
+
+def test_create_and_active_list_publish_current_focus_before_reaping(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda value: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    server._sessions.clear()
+    try:
+        first = server._methods["session.create"]("r1", {"cols": 80})["result"][
+            "session_id"
+        ]
+        second = server._methods["session.create"]("r2", {"cols": 80})["result"][
+            "session_id"
+        ]
+        assert server._session_is_focused(first) is False
+        assert server._session_is_focused(second) is True
+
+        response = server._methods["session.active_list"](
+            "r3", {"current_session_id": first}
+        )
+        assert "error" not in response
+        assert server._session_is_focused(first) is True
+        assert server._session_is_focused(second) is False
+    finally:
+        server._sessions.clear()
+
+
+def test_inactive_unload_keeps_focused_and_one_recent_warm_session(monkeypatch):
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
+    monkeypatch.setattr(server, "_inactive_session_policy", lambda: (60.0, 1))
+    now = time.time()
+    live_transport = object()
+
+    def session(key: str, last_active: float) -> dict:
+        value = _idle_evictable_session(now)
+        value.update(
+            {
+                "session_key": key,
+                "transport": live_transport,
+                "last_active": last_active,
+                "created_at": last_active,
+            }
+        )
+        return value
+
+    server._sessions.clear()
+    server._sessions.update(
+        {
+            "focused": session("focused-key", now - 600),
+            "warm": session("warm-key", now - 120),
+            "old": session("old-key", now - 300),
+            "unsafe": session("unsafe-key", now - 900) | {"running": True},
+        }
+    )
+    focus_transport = object()
+    try:
+        server._mark_session_focused("focused", focus_transport)
+        assert server._inactive_unload_victims(now) == ["old"]
+    finally:
+        server._sessions.clear()
+
+
+def test_inactive_unload_policy_defaults_validates_and_can_disable(monkeypatch):
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["gateway"]["inactive_session_ttl_seconds"] == 1800
+    assert DEFAULT_CONFIG["gateway"]["inactive_warm_sessions"] == 1
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    assert server._inactive_session_policy() == (1800.0, 1)
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "gateway": {
+                "inactive_session_ttl_seconds": "90",
+                "inactive_warm_sessions": "2",
+            }
+        },
+    )
+    assert server._inactive_session_policy() == (90.0, 2)
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "gateway": {
+                "inactive_session_ttl_seconds": 0,
+                "inactive_warm_sessions": -5,
+            }
+        },
+    )
+    assert server._inactive_session_policy() == (0.0, 0)
+
+
+def test_max_live_sessions_honors_default_and_explicit_disable(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    assert server._max_live_sessions() == 16
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": None})
+    assert server._max_live_sessions() == 0
+
+    monkeypatch.setattr(
+        server, "_load_cfg", lambda: {"gateway": {"max_live_sessions": "4"}}
+    )
+    assert server._max_live_sessions() == 4
+
+
+def test_safe_unload_rechecks_state_before_claim(monkeypatch):
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
+    now = time.time()
+    session = _idle_evictable_session(now)
+    session["running"] = True  # state changed after candidate selection
+    server._sessions.clear()
+    server._sessions["race"] = session
+    try:
+        assert server._unload_session_if_safe("race", now, end_reason="inactive_unload") is False
+        assert server._sessions["race"] is session
+    finally:
+        server._sessions.clear()
+
+
+def test_safe_unload_remains_resumable_through_native_session_resume(monkeypatch, tmp_path):
+    key = "resumable-inactive-session"
+    messages = [
+        {"role": "user", "content": "keep this"},
+        {"role": "assistant", "content": "preserved"},
+    ]
+
+    class FakeDB:
+        def __init__(self):
+            self.end_reason = None
+
+        def get_session(self, session_id):
+            if session_id != key:
+                return None
+            return {
+                "id": key,
+                "source": "tui",
+                "model": "test-model",
+                "model_config": {},
+                "cwd": str(tmp_path),
+                "created_at": 1.0,
+            }
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def end_session(self, session_id, reason):
+            assert session_id == key
+            self.end_reason = reason
+
+        def reopen_session(self, session_id):
+            assert session_id == key
+            self.end_reason = None
+
+        def get_resume_conversations(self, session_id):
+            assert session_id == key
+            return list(messages), list(messages)
+
+        def get_ancestor_display_prefix(self, session_id):
+            assert session_id == key
+            return []
+
+    fake_db = FakeDB()
+    ready = threading.Event()
+    ready.set()
+    old = time.time() - 3600
+    session = {
+        "agent": None,
+        "agent_ready": ready,
+        "created_at": old,
+        "durable": True,
+        "history": list(messages),
+        "history_lock": threading.Lock(),
+        "inflight_turn": None,
+        "last_active": old,
+        "running": False,
+        "session_key": key,
+        "slash_worker": None,
+        "source": "tui",
+        "transport": object(),
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: fake_db)
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, value: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda value: None)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(tmp_path))
+    server._sessions.clear()
+    server._sessions["live-id"] = session
+    try:
+        assert server._unload_session_if_safe(
+            "live-id", time.time(), end_reason="inactive_unload"
+        ) is True
+        assert "live-id" not in server._sessions
+        assert fake_db.end_reason == "inactive_unload"
+
+        response = server._methods["session.resume"](
+            "resume-rpc", {"session_id": key, "cols": 100}
+        )
+        assert "error" not in response
+        result = response["result"]
+        assert result["resumed"] == key
+        assert [item["text"] for item in result["messages"]] == [
+            "keep this",
+            "preserved",
+        ]
+        assert fake_db.end_reason is None
+        resumed = server._sessions[result["session_id"]]
+        assert resumed["durable"] is True
+        assert resumed["session_key"] == key
+    finally:
+        server._sessions.clear()
+
+
 def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
     closed = []
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
+    monkeypatch.setattr(server, "_inactive_session_policy", lambda: (0.0, 1))
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
     monkeypatch.setattr(
-        server, "_close_session_by_id",
-        lambda sid, *, end_reason: closed.append((sid, end_reason)),
+        server,
+        "_unload_session_if_safe",
+        lambda sid, now=None, *, end_reason, **kwargs: closed.append((sid, end_reason)) or True,
     )
     now = time.time()
     server._sessions.clear()

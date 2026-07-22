@@ -465,6 +465,45 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in {"running", "finalizing"})
 
 
+def has_active_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> bool:
+    """Return whether one session still owns running delegation work.
+
+    Session unloading is intentionally fail-safe: callers provide every stable
+    identity they know because the UI id, durable session key, and spawning
+    agent id differ across fresh, resumed, and messaging-gateway sessions.  A
+    record remains active through ``finalizing`` so the owner cannot disappear
+    in the narrow persistence/publication window before its completion event is
+    durable and queued.
+    """
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return False
+    with _records_lock:
+        return any(
+            record.get("status") in {"running", "finalizing"}
+            and (
+                (
+                    origin_ui_session_id
+                    and str(record.get("origin_ui_session_id") or "")
+                    == origin_ui_session_id
+                )
+                or (
+                    session_key
+                    and str(record.get("session_key") or "") == session_key
+                )
+                or (
+                    parent_session_id
+                    and str(record.get("parent_session_id") or "")
+                    == parent_session_id
+                )
+            )
+            for record in _records.values()
+        )
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 

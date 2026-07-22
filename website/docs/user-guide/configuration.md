@@ -1716,6 +1716,7 @@ and messaging gateway:
 
 ```yaml
 max_concurrent_sessions: null  # null/0 = unlimited; positive integer = active session cap
+max_live_sessions: 16          # soft in-memory TUI/Desktop cap; null/0 disables
 ```
 
 When the cap is reached, Hermes returns a direct limit message for new sessions.
@@ -1729,6 +1730,35 @@ The cap is enforced with a local runtime lease file and is best-effort: Hermes
 fails open if the registry cannot be read or locked so users are not stranded.
 It is intended for a single host/profile runtime, not a shared `$HERMES_HOME`
 mounted across multiple machines.
+
+`max_live_sessions` is a separate, soft memory guard for TUI/Desktop sessions.
+When the process exceeds the cap, Hermes can unload the oldest safe detached
+sessions through the same resumable teardown path. Focused, busy, pending,
+queued, building, delegated, non-durable, and configured warm sessions can keep
+the process above the soft cap; safety takes precedence over the number.
+
+### TUI/Desktop inactive session memory
+
+Hermes can release inactive TUI/Desktop agents from memory while preserving
+their conversations for normal database-backed resume:
+
+```yaml
+gateway:
+  inactive_session_ttl_seconds: 1800  # 30 minutes; 0 disables this policy
+  inactive_warm_sessions: 1           # keep the most recent safe idle session warm
+```
+
+The focused session is always retained, including one focused session per
+connected desktop/browser client. Hermes also refuses to unload a session that
+is running, building, awaiting input or approval, holding a queued/in-flight
+prompt, or owns active delegated work. Drafts without a durable session row are
+retained because they cannot yet be resumed. The warm-session count applies in
+addition to those safety exemptions. A cold session reopens through the same
+`session.resume` path as any other saved conversation.
+
+Setting `inactive_session_ttl_seconds: 0` disables only this focus-aware policy;
+the existing WebSocket-orphan and detached-session cleanup behavior remains in
+effect.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

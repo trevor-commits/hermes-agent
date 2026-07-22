@@ -98,6 +98,37 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
+def test_has_active_for_session_matches_each_owner_selector():
+    ad._records.update(
+        {
+            "ui": {
+                "status": "running",
+                "session_key": "key-a",
+                "origin_ui_session_id": "ui-a",
+                "parent_session_id": "parent-a",
+            },
+            "finalizing": {
+                "status": "finalizing",
+                "session_key": "key-b",
+                "origin_ui_session_id": "ui-b",
+                "parent_session_id": "parent-b",
+            },
+            "done": {
+                "status": "completed",
+                "session_key": "key-c",
+                "origin_ui_session_id": "ui-c",
+                "parent_session_id": "parent-c",
+            },
+        }
+    )
+
+    assert ad.has_active_for_session(session_key="key-a") is True
+    assert ad.has_active_for_session(origin_ui_session_id="ui-b") is True
+    assert ad.has_active_for_session(parent_session_id="parent-a") is True
+    assert ad.has_active_for_session(session_key="key-c") is False
+    assert ad.has_active_for_session() is False
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 
@@ -908,4 +939,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

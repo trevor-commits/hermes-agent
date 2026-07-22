@@ -3062,6 +3062,16 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Focus-aware native session unloading for TUI/Desktop. Once a safe,
+        # unfocused session is older than this many seconds, Hermes releases
+        # its in-memory agent/worker and leaves the state.db conversation ready
+        # for normal resume. 0 disables this policy without disabling the
+        # existing detached-WebSocket cleanup paths.
+        "inactive_session_ttl_seconds": 1800,
+        # Keep this many of the most recently used safe, unfocused sessions warm
+        # in addition to every focused/busy/pending/delegated session.
+        "inactive_warm_sessions": 1,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

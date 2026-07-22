@@ -42,6 +42,8 @@ def server():
         mod._pending.clear()
         mod._answers.clear()
         mod._live_transports.clear()
+        if hasattr(mod, "_focus_owner_by_transport"):
+            mod._focus_owner_by_transport.clear()
 
 
 @pytest.fixture()
@@ -485,10 +487,22 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     """The LRU cap frees the least-recently-active DETACHED sessions when over
     the limit, and never a live-transport / running / mid-build one."""
 
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": 2})
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "max_live_sessions": 2,
+            "gateway": {"inactive_warm_sessions": 0},
+        },
+    )
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_session_has_active_delegation", lambda sid, session: False)
+    monkeypatch.setattr(server, "_child_run_active", lambda session_key: False)
     evicted: list[str] = []
     monkeypatch.setattr(
-        server, "_close_session_by_id", lambda sid, end_reason=None: evicted.append(sid)
+        server,
+        "_unload_session_if_safe",
+        lambda sid, now=None, **kwargs: evicted.append(sid) or True,
     )
 
     def _ready() -> threading.Event:
@@ -502,15 +516,35 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     server._sessions.clear()
     server._sessions.update(
         {
-            "old_detached": {"transport": detached, "last_active": 100.0, "agent_ready": _ready()},
-            "new_detached": {"transport": detached, "last_active": 300.0, "agent_ready": _ready()},
+            "old_detached": {
+                "transport": detached,
+                "last_active": 100.0,
+                "agent_ready": _ready(),
+                "durable": True,
+                "session_key": "old",
+            },
+            "new_detached": {
+                "transport": detached,
+                "last_active": 300.0,
+                "agent_ready": _ready(),
+                "durable": True,
+                "session_key": "new",
+            },
             "running_detached": {
                 "transport": detached,
                 "last_active": 50.0,
                 "running": True,
                 "agent_ready": _ready(),
+                "durable": True,
+                "session_key": "running",
             },
-            "focused_live": {"transport": live, "last_active": 200.0, "agent_ready": _ready()},
+            "focused_live": {
+                "transport": live,
+                "last_active": 200.0,
+                "agent_ready": _ready(),
+                "durable": True,
+                "session_key": "focused",
+            },
         }
     )
 
@@ -668,10 +702,12 @@ def test_session_resume_lazy_registers_watch_session_without_agent(server, monke
     assert server._find_live_session_by_key(target) == (sid, session)
     # A later prompt.submit upgrade must continue THIS stored conversation.
     assert session["resume_session_id"] == target
-    # No build started: the idle reaper must still be able to evict it, and
-    # the live status must not report a never-ending "starting".
+    # No build started: after its frontend disconnects (which releases focus),
+    # the idle reaper must still be able to evict it, and the live status must
+    # not report a never-ending "starting".
     assert not session["agent_ready"].is_set()
     assert server._session_live_status(sid, session) != "starting"
+    server._clear_transport_focus(server._stdio_transport)
     session["transport"] = server._detached_ws_transport
     far_future = time.time() + 999999
     assert server._session_is_evictable(sid, session, far_future)

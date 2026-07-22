@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -141,6 +142,11 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+# One focus owner per connected frontend transport. Multiple frontends may
+# focus the same session concurrently, so focus is not a single global sid.
+# Values are live UI session ids; transport object ids are removed on WS
+# disconnect and when their focused session is torn down.
+_focus_owner_by_transport: dict[int, str] = {}
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -777,6 +783,46 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
+def _mark_session_focused(sid: str, transport) -> bool:
+    """Bind one frontend transport's focus to ``sid`` atomically.
+
+    A gateway can serve more than one desktop/browser client. Replacing a
+    process-global ``focused_sid`` would let one window make another window's
+    active chat unloadable. Keying the focus lease by transport preserves every
+    client's current session while still releasing the previous session when
+    that same client switches.
+    """
+    token = id(transport or _stdio_transport)
+    now = time.time()
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None or session.get("_finalized") or session.get("_unloading"):
+            return False
+        _focus_owner_by_transport[token] = sid
+        session["last_focused"] = now
+        session["last_active"] = max(float(session.get("last_active") or 0.0), now)
+        return True
+
+
+def _clear_transport_focus(transport) -> None:
+    """Release a disconnected frontend's focus lease."""
+    token = id(transport or _stdio_transport)
+    with _sessions_lock:
+        _focus_owner_by_transport.pop(token, None)
+
+
+def _session_is_focused(sid: str) -> bool:
+    with _sessions_lock:
+        return sid in _focus_owner_by_transport.values()
+
+
+def _drop_session_focus_locked(sid: str) -> None:
+    """Remove every focus lease for ``sid``; caller holds _sessions_lock."""
+    stale = [token for token, focused_sid in _focus_owner_by_transport.items() if focused_sid == sid]
+    for token in stale:
+        _focus_owner_by_transport.pop(token, None)
+
+
 def _pop_session_by_id(sid: str) -> dict | None:
     """Atomically detach one live session from the registry.
 
@@ -789,6 +835,8 @@ def _pop_session_by_id(sid: str) -> dict | None:
     """
     with _sessions_lock:
         session = _sessions.pop(sid, None)
+        if session is not None:
+            _drop_session_focus_locked(sid)
     if session is None:
         return None
     # The session is already out of _sessions here, so downstream teardown
@@ -883,6 +931,10 @@ def _close_sessions_for_transport(
     independent reap loop in ``handle_ws``.
 
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    # A disconnected client no longer focuses any session. Release this before
+    # detaching its sessions so the native idle policy can make a fresh choice
+    # if another client remains connected.
+    _clear_transport_focus(transport)
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
     reaped = 0
@@ -920,6 +972,9 @@ except (TypeError, ValueError):
     _SESSION_TTL_S = float(6 * 3600)
 _SESSION_TTL_S = max(0.0, _SESSION_TTL_S)
 _REAPER_SCAN_S = 300.0
+_INACTIVE_SESSION_TTL_DEFAULT_S = 30 * 60.0
+_INACTIVE_WARM_SESSIONS_DEFAULT = 1
+_MAX_LIVE_SESSIONS_DEFAULT = 16
 
 
 def _transport_is_dead(transport) -> bool:
@@ -932,13 +987,103 @@ def _transport_is_dead(transport) -> bool:
     return getattr(transport, "_closed", None) is True
 
 
-def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
+def _inactive_session_policy() -> tuple[float, int]:
+    """Return validated focus-aware unload settings from raw config.
+
+    ``_load_cfg`` deliberately does not merge DEFAULT_CONFIG, so runtime
+    defaults must live at this read site as well as in the public schema.
+    A zero TTL disables focus-aware attached-session unloading; the legacy WS
+    orphan and detached-session cleanup paths remain intact.
+    """
+    try:
+        cfg = _load_cfg() or {}
+    except Exception:
+        cfg = {}
+    gateway_cfg = cfg.get("gateway") if isinstance(cfg, dict) else {}
+    if not isinstance(gateway_cfg, dict):
+        gateway_cfg = {}
+
+    raw_ttl = gateway_cfg.get(
+        "inactive_session_ttl_seconds", _INACTIVE_SESSION_TTL_DEFAULT_S
+    )
+    try:
+        ttl = float(raw_ttl)
+    except (TypeError, ValueError):
+        ttl = _INACTIVE_SESSION_TTL_DEFAULT_S
+    if not math.isfinite(ttl):
+        ttl = _INACTIVE_SESSION_TTL_DEFAULT_S
+    ttl = max(0.0, ttl)
+
+    raw_warm = gateway_cfg.get(
+        "inactive_warm_sessions", _INACTIVE_WARM_SESSIONS_DEFAULT
+    )
+    try:
+        warm = int(raw_warm)
+    except (TypeError, ValueError):
+        warm = _INACTIVE_WARM_SESSIONS_DEFAULT
+    return ttl, max(0, warm)
+
+
+def _session_has_active_delegation(sid: str, session: dict) -> bool:
+    """Fail-closed active-delegation check for native session unloading."""
+    key = str(session.get("session_key") or "")
+    agent = session.get("agent")
+    parent_session_id = str(
+        getattr(agent, "session_id", "")
+        or session.get("resume_session_id")
+        or key
+        or ""
+    )
+    try:
+        from tools.async_delegation import has_active_for_session
+
+        return has_active_for_session(
+            session_key=key,
+            origin_ui_session_id=sid,
+            parent_session_id=parent_session_id,
+        )
+    except Exception:
+        # A missing/unreadable registry is uncertainty, not proof that the
+        # session is idle. Keep it resident rather than risk interrupting work.
+        logger.debug("could not verify delegation state for session %s", sid, exc_info=True)
+        return True
+
+
+def _session_is_safe_to_unload(sid: str, session: dict, now: float) -> bool:
+    """Whether ``session`` may be removed without losing or interrupting work.
+
+    This predicate intentionally excludes age and transport: callers layer
+    their own policy (detached TTL, focus-aware inactive TTL, or LRU pressure)
+    over the same non-negotiable safety gate.
+    """
+    if session.get("_finalized") or session.get("_unloading"):
+        return False
+    if _session_is_focused(sid):
+        return False
+    # A draft without a state.db row cannot be cold-resumed. Never trade user
+    # state for memory savings; first real activity flips this marker true.
+    if session.get("durable") is not True:
+        return False
     if session.get("running") or _session_pending_kind(sid):
         return False
+    if session.get("queued_prompt") or session.get("inflight_turn"):
+        return False
     ready = session.get("agent_ready")
-    # Lazy watch sessions (subagent spectator windows) never start a build,
-    # so their forever-unset agent_ready must not make them immortal.
     if ready is not None and not ready.is_set() and not session.get("lazy"):
+        return False
+    key = str(session.get("session_key") or "")
+    try:
+        if session.get("lazy") and key and _child_run_active(key):
+            return False
+    except Exception:
+        return False
+    if _session_has_active_delegation(sid, session):
+        return False
+    return True
+
+
+def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
+    if not _session_is_safe_to_unload(sid, session, now):
         return False
     if not _transport_is_dead(session.get("transport")):
         return False
@@ -947,12 +1092,103 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     return (now - last_active) > _SESSION_TTL_S and (now - created_at) > _SESSION_TTL_S
 
 
+def _inactive_unload_victims(now: float | None = None) -> list[str]:
+    """Select old, safe, unfocused sessions while retaining a warm tail."""
+    now = time.time() if now is None else now
+    ttl, warm_count = _inactive_session_policy()
+    if ttl <= 0:
+        return []
+    with _sessions_lock:
+        snapshot = list(_sessions.items())
+    candidates = [
+        (sid, session)
+        for sid, session in snapshot
+        if _session_is_safe_to_unload(sid, session, now)
+    ]
+    # Newest first: warm_count protects the sessions a user is most likely to
+    # switch back to. Unsafe/focused sessions are already protected and do not
+    # consume this warm allowance.
+    candidates.sort(
+        key=lambda item: (
+            float(item[1].get("last_active") or item[1].get("created_at") or 0.0),
+            item[0],
+        ),
+        reverse=True,
+    )
+    victims: list[str] = []
+    for sid, session in candidates[warm_count:]:
+        last_active = float(session.get("last_active") or 0.0)
+        created_at = float(session.get("created_at") or 0.0)
+        if (now - last_active) > ttl and (now - created_at) > ttl:
+            victims.append(sid)
+    return victims
+
+
+def _unload_session_if_safe(
+    sid: str,
+    now: float | None = None,
+    *,
+    end_reason: str,
+    require_detached: bool = False,
+    min_age_seconds: float | None = None,
+) -> bool:
+    """Revalidate and atomically claim one session for native teardown.
+
+    Candidate selection and teardown are separated by real time. This second
+    check closes the race where a prompt, approval, focus switch, or delegation
+    begins after the reaper's snapshot. ``_unloading`` also makes a request that
+    already resolved the session fail before it can start a turn.
+    """
+    now = time.time() if now is None else now
+    claimed = None
+    with _session_resume_lock:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if session is None:
+                return False
+            history_lock = session.get("history_lock")
+            lock_context = history_lock if history_lock is not None else contextlib.nullcontext()
+            with lock_context:
+                if not _session_is_safe_to_unload(sid, session, now):
+                    return False
+                if require_detached and not _transport_is_dead(session.get("transport")):
+                    return False
+                if min_age_seconds is not None:
+                    last_active = float(session.get("last_active") or 0.0)
+                    created_at = float(session.get("created_at") or 0.0)
+                    if (
+                        (now - last_active) <= min_age_seconds
+                        or (now - created_at) <= min_age_seconds
+                    ):
+                        return False
+                session["_unloading"] = True
+                claimed = _sessions.pop(sid, None)
+                if claimed is not None:
+                    _drop_session_focus_locked(sid)
+                    claimed["_sid"] = sid
+    return _teardown_popped_session(claimed, end_reason=end_reason)
+
+
 def _reap_idle_sessions() -> None:
     now = time.time()
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
     for sid in victims:
-        _close_session_by_id(sid, end_reason="idle_timeout")
+        _unload_session_if_safe(
+            sid,
+            now,
+            end_reason="idle_timeout",
+            require_detached=True,
+            min_age_seconds=_SESSION_TTL_S,
+        )
+    ttl, _warm = _inactive_session_policy()
+    for sid in _inactive_unload_victims(now):
+        _unload_session_if_safe(
+            sid,
+            now,
+            end_reason="inactive_unload",
+            min_age_seconds=ttl,
+        )
     _enforce_session_cap()
 
 
@@ -969,11 +1205,16 @@ def _max_live_sessions() -> int:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
 
         cfg = _load_cfg() or {}
-        raw = cfg.get("max_live_sessions")
-        if raw is None:
-            gateway_cfg = cfg.get("gateway")
-            if isinstance(gateway_cfg, dict):
-                raw = gateway_cfg.get("max_live_sessions")
+        gateway_cfg = cfg.get("gateway")
+        if "max_live_sessions" in cfg:
+            # Presence matters: an explicit null disables the soft cap.
+            raw = cfg.get("max_live_sessions")
+        elif isinstance(gateway_cfg, dict) and "max_live_sessions" in gateway_cfg:
+            raw = gateway_cfg.get("max_live_sessions")
+        else:
+            # _load_cfg is raw YAML, not DEFAULT_CONFIG-merged. Keep the
+            # documented default-on behavior at the read site.
+            raw = _MAX_LIVE_SESSIONS_DEFAULT
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
@@ -981,15 +1222,13 @@ def _max_live_sessions() -> int:
 
 
 def _session_is_lru_evictable(sid: str, session: dict) -> bool:
-    # Same hard exemptions as the TTL reaper (never evict a session mid-turn,
-    # awaiting input, or still building), but WITHOUT the hours-scale age gate:
-    # a detached session is eligible the moment it loses its client.
-    if session.get("running") or _session_pending_kind(sid):
-        return False
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.is_set() and not session.get("lazy"):
-        return False
-    return _transport_is_dead(session.get("transport"))
+    # Same hard exemptions as every unload path, but WITHOUT the hours-scale
+    # age gate: a detached session is pressure-eligible when it loses its
+    # client. Focus, warm-tail, durable-resume, queued, and delegated guards
+    # are applied independently below.
+    return _session_is_safe_to_unload(sid, session, time.time()) and _transport_is_dead(
+        session.get("transport")
+    )
 
 
 def _enforce_session_cap() -> None:
@@ -1003,12 +1242,19 @@ def _enforce_session_cap() -> None:
         evictable = [
             (sid, s) for sid, s in _sessions.items() if _session_is_lru_evictable(sid, s)
         ]
-    # Oldest-touched first; only evict down to the cap (live/focused sessions on
-    # a live transport are never eligible, so we may stop short of the cap).
+    # Oldest-touched first; preserve the configured warm tail even under cap
+    # pressure. Safety wins over reaching the numeric cap, so focused or busy
+    # sessions may leave the process above the soft limit.
     evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
     overflow = total - cap
-    for sid, _s in evictable[:overflow]:
-        _close_session_by_id(sid, end_reason="lru_evict")
+    _ttl, warm_count = _inactive_session_policy()
+    pressure_victims = evictable[: max(0, len(evictable) - warm_count)]
+    for sid, _s in pressure_victims[:overflow]:
+        _unload_session_if_safe(
+            sid,
+            end_reason="lru_evict",
+            require_detached=True,
+        )
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -1783,8 +2029,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    with _sessions_lock:
+        s = _sessions.get(params.get("session_id") or "")
+        if s is None or s.get("_unloading"):
+            return (None, _err(rid, 4001, "session not found"))
+        return (s, None)
 
 
 def _sess(params, rid):
@@ -2084,6 +2333,8 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
         )
+        # Safe unload is allowed only after this durable resume anchor exists.
+        session["durable"] = True
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
@@ -5345,6 +5596,7 @@ def _init_session(
             "history_version": 0,
             "inflight_turn": None,
             "created_at": now,
+            "durable": False,
             "last_active": now,
             "running": False,
             "attached_images": [],
@@ -5368,6 +5620,10 @@ def _init_session(
     db = session_db if session_db is not None else _get_db()
     if db is not None:
         row = db.get_session(key)
+        if row:
+            with _sessions_lock:
+                if sid in _sessions:
+                    _sessions[sid]["durable"] = True
         if row and row.get("cwd"):
             with _sessions_lock:
                 if sid in _sessions:
@@ -6072,6 +6328,9 @@ def _(rid, params: dict) -> dict:
             "active_session_lease": lease,
             "cols": cols,
             "created_at": now,
+            # Fresh drafts are not written to state.db until the first prompt.
+            # They cannot be unloaded safely before that durable anchor exists.
+            "durable": False,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
             "history": history,
@@ -6097,6 +6356,11 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+
+    # session.create makes this the caller's visible session immediately. Mark
+    # focus before any asynchronous cap/reaper work can inspect the registry;
+    # the periodic active-list signal keeps the lease current afterwards.
+    _mark_session_focused(sid, current_transport() or _stdio_transport)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -6325,6 +6589,9 @@ def _deferred_session_record(
         "active_session_lease": lease,
         "cols": cols,
         "created_at": now,
+        # Deferred records are created only for an existing state.db session
+        # selected through resume/watch, so cold resume is already available.
+        "durable": True,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
@@ -6367,6 +6634,7 @@ def _claim_or_reuse_live(
         with _sessions_lock:
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
+    _mark_session_focused(sid, current_transport() or _stdio_transport)
     return None
 
 
@@ -6455,6 +6723,7 @@ def _(rid, params: dict) -> dict:
     )
 
     def _reuse_live_payload(sid: str, session: dict) -> dict:
+        _mark_session_focused(sid, current_transport() or _stdio_transport)
         payload = _live_session_payload(
             sid,
             session,
@@ -6710,6 +6979,9 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             other_sid, other_session = live
+            _mark_session_focused(
+                other_sid, current_transport() or _stdio_transport
+            )
             payload = _live_session_payload(
                 other_sid,
                 other_session,
@@ -6756,6 +7028,7 @@ def _(rid, params: dict) -> dict:
                 lease.release()
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
+    _mark_session_focused(sid, current_transport() or _stdio_transport)
     return _ok(
         rid,
         {
@@ -7024,6 +7297,8 @@ def _(rid, params: dict) -> dict:
     without closing siblings.
     """
     current = str(params.get("current_session_id") or "")
+    if current:
+        _mark_session_focused(current, current_transport() or _stdio_transport)
     try:
         with _sessions_lock:
             snapshot = list(_sessions.items())
@@ -7061,6 +7336,9 @@ def _(rid, params: dict) -> dict:
     returns enough state for Ink to redraw around another live session id.
     """
     sid = str(params.get("session_id") or "")
+    transport = current_transport() or _stdio_transport
+    if not _mark_session_focused(sid, transport):
+        return _err(rid, 4001, "session not found")
     session, err = _sess_nowait({"session_id": sid}, rid)
     if err:
         return err
@@ -7072,7 +7350,7 @@ def _(rid, params: dict) -> dict:
             sid,
             session,
             touch=True,
-            transport=current_transport() or _stdio_transport,
+            transport=transport,
         ),
     )
 
@@ -9786,6 +10064,8 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if session.get("_unloading"):
+                return _err(rid, 4001, "session not found")
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -9802,6 +10082,8 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        if session.get("_unloading"):
+            return _err(rid, 4001, "session not found")
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
