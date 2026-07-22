@@ -148,6 +148,13 @@ _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
 _check_fn_last_good: Dict[Callable, float] = {}
+# Last stable availability state reported by each probe. This lets us keep an
+# expected cold ``False`` at DEBUG while still surfacing real state changes.
+_check_fn_reported_state: Dict[Callable, bool] = {}
+# Last-good timestamp for which a transient-failure warning was emitted.
+# A flapping probe is retried on every call during the grace window, so without
+# this guard it can otherwise produce one warning per tool-definition build.
+_check_fn_transient_warning_epoch: Dict[Callable, float] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
@@ -177,8 +184,15 @@ def _check_fn_cached(fn: Callable) -> bool:
 
     with _check_fn_cache_lock:
         if value:
+            prior_state = _check_fn_reported_state.get(fn)
             _check_fn_last_good[fn] = now
             _check_fn_cache[fn] = (now, True)
+            _check_fn_reported_state[fn] = True
+            if prior_state is False:
+                logger.info(
+                    "check_fn %s recovered; dependent tools are available again",
+                    getattr(fn, "__qualname__", fn),
+                )
             return True
 
         last_good = _check_fn_last_good.get(fn)
@@ -186,22 +200,45 @@ def _check_fn_cached(fn: Callable) -> bool:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
             # rather than pinning a stale verdict for the full TTL.
-            logger.warning(
-                "check_fn %s failed (%s) within %.0fs of last success; "
-                "treating as transient and keeping tool(s) available",
-                getattr(fn, "__qualname__", fn),
-                "raised" if raised else "returned False",
-                _CHECK_FN_FAILURE_GRACE_SECONDS,
-            )
+            if _check_fn_transient_warning_epoch.get(fn) != last_good:
+                logger.warning(
+                    "check_fn %s failed (%s) within %.0fs of last success; "
+                    "treating as transient and keeping tool(s) available",
+                    getattr(fn, "__qualname__", fn),
+                    "raised" if raised else "returned False",
+                    _CHECK_FN_FAILURE_GRACE_SECONDS,
+                )
+                _check_fn_transient_warning_epoch[fn] = last_good
             return True
 
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
-            "check_fn %s %s; dependent tools will be unavailable this turn",
-            getattr(fn, "__qualname__", fn),
-            "raised" if raised else "returned False",
-        )
+        # No recent success (or grace expired) — honor the failure. Expected
+        # cold unavailability is common for optional integrations, so only a
+        # real available→unavailable transition (or a cold probe exception)
+        # warrants a warning. Repeated probes in the same unavailable state
+        # stay at DEBUG to avoid drowning actionable runtime signals.
+        prior_state = _check_fn_reported_state.get(fn)
+        failure_reason = "raised" if raised else "returned False"
+        if prior_state is True:
+            logger.warning(
+                "check_fn %s transitioned from available to unavailable (%s); "
+                "dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+                failure_reason,
+            )
+        elif raised and prior_state is None:
+            logger.warning(
+                "check_fn %s raised during its initial availability probe; "
+                "dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+        else:
+            logger.debug(
+                "check_fn %s %s (expected unavailable state); "
+                "dependent tools remain unavailable",
+                getattr(fn, "__qualname__", fn),
+                failure_reason,
+            )
+        _check_fn_reported_state[fn] = False
         _check_fn_cache[fn] = (now, False)
         return False
 
@@ -212,6 +249,8 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+        _check_fn_reported_state.clear()
+        _check_fn_transient_warning_epoch.clear()
 
 
 class ToolRegistry:

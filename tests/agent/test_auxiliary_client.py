@@ -2500,6 +2500,55 @@ class TestAuxiliaryFallbackLayering:
 
         assert main_client.chat.completions.create.called
 
+    def test_optional_explicit_route_does_not_silently_use_main_model(self):
+        """Optional work degrades when its declared route and explicit chain fail.
+
+        Title generation has a deterministic caller fallback; spending the
+        primary chat model as an undocumented safety net is unnecessary and
+        defeats operator cost/routing intent.
+        """
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "cheap-title-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openrouter", "cheap-title-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")) as configured, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as main:
+            with pytest.raises(Exception, match="Payment Required"):
+                call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "name this chat"}],
+                )
+
+        configured.assert_called_once()
+        main.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_optional_explicit_route_does_not_use_main_model(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=self._make_payment_err()
+        )
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "cheap-title-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openrouter", "cheap-title-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")) as configured, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as main:
+            with pytest.raises(Exception, match="Payment Required"):
+                await async_call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "name this chat"}],
+                )
+
+        configured.assert_called_once()
+        main.assert_not_called()
+
     def test_explicit_provider_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit on an explicit provider must trigger fallback (not be ignored).
 

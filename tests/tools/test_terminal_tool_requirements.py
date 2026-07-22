@@ -133,6 +133,79 @@ class TestCheckFnTransientFailureSuppression:
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
         assert reg._check_fn_cached(never) is False
 
+    def test_expected_cold_unavailability_is_debug_not_warning(
+        self, monkeypatch, caplog
+    ):
+        import logging
+        import tools.registry as reg
+
+        monkeypatch.setattr(reg.time, "monotonic", lambda: 1000.0)
+
+        def optional_feature_disabled():
+            return False
+
+        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+            assert reg._check_fn_cached(optional_feature_disabled) is False
+
+        assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+        assert any("expected unavailable state" in record.message for record in caplog.records)
+
+    def test_real_available_to_unavailable_transition_warns_once(
+        self, monkeypatch, caplog
+    ):
+        import logging
+        import tools.registry as reg
+
+        state = {"ok": True}
+        now = {"value": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: now["value"])
+
+        def probe():
+            return state["ok"]
+
+        assert reg._check_fn_cached(probe) is True
+        state["ok"] = False
+        now["value"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
+        with caplog.at_level(logging.WARNING, logger="tools.registry"):
+            assert reg._check_fn_cached(probe) is False
+            now["value"] += reg._CHECK_FN_TTL_SECONDS + 1
+            assert reg._check_fn_cached(probe) is False
+
+        warnings = [
+            record for record in caplog.records
+            if "transitioned from available to unavailable" in record.message
+        ]
+        assert len(warnings) == 1
+
+    def test_transient_warning_is_deduplicated_for_one_last_good_epoch(
+        self, monkeypatch, caplog
+    ):
+        import logging
+        import tools.registry as reg
+
+        state = {"ok": True}
+        now = {"value": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: now["value"])
+
+        def probe():
+            return state["ok"]
+
+        assert reg._check_fn_cached(probe) is True
+        state["ok"] = False
+        with caplog.at_level(logging.WARNING, logger="tools.registry"):
+            now["value"] += reg._CHECK_FN_TTL_SECONDS + 1
+            assert reg._check_fn_cached(probe) is True
+            # Transient failures are deliberately not cached, so one second
+            # later the probe runs again in the same last-good grace epoch.
+            now["value"] += 1
+            assert reg._check_fn_cached(probe) is True
+
+        warnings = [
+            record for record in caplog.records
+            if "treating as transient" in record.message
+        ]
+        assert len(warnings) == 1
+
     def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
         import tools.registry as reg
 

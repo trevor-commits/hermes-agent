@@ -10,6 +10,8 @@ Pure-function / config-driven; no live model calls.
 """
 from typing import Any
 from unittest.mock import patch
+from pathlib import Path
+import json
 
 from agent import background_review as br
 
@@ -98,7 +100,7 @@ def test_routing_same_model_as_parent_is_not_routed():
     assert rt["routed"] is False  # same model/provider → keep full-replay path
 
 
-def test_routing_resolution_failure_falls_back_to_parent():
+def test_routing_resolution_failure_is_degraded_without_parent_fallback():
     agent = _FakeAgent()
     cfg = {"auxiliary": {"background_review": {
         "provider": "openrouter", "model": "google/gemini-3-flash-preview",
@@ -107,8 +109,119 @@ def test_routing_resolution_failure_falls_back_to_parent():
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                side_effect=RuntimeError("boom")):
         rt = br._resolve_review_runtime(agent)
-    assert rt["routed"] is False
-    assert rt["provider"] == "openai-codex"
+    assert rt["routed"] is True
+    assert rt["available"] is False
+    assert rt["requested_provider"] == "openrouter"
+    assert rt["requested_model"] == "google/gemini-3-flash-preview"
+    assert "boom" in rt["degraded_reason"]
+
+
+def test_completed_turn_without_learning_signal_does_not_qualify():
+    result = br.qualify_background_review_turn(
+        original_user_message="What time is the meeting?",
+        completed=True,
+        memory_due=True,
+        skills_due=False,
+        memory_available=True,
+        skills_available=True,
+    )
+    assert result == {
+        "review_memory": False,
+        "review_skills": False,
+        "reasons": [],
+    }
+
+
+def test_explicit_preference_qualifies_memory_immediately():
+    result = br.qualify_background_review_turn(
+        original_user_message="I prefer concise status updates; remember that.",
+        completed=True,
+        memory_due=False,
+        skills_due=False,
+        memory_available=True,
+        skills_available=True,
+    )
+    assert result["review_memory"] is True
+    assert "memory_signal" in result["reasons"]
+
+
+def test_user_correction_qualifies_skill_review_immediately():
+    result = br.qualify_background_review_turn(
+        original_user_message="Stop using that format; next time use a table instead.",
+        completed=True,
+        memory_due=False,
+        skills_due=False,
+        memory_available=True,
+        skills_available=True,
+    )
+    assert result["review_skills"] is True
+    assert "workflow_correction" in result["reasons"]
+
+
+def test_failed_or_interrupted_turn_never_qualifies():
+    result = br.qualify_background_review_turn(
+        original_user_message="Remember that I prefer tables.",
+        completed=False,
+        memory_due=True,
+        skills_due=True,
+        memory_available=True,
+        skills_available=True,
+    )
+    assert result["review_memory"] is False
+    assert result["review_skills"] is False
+
+
+def test_unavailable_optional_route_does_not_construct_primary_review_agent():
+    agent = _FakeAgent()
+    agent.session_id = "session-route-degraded"
+    agent.root_task_budget = None
+    captured = []
+    unavailable = {
+        "available": False,
+        "routed": True,
+        "requested_provider": "openrouter",
+        "requested_model": "cheap-review-model",
+        "degraded_reason": "quota exhausted",
+    }
+
+    with patch.object(br, "_resolve_review_runtime", return_value=unavailable), \
+         patch("run_agent.AIAgent") as review_agent_cls, \
+         patch.object(
+             br,
+             "_write_background_review_receipt",
+             side_effect=lambda _agent, receipt: captured.append(dict(receipt)),
+         ):
+        br._run_review_in_thread(
+            agent,
+            [{"role": "user", "content": "Remember my preference."}],
+            "review memory",
+            review_memory=True,
+        )
+
+    review_agent_cls.assert_not_called()
+    assert captured[-1]["status"] == "degraded"
+    assert captured[-1]["reason"] == "optional_route_unavailable"
+    assert captured[-1]["route"]["requested_provider"] == "openrouter"
+
+
+def test_review_receipt_writes_archive_and_atomic_last_pointer(tmp_path):
+    payload = {
+        "schema_version": 1,
+        "receipt_id": "receipt-test",
+        "session_id": "session-test",
+        "status": "no_action",
+    }
+    agent = _FakeAgent()
+
+    with patch("hermes_constants.get_hermes_home", return_value=Path(tmp_path)):
+        archive = br._write_background_review_receipt(agent, payload)
+
+    assert archive is not None
+    archive_path = Path(archive)
+    last_path = Path(tmp_path) / "audits" / "background-review-last.json"
+    assert json.loads(archive_path.read_text()) == payload
+    assert json.loads(last_path.read_text()) == payload
+    assert archive_path.stat().st_mode & 0o777 == 0o600
 
 
 # ---------------------------------------------------------------------------

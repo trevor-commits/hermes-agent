@@ -589,13 +589,31 @@ def finalize_turn(
     )
 
     # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # and only for a completed turn with a concrete learning signal. Explicit
+    # preferences/corrections can qualify immediately; an elapsed memory
+    # cadence by itself no longer spends an otherwise empty model review.
+    from agent.background_review import qualify_background_review_turn
+
+    _valid_tools = set(getattr(agent, "valid_tool_names", ()) or ())
+    _review_qualification = qualify_background_review_turn(
+        original_user_message=original_user_message,
+        completed=bool(completed and not interrupted),
+        memory_due=_should_review_memory,
+        skills_due=_should_review_skills,
+        memory_available=bool(
+            "memory" in _valid_tools and getattr(agent, "_memory_store", None)
+        ),
+        skills_available="skill_manage" in _valid_tools,
+    )
+    if (
+        _review_qualification["review_memory"]
+        or _review_qualification["review_skills"]
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_memory=_review_qualification["review_memory"],
+                review_skills=_review_qualification["review_skills"],
             )
         except Exception:
             pass  # Background review is best-effort

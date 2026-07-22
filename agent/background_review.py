@@ -21,11 +21,68 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import tempfile
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_SIGNAL_RE = re.compile(
+    r"\b(remember(?: that| this)?|my (?:name|timezone|location|role|job|"
+    r"preference|preferences|workflow|setup)|i (?:prefer|dislike|like|always|"
+    r"never|use|work|live|am)|i'm|we (?:prefer|use)|from now on)\b",
+    re.IGNORECASE,
+)
+_WORKFLOW_CORRECTION_RE = re.compile(
+    r"\b(stop|don't|do not|instead|wrong|should have|next time|from now on|"
+    r"too verbose|too long|use a table|change the format)\b",
+    re.IGNORECASE,
+)
+
+
+def qualify_background_review_turn(
+    *,
+    original_user_message: str,
+    completed: bool,
+    memory_due: bool,
+    skills_due: bool,
+    memory_available: bool,
+    skills_available: bool,
+) -> Dict[str, Any]:
+    """Select high-signal completed turns for the optional review fork.
+
+    Explicit preference/personal-memory signals and workflow corrections fire
+    immediately. The existing skill tool-work threshold remains a useful
+    event. A periodic memory counter alone no longer spends a model call when
+    the completed turn contains no durable learning signal.
+    """
+    result = {"review_memory": False, "review_skills": False, "reasons": []}
+    if not completed:
+        return result
+
+    text = str(original_user_message or "")
+    memory_signal = bool(_MEMORY_SIGNAL_RE.search(text))
+    correction_signal = bool(_WORKFLOW_CORRECTION_RE.search(text))
+    if memory_available and memory_signal:
+        result["review_memory"] = True
+        result["reasons"].append("memory_signal")
+    # memory_due is deliberately used as a qualification hint rather than a
+    # sufficient trigger. It keeps the cadence state meaningful without
+    # generating empty periodic review calls.
+    if memory_due and memory_signal and "memory_signal" not in result["reasons"]:
+        result["reasons"].append("periodic_memory_signal")
+    if skills_available and correction_signal:
+        result["review_skills"] = True
+        result["reasons"].append("workflow_correction")
+    if skills_available and skills_due:
+        result["review_skills"] = True
+        result["reasons"].append("tool_work_threshold")
+    return result
 
 
 def _background_review_max_iterations() -> int:
@@ -46,6 +103,45 @@ def _background_review_max_iterations() -> int:
     except Exception:
         value = 4
     return max(1, min(4, value))
+
+
+def _atomic_write_review_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _write_background_review_receipt(agent: Any, payload: Dict[str, Any]) -> Optional[str]:
+    """Persist one immutable review artifact plus an atomic last-run receipt."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home() / "audits" / "background-review"
+        receipt_id = str(payload.get("receipt_id") or uuid.uuid4().hex)
+        archive = root / f"review-{receipt_id}.json"
+        last = get_hermes_home() / "audits" / "background-review-last.json"
+        _atomic_write_review_json(archive, payload)
+        _atomic_write_review_json(last, payload)
+        try:
+            agent._last_background_review_receipt = str(archive)
+        except Exception:
+            pass
+        return str(archive)
+    except Exception:
+        logger.warning("Background review receipt persistence failed", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +184,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
+        "available": True,
     }
     try:
         from hermes_cli.config import load_config
@@ -124,10 +221,21 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "command": rp.get("command"),
             "args": list(rp.get("args") or []),
             "routed": True,
+            "available": True,
         }
     except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
-        return parent
+        logger.warning(
+            "background-review optional route unavailable; review will be degraded "
+            "without falling back to the primary model: %s",
+            e,
+        )
+        return {
+            "routed": True,
+            "available": False,
+            "requested_provider": task_provider,
+            "requested_model": task_model,
+            "degraded_reason": str(e)[:500],
+        }
 
 
 def _msg_text(m: Dict) -> str:
@@ -638,6 +746,9 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    *,
+    review_memory: bool = False,
+    review_skills: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -667,7 +778,35 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+    review_limit = _background_review_max_iterations()
+    started_at = time.time()
+    receipt: Dict[str, Any] = {
+        "schema_version": 1,
+        "receipt_id": (
+            f"{int(started_at * 1000)}-{uuid.uuid4().hex[:12]}"
+        ),
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "root_turn_id": str(
+            getattr(getattr(agent, "root_task_budget", None), "root_turn_id", "")
+            or ""
+        ),
+        "review_memory": bool(review_memory),
+        "review_skills": bool(review_skills),
+        "max_iterations": review_limit,
+        "status": "started",
+        "started_at": started_at,
+    }
     try:
+        # Review is optional and cannot enter the capacity reserved for parent
+        # integration/verification. Skip before constructing another agent when
+        # no optional physical-call slot remains.
+        root_budget = getattr(agent, "root_task_budget", None)
+        optional_remaining = getattr(root_budget, "optional_remaining", None)
+        if isinstance(optional_remaining, int) and optional_remaining < 1:
+            receipt["status"] = "skipped"
+            receipt["reason"] = "root_closure_reserve"
+            return
+
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
         # ``sys.stdout``/``sys.stderr`` for every other thread — including a
@@ -692,6 +831,25 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent)
             _routed = bool(_rt.get("routed"))
+            receipt["route"] = {
+                key: _rt.get(key)
+                for key in (
+                    "available",
+                    "routed",
+                    "provider",
+                    "model",
+                    "requested_provider",
+                    "requested_model",
+                )
+                if _rt.get(key) is not None
+            }
+            if not _rt.get("available", True):
+                receipt["status"] = "degraded"
+                receipt["reason"] = "optional_route_unavailable"
+                receipt["error_message"] = str(
+                    _rt.get("degraded_reason") or "route resolution failed"
+                )[:500]
+                return
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -731,7 +889,7 @@ def _run_review_in_thread(
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=_background_review_max_iterations(),
+                max_iterations=review_limit,
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
@@ -944,8 +1102,13 @@ def _run_review_in_thread(
                     )
                 except Exception:
                     pass
+        receipt["status"] = "succeeded" if actions else "no_action"
+        receipt["actions"] = list(dict.fromkeys(actions))
 
     except Exception as e:
+        receipt["status"] = "failed"
+        receipt["error_type"] = type(e).__name__
+        receipt["error_message"] = str(e)[:500]
         logger.warning("Background memory/skill review failed: %s", e)
         agent._emit_auxiliary_failure("background review", e)
     finally:
@@ -973,6 +1136,17 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        receipt["finished_at"] = time.time()
+        receipt["duration_seconds"] = round(
+            receipt["finished_at"] - started_at, 3
+        )
+        root_budget = getattr(agent, "root_task_budget", None)
+        if root_budget is not None and hasattr(root_budget, "snapshot"):
+            try:
+                receipt["root_budget"] = root_budget.snapshot()
+            except Exception:
+                pass
+        _write_background_review_receipt(agent, receipt)
 
 
 def spawn_background_review_thread(
@@ -998,7 +1172,13 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent,
+            messages_snapshot,
+            prompt,
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
 
     return _target, prompt
 

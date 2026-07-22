@@ -824,19 +824,33 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a real final response.
+    # Background review fork — same event-driven qualification as the default
+    # transport. A periodic counter alone is not a reason to spend an optional
+    # model call on a completed turn with no durable learning signal.
+    from agent.background_review import qualify_background_review_turn
+
+    _valid_tools = set(getattr(agent, "valid_tool_names", ()) or ())
+    _review_qualification = qualify_background_review_turn(
+        original_user_message=original_user_message,
+        completed=bool(
+            turn.final_text and not turn.interrupted and turn.error is None
+        ),
+        memory_due=should_review_memory,
+        skills_due=should_review_skills,
+        memory_available=bool(
+            "memory" in _valid_tools and getattr(agent, "_memory_store", None)
+        ),
+        skills_available="skill_manage" in _valid_tools,
+    )
     if (
-        turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
+        _review_qualification["review_memory"]
+        or _review_qualification["review_skills"]
     ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
+                review_memory=_review_qualification["review_memory"],
+                review_skills=_review_qualification["review_skills"],
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)

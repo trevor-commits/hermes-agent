@@ -301,6 +301,28 @@ _PROVIDER_ALIASES = {
     "tencentmaas": "tencent-tokenhub",
 }
 
+# These tasks are enhancements around the user's requested work and have
+# deterministic/no-op caller fallbacks. If the operator pins one to an
+# auxiliary route, exhausting that route must not silently spend the primary
+# chat model. Explicit per-task fallback_chain entries remain honored.
+_OPTIONAL_AUXILIARY_TASKS = frozenset(
+    {
+        "title_generation",
+        "memory_query_rewrite",
+        "tts_audio_tags",
+        "profile_describer",
+        "goal_judge",
+        "curator",
+        "monitor",
+        "background_review",
+        "moa_reference",
+    }
+)
+
+
+def _optional_auxiliary_route(task: Optional[str]) -> bool:
+    return str(task or "").strip().lower() in _OPTIONAL_AUXILIARY_TASKS
+
 
 def _normalize_aux_provider(provider: Optional[str]) -> str:
     normalized = (provider or "auto").strip().lower()
@@ -7655,7 +7677,7 @@ def call_llm(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
+                if fb_client is None and not _optional_auxiliary_route(task):
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
@@ -7672,8 +7694,11 @@ def call_llm(
                 # The candidate had a stale/unrefreshable credential and was
                 # quarantined — walk the discovery chain once more; unhealthy
                 # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                if is_auto or not _optional_auxiliary_route(task):
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
+                else:
+                    fb_client, fb_model, fb_label = (None, None, "")
                 if fb_client is not None:
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
@@ -7689,8 +7714,10 @@ def call_llm(
             # (#26882) The error itself is re-raised below.
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(explicit fallback_chain%s). Raising original error.",
                 task or "call", reason, resolved_provider,
+                " only; primary-model fallback disabled for optional work"
+                if _optional_auxiliary_route(task) else " + main agent model",
             )
         # Connection/timeout errors leave the cached client poisoned (closed
         # httpx transport, half-read stream, dead async loop).  Drop it from
@@ -8201,7 +8228,7 @@ async def async_call_llm(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
+                if fb_client is None and not _optional_auxiliary_route(task):
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
@@ -8221,8 +8248,11 @@ async def async_call_llm(
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
                 # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                if is_auto or not _optional_auxiliary_route(task):
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
+                else:
+                    fb_client, fb_model, fb_label = (None, None, "")
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
@@ -8239,8 +8269,10 @@ async def async_call_llm(
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(explicit fallback_chain%s). Raising original error.",
                 task or "call", reason, resolved_provider,
+                " only; primary-model fallback disabled for optional work"
+                if _optional_auxiliary_route(task) else " + main agent model",
             )
         # Mirror the sync path: drop poisoned clients on connection/timeout
         # so the next aux call rebuilds.  See issue #23432.
