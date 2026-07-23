@@ -3943,14 +3943,18 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
 
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
-    # Stable cwd anchor — never the volatile source checkout. See
-    # _stable_service_working_dir() for the rationale (same rot risk applies
-    # to launchd's WorkingDirectory as to systemd's).
-    working_dir = _stable_service_working_dir()
+    # launchd must open its cwd and stdio paths before Python executes. macOS can
+    # deny those pre-exec opens when HERMES_HOME lives on removable storage,
+    # even though the launched gateway itself has access. Keep launchd-owned
+    # paths on the internal user home; HERMES_HOME below still points at the
+    # configured state directory.
+    user_home = Path.home()
+    working_dir = str(user_home)
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
+    base_log_dir = user_home / "Library" / "Logs" / "Hermes"
+    log_dir = base_log_dir if label == "ai.hermes.gateway" else base_log_dir / label
+    log_dir.mkdir(parents=True, exist_ok=True)
     profile_arg = _profile_arg(hermes_home)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,

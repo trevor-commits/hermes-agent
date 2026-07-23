@@ -505,6 +505,40 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_plist_keeps_supervisor_paths_off_external_hermes_home(self, tmp_path, monkeypatch):
+        internal_home = tmp_path / "Users" / "alice"
+        external_home = tmp_path / "Volumes" / "T7" / "hermes-home"
+        internal_home.mkdir(parents=True)
+        external_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(internal_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: external_home)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        internal_logs = internal_home / "Library" / "Logs" / "Hermes"
+        assert f"<key>WorkingDirectory</key>\n    <string>{internal_home}</string>" in plist
+        assert f"<string>{internal_logs}/gateway.log</string>" in plist
+        assert f"<string>{internal_logs}/gateway.error.log</string>" in plist
+        assert f"<key>HERMES_HOME</key>\n        <string>{external_home.resolve()}</string>" in plist
+
+    def test_launchd_plist_isolates_named_profile_logs(self, tmp_path, monkeypatch):
+        internal_home = tmp_path / "Users" / "alice"
+        external_home = tmp_path / "Volumes" / "T7" / "profiles" / "coder"
+        internal_home.mkdir(parents=True)
+        external_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(internal_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: external_home)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway-coder")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        profile_logs = internal_home / "Library" / "Logs" / "Hermes" / "ai.hermes.gateway-coder"
+        assert f"<string>{profile_logs}/gateway.log</string>" in plist
+        assert f"<string>{profile_logs}/gateway.error.log</string>" in plist
+
     def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
         monkeypatch.setenv(
@@ -3516,9 +3550,10 @@ class TestGatewayCommandCatchesSystemScopeError:
 
 
 class TestServiceWorkingDirIsStable:
-    """The gateway service must anchor WorkingDirectory at a stable path
-    (HERMES_HOME), never the source checkout / worktree, so a relocated or
-    deleted checkout can't crash-loop the unit on CHDIR (status=200).
+    """Gateway services must anchor WorkingDirectory outside source checkouts.
+
+    Systemd uses HERMES_HOME. Launchd uses the internal user home because macOS
+    can deny its pre-exec chdir when HERMES_HOME is on removable storage.
     """
 
     def test_stable_working_dir_uses_hermes_home(self, tmp_path, monkeypatch):
@@ -3545,16 +3580,19 @@ class TestServiceWorkingDirIsStable:
         # The bug class: never pin cwd inside a transient worktree checkout.
         assert "/.worktrees/" not in value
 
-    def test_launchd_workingdirectory_is_hermes_home(self, tmp_path, monkeypatch):
+    def test_launchd_workingdirectory_is_internal_user_home(self, tmp_path, monkeypatch):
         import re
 
-        home = tmp_path / ".hermes"
-        home.mkdir()
-        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        internal_home = tmp_path / "Users" / "alice"
+        external_home = tmp_path / "Volumes" / "T7" / ".hermes"
+        internal_home.mkdir(parents=True)
+        external_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(internal_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: external_home)
         plist = gateway_cli.generate_launchd_plist()
         m = re.search(r"<key>WorkingDirectory</key>\s*<string>(.*?)</string>", plist)
         assert m, "plist has no WorkingDirectory entry"
-        assert Path(m.group(1)).resolve() == home.resolve()
+        assert Path(m.group(1)).resolve() == internal_home.resolve()
         assert "/.worktrees/" not in m.group(1)
 
     def test_launchd_plist_keepalive_unconditional(self, tmp_path, monkeypatch):
