@@ -190,3 +190,5 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+gateway/run.py.bak.*
+installer-stub-archive/
