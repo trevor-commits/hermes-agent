@@ -11599,6 +11599,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Notify the chat that initiated /restart that the gateway is back.
         chat_restart_notification_pending = _restart_notification_pending()
         planned_restart_notification_pending = _planned_restart_notification_pending()
+        # Trevor (Jul 2026): also fire the home-channel startup notification
+        # when the previous gateway did NOT exit cleanly (no .clean_shutdown
+        # marker present). This is the reliable signal that the gateway was
+        # killed by a SIGTERM/OOM/crash rather than a planned restart. Without
+        # this, the user gets a shutdown alert but never learns the gateway
+        # recovered. The .clean_shutdown marker is consumed (unlinked) below
+        # in the session-suspension block, so check it BEFORE that happens.
+        _clean_startup_marker = _hermes_home / ".clean_shutdown"
+        _unclean_startup = not _clean_startup_marker.exists()
         # Capture, before _send_restart_notification() unlinks the marker,
         # whether this process booted from a chat-originated /restart. Used as
         # a one-shot signal by the /restart redelivery guard so a missing
@@ -11620,6 +11629,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             finally:
                 _clear_planned_restart_notification()
+        elif _unclean_startup and not chat_restart_notification_pending:
+            # Previous gateway was killed (SIGTERM/OOM/crash), not restarted
+            # cleanly. Send the startup notification so the user knows Hermes
+            # is back. Skip if a /restart notification was already sent to
+            # avoid duplicate messages.
+            try:
+                await self._send_home_channel_startup_notifications(
+                    skip_targets=None,
+                )
+                logger.info(
+                    "Sent startup notification after unclean shutdown "
+                    "(no .clean_shutdown marker)"
+                )
+            except Exception as e:
+                logger.warning("Unclean-shutdown startup notification failed: %s", e)
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
