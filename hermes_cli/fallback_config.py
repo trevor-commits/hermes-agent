@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -41,6 +42,18 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
 
 
 def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
+    # Older ``hermes config set fallback_providers '[{...}]'`` versions wrote
+    # the JSON argument as a quoted YAML string. Recover those already-written
+    # configs at runtime while the writer now preserves the declared list type.
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+        if not isinstance(decoded, (dict, list)):
+            return []
+        raw = decoded
+
     if isinstance(raw, dict):
         candidates = [raw]
     elif isinstance(raw, list):
