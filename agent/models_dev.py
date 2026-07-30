@@ -359,7 +359,10 @@ def _start_background_refresh_models_dev() -> None:
 
 
 def fetch_models_dev(
-    force_refresh: bool = False, *, allow_network: bool = True
+    force_refresh: bool = False,
+    *,
+    allow_network: bool = True,
+    allow_disk: bool = True,
 ) -> Dict[str, Any]:
     """Fetch models.dev registry. Cache hierarchy: in-mem → disk → network.
 
@@ -384,13 +387,17 @@ def fetch_models_dev(
     to cached data if the call fails. When ``allow_network=False``, any
     memory or disk cache is returned regardless of age and no request is
     made — used by latency-sensitive paths (gateway route-identity checks)
-    that must never wait on the network.
+    that must never wait on the network. ``allow_disk=False`` additionally
+    keeps the lookup memory-only for first-turn paths that must not block
+    opening a cache on an unavailable external volume.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
 
     if not allow_network:
         if _models_dev_cache:
             return _models_dev_cache
+        if not allow_disk:
+            return {}
         disk_data = _load_disk_cache()
         if disk_data:
             _models_dev_cache = disk_data
@@ -487,17 +494,34 @@ def fetch_models_dev(
         return _models_dev_cache
 
 
-def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
+def lookup_models_dev_context(
+    provider: str,
+    model: str,
+    *,
+    allow_network: bool = True,
+    allow_disk: bool = True,
+) -> Optional[int]:
     """Look up context_length for a provider+model combo in models.dev.
 
     Returns the context window in tokens, or None if not found.
     Handles case-insensitive matching and filters out context=0 entries.
+    ``allow_network=False`` restricts the lookup to cached data.
+    ``allow_disk=False`` makes that lookup memory-only.
     """
     mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
     if not mdev_provider_id:
         return None
 
-    data = fetch_models_dev()
+    # Preserve the zero-argument default path: several callers/tests replace
+    # fetch_models_dev with a zero-argument provider stub.
+    data = (
+        fetch_models_dev()
+        if allow_network and allow_disk
+        else fetch_models_dev(
+            allow_network=allow_network,
+            allow_disk=allow_disk,
+        )
+    )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return None

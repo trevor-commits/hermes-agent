@@ -1,7 +1,7 @@
-"""Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
+"""Tests for hermes_cli/fallback_config.py."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import resolve_entry_api_key
+from hermes_cli.fallback_config import get_fallback_chain, resolve_entry_api_key
 
 
 class TestResolveEntryApiKey:
@@ -10,10 +10,8 @@ class TestResolveEntryApiKey:
         entry = {"provider": "custom", "api_key": "inline-key", "key_env": "FB_KEY"}
         assert resolve_entry_api_key(entry) == "inline-key"
 
-
     def test_no_key_fields_returns_none(self):
         assert resolve_entry_api_key({"provider": "openrouter", "model": "glm"}) is None
-
 
     def test_whitespace_inline_key_falls_through_to_env(self, monkeypatch):
         monkeypatch.setenv("FB_KEY", "env-key")
@@ -37,3 +35,21 @@ class TestResolveEntryApiKey:
         # secret scope installed, resolution still reads os.environ.
         monkeypatch.setenv("FB_KEY", "env-key")
         assert resolve_entry_api_key({"key_env": "FB_KEY"}) == "env-key"
+
+def test_recovers_legacy_json_encoded_fallback_list():
+    """A chain stringified by older ``config set`` versions still runs."""
+    config = {
+        "fallback_providers": (
+            '[{"provider":"deepseek","model":"deepseek-chat"},'
+            '{"provider":"openai-codex","model":"gpt-5.6-luna"},'
+            '{"provider":"nous","model":"z-ai/glm-5.2"}]'
+        )
+    }
+
+    chain = get_fallback_chain(config)
+
+    assert [entry["provider"] for entry in chain] == [
+        "deepseek",
+        "openai-codex",
+        "nous",
+    ]
