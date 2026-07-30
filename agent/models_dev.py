@@ -578,7 +578,10 @@ def _start_background_refresh_models_dev() -> None:
 
 
 def fetch_models_dev(
-    force_refresh: bool = False, *, allow_network: bool = True
+    force_refresh: bool = False,
+    *,
+    allow_network: bool = True,
+    allow_disk: bool = True,
 ) -> Dict[str, Any]:
     """Fetch models.dev registry. Cache hierarchy: in-mem → disk → network.
 
@@ -611,13 +614,17 @@ def fetch_models_dev(
     memory or disk cache is returned regardless of age and no request is
     made — used by latency-sensitive paths (gateway route-identity checks,
     vision routing, context-length lookup) that must never wait on the
-    network.
+    network. ``allow_disk=False`` additionally keeps the lookup memory-only
+    for first-turn paths that must not block opening a cache on an
+    unavailable external volume.
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
 
     if not allow_network:
         if _models_dev_cache:
             return _models_dev_cache
+        if not allow_disk:
+            return {}
         disk_data = _load_disk_cache()
         if disk_data:
             _models_dev_cache = disk_data
@@ -733,7 +740,11 @@ def fetch_models_dev(
 
 
 def lookup_models_dev_context(
-    provider: str, model: str, *, allow_network: bool = False
+    provider: str,
+    model: str,
+    *,
+    allow_network: bool = False,
+    allow_disk: bool = True,
 ) -> Optional[int]:
     """Look up context_length for a provider+model combo in models.dev.
 
@@ -748,6 +759,7 @@ def lookup_models_dev_context(
     ``allow_network`` defaults to False — context-length lookup is a
     hot path (called during every conversation turn) and must never block
     on the network. Pass True only from explicit refresh flows.
+    ``allow_disk=False`` makes the cached lookup memory-only.
     """
     # Explicit config override — checked before catalog so it always wins.
     override_ctx = _override_context_window(provider, model)
@@ -763,8 +775,11 @@ def lookup_models_dev_context(
     # passing the kwarg unconditionally breaks them all (TypeError).
     data = (
         fetch_models_dev()
-        if allow_network
-        else fetch_models_dev(allow_network=False)
+        if allow_network and allow_disk
+        else fetch_models_dev(
+            allow_network=allow_network,
+            allow_disk=allow_disk,
+        )
     )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
