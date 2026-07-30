@@ -385,6 +385,57 @@ class TestStringTypedConfigValues:
 
 
 # ---------------------------------------------------------------------------
+# Structured config values — regression test for fallback-chain corruption
+# ---------------------------------------------------------------------------
+
+class TestStructuredConfigValues:
+    def test_list_typed_value_is_parsed_before_write(self, _isolated_hermes_home):
+        """JSON passed by ``config set`` must remain a YAML list on disk."""
+        value = json.dumps([
+            {
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "key_env": "DEEPSEEK_API_KEY",
+            },
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "api_mode": "codex_responses",
+            },
+        ])
+
+        set_config_value("fallback_providers", value)
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert isinstance(saved["fallback_providers"], list)
+        assert [entry["provider"] for entry in saved["fallback_providers"]] == [
+            "deepseek",
+            "openai-codex",
+        ]
+
+    def test_invalid_list_value_does_not_overwrite_existing_chain(
+        self,
+        _isolated_hermes_home,
+    ):
+        existing = [
+            {"provider": "deepseek", "model": "deepseek-chat"},
+            {"provider": "nous", "model": "z-ai/glm-5.2"},
+        ]
+        (_isolated_hermes_home / "config.yaml").write_text(
+            json.dumps({"fallback_providers": existing}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit):
+            set_config_value("fallback_providers", "not-a-list")
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["fallback_providers"] == existing
+
+
+# ---------------------------------------------------------------------------
 # Secret redaction in display output (issue #50245)
 # ---------------------------------------------------------------------------
 

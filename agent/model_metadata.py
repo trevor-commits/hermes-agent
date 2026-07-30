@@ -2700,7 +2700,18 @@ def get_model_context_length(
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
-        ctx = lookup_models_dev_context(effective_provider, model)
+        # Context resolution runs synchronously during cold agent startup.
+        # Never make the first user turn wait on models.dev I/O. The Hermes
+        # home may live on an external volume, and a stalled system-policy or
+        # filesystem service can hold even a cache open for minutes. Use only
+        # process memory here; a miss falls through to the curated model table
+        # and conservative default below.
+        ctx = lookup_models_dev_context(
+            effective_provider,
+            model,
+            allow_network=False,
+            allow_disk=False,
+        )
         if ctx:
             # MiniMax M3: models.dev reports 512K but actual context is 1M.
             # Prefer hardcoded catalog over stale probe value.
