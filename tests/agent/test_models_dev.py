@@ -311,6 +311,21 @@ class TestFetchModelsDev:
         assert result == expected
         mock_get.assert_not_called()
 
+    @patch("agent.models_dev.requests.get")
+    def test_memory_only_never_opens_disk_or_network(self, mock_get):
+        import agent.models_dev as md
+
+        md._models_dev_cache = {}
+        with patch.object(md, "_load_disk_cache") as load_disk:
+            result = fetch_models_dev(
+                allow_network=False,
+                allow_disk=False,
+            )
+
+        assert result == {}
+        load_disk.assert_not_called()
+        mock_get.assert_not_called()
+
 
 
 
@@ -389,4 +404,3 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("gemini", "weird-model")
         assert caps is not None
         assert caps.supports_vision is False
-
