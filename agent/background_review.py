@@ -651,6 +651,61 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _record_background_review_usage(parent_agent: Any, review_agent: Any) -> None:
+    """Attribute a persistence-isolated review fork as auxiliary usage.
+
+    Background review deliberately sets ``_persist_disabled`` and removes its
+    own session DB so its harness prompt can never enter the user's transcript.
+    That safety boundary previously made all of the fork's model calls vanish
+    from ``session_model_usage`` as a side effect. Record one aggregate against
+    the parent session after the fork exits so usage analytics remain honest.
+    """
+    calls = max(0, int(getattr(review_agent, "session_api_calls", 0) or 0))
+    if calls == 0:
+        return
+    session_db = getattr(parent_agent, "_session_db", None)
+    session_id = getattr(parent_agent, "session_id", None)
+    if session_db is None or not session_id:
+        return
+    try:
+        session_db.record_auxiliary_usage(
+            session_id,
+            "background_review",
+            model=getattr(review_agent, "model", None),
+            billing_provider=getattr(review_agent, "provider", None),
+            billing_base_url=getattr(review_agent, "base_url", None),
+            input_tokens=getattr(review_agent, "session_input_tokens", 0) or 0,
+            output_tokens=getattr(review_agent, "session_output_tokens", 0) or 0,
+            cache_read_tokens=(
+                getattr(review_agent, "session_cache_read_tokens", 0) or 0
+            ),
+            cache_write_tokens=(
+                getattr(review_agent, "session_cache_write_tokens", 0) or 0
+            ),
+            reasoning_tokens=(
+                getattr(review_agent, "session_reasoning_tokens", 0) or 0
+            ),
+            estimated_cost_usd=(
+                getattr(review_agent, "session_estimated_cost_usd", 0.0) or 0.0
+            ),
+            api_call_count=calls,
+        )
+        logger.info(
+            "Background review usage recorded: session=%s model=%s calls=%d "
+            "input=%d output=%d cache_read=%d",
+            session_id,
+            getattr(review_agent, "model", "unknown"),
+            calls,
+            getattr(review_agent, "session_input_tokens", 0) or 0,
+            getattr(review_agent, "session_output_tokens", 0) or 0,
+            getattr(review_agent, "session_cache_read_tokens", 0) or 0,
+        )
+    except Exception:
+        # Accounting must never turn a best-effort review into a user-visible
+        # failure. The review's ordinary API-call logs remain a fallback trail.
+        logger.debug("Background review usage recording failed", exc_info=True)
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -933,6 +988,7 @@ def _run_review_in_thread(
                 )
             finally:
                 clear_thread_tool_whitelist()
+                _record_background_review_usage(agent, review_agent)
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
