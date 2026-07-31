@@ -434,6 +434,21 @@ class TestBuildNousSubscriptionPrompt:
 
 
 class TestBuildContextFilesPrompt:
+    def test_home_directory_never_loads_project_context(self, tmp_path, monkeypatch):
+        """Messaging sessions rooted at HOME must not inherit editor rules."""
+        home = tmp_path / "home"
+        cursor_rules = home / ".cursor" / "rules"
+        cursor_rules.mkdir(parents=True)
+        (home / ".hermes.md").write_text("HOME-SCOPED HERMES CONTEXT")
+        (home / "AGENTS.md").write_text("HOME-SCOPED AGENT CONTEXT")
+        (home / ".cursorrules").write_text("HOME-SCOPED CURSOR CONTEXT")
+        (cursor_rules / "global.mdc").write_text("GLOBAL CURSOR RULE")
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+        result = build_context_files_prompt(cwd=str(home), skip_soul=True)
+
+        assert result == ""
+
     def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
         from unittest.mock import patch
 
@@ -985,5 +1000,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
