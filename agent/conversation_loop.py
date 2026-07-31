@@ -23,6 +23,7 @@ import random
 import re
 import ssl
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -616,9 +617,23 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # Compare against resolve_agent_cwd() — the SAME resolver used to build the
     # prompt — so gateway/TUI sessions that set TERMINAL_CWD are not falsely
     # rejected (they would always differ from the launch dir's os.getcwd()).
+    current_cwd = resolve_agent_cwd()
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
+        if stored_cwd != str(current_cwd):
+            return False
+
+    # Migration guard for sessions/backups created before HOME stopped being
+    # a project root. Those prompts can contain the user's global Cursor rules
+    # even though a fresh HOME prompt now deliberately skips all project-file
+    # discovery. Reject only that retired prompt shape; ordinary stored prompts
+    # retain the byte-stability/prefix-cache contract above.
+    if current_cwd.resolve() == Path.home().resolve():
+        has_cursor_project_context = any(
+            line == "## .cursorrules" or line.startswith("## .cursor/rules/")
+            for line in prompt.splitlines()
+        )
+        if has_cursor_project_context:
             return False
 
     # Detect runtime-surface drift: the stored prompt records which platform it
