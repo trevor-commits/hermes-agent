@@ -16,7 +16,7 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -112,6 +112,43 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_home_cursor_context_from_old_snapshot_is_rebuilt(self, tmp_path):
+        """A pre-fix HOME prompt must not survive a DB restore.
+
+        This is a narrow migration guard for backups or sessions created before
+        HOME stopped being a project root. Other stored prompts remain byte-stable.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        stored = (
+            "You are Hermes Agent.\n\n"
+            f"User home directory: {home}\n"
+            f"Current working directory: {home}\n"
+            "# Project Context\n\n"
+            "## .cursor/rules/global.mdc\n\n"
+            "Cursor-only instructions that must not reach Hermes.\n\n"
+            "Model: test-model\n"
+            "Provider: openrouter\n"
+            "Platform: cli"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="CLEAN_HOME_PROMPT")
+
+        with (
+            patch("pathlib.Path.home", return_value=home),
+            patch("agent.conversation_loop.resolve_agent_cwd", return_value=home),
+        ):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        assert agent._cached_system_prompt == "CLEAN_HOME_PROMPT"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "CLEAN_HOME_PROMPT"
+        )
 
 
 # ---------------------------------------------------------------------------
