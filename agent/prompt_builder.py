@@ -2153,7 +2153,7 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if cwd_path == Path.home():
+    if cwd_path == Path.home().resolve():
         # The user's HOME directory is not a project root (keepers 2026-07-30).
         # Messaging-gateway sessions run with cwd=$HOME, which made a 67K-char
         # ~/.cursorrules (Cursor-specific config) load into every Telegram
