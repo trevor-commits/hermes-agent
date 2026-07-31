@@ -749,6 +749,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # long model call. Back off per chat so a short Telegram-side outage
         # does not spam the API/logs or burn the keep-typing budget.
         self._telegram_typing_cooldown_until: Dict[str, float] = {}
+        # Server-directed limits (429 / RetryAfter) must be honored even for
+        # a new turn. Generic network failures are softer: a newly received
+        # inbound update proves connectivity may have recovered, so its one
+        # initial acknowledgement is allowed to probe through the cooldown.
+        self._telegram_typing_server_backoff_chats: set[str] = set()
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds",
             30.0,
@@ -7593,34 +7598,76 @@ class TelegramAdapter(BasePlatformAdapter):
         """Suppress Telegram typing refreshes for this chat after transient failures."""
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
+        if not hasattr(self, "_telegram_typing_server_backoff_chats"):
+            self._telegram_typing_server_backoff_chats = set()
         loop = asyncio.get_running_loop()
         retry_after = getattr(exc, "retry_after", None)
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        error_text = str(exc).lower()
+        server_directed = (
+            retry_after is not None
+            or status_code == 429
+            or "too many requests" in error_text
+            or "rate limit" in error_text
+        )
         try:
             delay = float(retry_after) if retry_after is not None else self._telegram_typing_cooldown_seconds
         except (TypeError, ValueError):
             delay = self._telegram_typing_cooldown_seconds
         delay = max(1.0, min(delay, 300.0))
-        self._telegram_typing_cooldown_until[str(chat_id)] = loop.time() + delay
+        chat_key = str(chat_id)
+        self._telegram_typing_cooldown_until[chat_key] = loop.time() + delay
+        if server_directed:
+            self._telegram_typing_server_backoff_chats.add(chat_key)
+        else:
+            self._telegram_typing_server_backoff_chats.discard(chat_key)
 
-    def _typing_in_cooldown(self, chat_id: str) -> bool:
+    def _typing_in_cooldown(
+        self,
+        chat_id: str,
+        *,
+        allow_initial_probe: bool = False,
+    ) -> bool:
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
             self._telegram_typing_cooldown_seconds = 30.0
-        until = self._telegram_typing_cooldown_until.get(str(chat_id))
+        if not hasattr(self, "_telegram_typing_server_backoff_chats"):
+            self._telegram_typing_server_backoff_chats = set()
+        chat_key = str(chat_id)
+        until = self._telegram_typing_cooldown_until.get(chat_key)
         if until is None:
             return False
         if asyncio.get_running_loop().time() < until:
+            if (
+                allow_initial_probe
+                and chat_key not in self._telegram_typing_server_backoff_chats
+            ):
+                return False
             return True
-        self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+        self._telegram_typing_cooldown_until.pop(chat_key, None)
+        self._telegram_typing_server_backoff_chats.discard(chat_key)
         return False
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
-        if not self._bot or self._typing_in_cooldown(chat_id):
+        initial_attempt = bool(
+            metadata and metadata.get("_hermes_initial_typing_attempt")
+        )
+        if not self._bot or self._typing_in_cooldown(
+            chat_id,
+            allow_initial_probe=initial_attempt,
+        ):
+            if initial_attempt and self._bot:
+                logger.warning(
+                    "[%s] Initial Telegram typing acknowledgement skipped "
+                    "because a server-directed retry cooldown is active",
+                    self.name,
+                )
             return
 
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
+        attempt_started = asyncio.get_running_loop().time()
         try:
             _typing_thread = self._metadata_thread_id(metadata)
             _is_dm_topic = bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
@@ -7630,7 +7677,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 action="typing",
                 message_thread_id=message_thread_id,
             )
-            self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+            chat_key = str(chat_id)
+            self._telegram_typing_cooldown_until.pop(chat_key, None)
+            self._telegram_typing_server_backoff_chats.discard(chat_key)
+            if initial_attempt:
+                logger.info(
+                    "[%s] Initial Telegram typing acknowledgement sent in %.3fs",
+                    self.name,
+                    asyncio.get_running_loop().time() - attempt_started,
+                )
         except Exception as e:
             # For DM topic lanes, Telegram may reject message_thread_id.
             # Fall back to sending typing without thread_id so the typing
@@ -7641,15 +7696,28 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         action="typing",
                     )
-                    self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+                    chat_key = str(chat_id)
+                    self._telegram_typing_cooldown_until.pop(chat_key, None)
+                    self._telegram_typing_server_backoff_chats.discard(chat_key)
+                    if initial_attempt:
+                        logger.info(
+                            "[%s] Initial Telegram typing acknowledgement sent "
+                            "through DM-topic fallback in %.3fs",
+                            self.name,
+                            asyncio.get_running_loop().time() - attempt_started,
+                        )
                     return
                 except Exception as fallback_exc:
                     if self._is_transient_typing_error(fallback_exc):
                         self._record_typing_cooldown(chat_id, fallback_exc)
             elif self._is_transient_typing_error(e):
                 self._record_typing_cooldown(chat_id, e)
-            # Typing failures are non-fatal; log at debug level only.
-            logger.debug(
+            # Refresh failures stay debug-level, but a failed first-turn
+            # acknowledgement is operationally significant: without this
+            # warning the user sees silence and the gateway log cannot explain
+            # whether Telegram or local setup caused it.
+            log_typing_failure = logger.warning if initial_attempt else logger.debug
+            log_typing_failure(
                 "[%s] Failed to send Telegram typing indicator: %s",
                 self.name,
                 _redact_telegram_error_text(e),
