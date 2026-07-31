@@ -85,3 +85,52 @@ async def test_typing_indicator_enabled_spawns_refresh_loop():
     assert adapter.send_typing.await_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_initial_typing_attempt_precedes_message_handler():
+    """The acknowledgement must start before turn setup enters the handler.
+
+    The handler can do synchronous setup before its first ``await`` (command
+    discovery, prompt construction, and tool registration).  Merely scheduling
+    ``_keep_typing`` does not let that task run, so a slow synchronous prefix
+    otherwise creates a silent gap even though the typing task exists.
+    """
+    adapter = _make_adapter(typing_indicator=True)
+    typing_attempts_at_handler_entry = []
+
+    async def _handler_without_an_initial_yield(_event):
+        typing_attempts_at_handler_entry.append(adapter.send_typing.await_count)
+        return "ok"
+
+    adapter._message_handler = _handler_without_an_initial_yield
+    event = _make_event()
+    adapter._active_sessions[_sk()] = asyncio.Event()
+
+    await adapter._process_message_background(event, _sk())
+
+    assert typing_attempts_at_handler_entry == [1]
+
+
+@pytest.mark.asyncio
+async def test_slow_initial_typing_attempt_is_bounded():
+    """A broken platform acknowledgement cannot hold the turn indefinitely."""
+    adapter = _make_adapter(typing_indicator=True)
+    handler_started = asyncio.Event()
+
+    async def _stuck_typing(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    async def _handler(_event):
+        handler_started.set()
+        return "ok"
+
+    adapter.send_typing = AsyncMock(side_effect=_stuck_typing)
+    adapter._message_handler = _handler
+    event = _make_event()
+    adapter._active_sessions[_sk()] = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    await adapter._process_message_background(event, _sk())
+
+    assert handler_started.is_set()
+    assert loop.time() - started < 2.0
