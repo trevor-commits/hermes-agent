@@ -2153,7 +2153,19 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if (
+    if cwd_path == Path.home():
+        # The user's HOME directory is not a project root (keepers 2026-07-30).
+        # Messaging-gateway sessions run with cwd=$HOME, which made a 67K-char
+        # ~/.cursorrules (Cursor-specific config) load into every Telegram
+        # turn — ~16K tokens of off-target context plus a TRUNCATED warning
+        # surfaced in the chat. Identity/context still arrives via SOUL.md and
+        # HERMES_HOME docs; a deliberate project cwd is unaffected.
+        logger.info(
+            "skipping project-context discovery: cwd is the home directory (%s)",
+            cwd_path,
+        )
+        project_context = ""
+    elif (
         cwd_is_fallback
         and not allow_install_tree_fallback
         and _is_install_tree(cwd_path)
