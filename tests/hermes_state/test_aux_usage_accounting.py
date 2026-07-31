@@ -67,7 +67,21 @@ class TestRecordAuxiliaryUsage:
         assert rows[0]["input_tokens"] == 3000
         assert rows[0]["api_call_count"] == 3
 
-
+    def test_accepts_aggregated_api_call_count(self, db):
+        """A forked auxiliary agent may report one aggregate after it exits."""
+        db.create_session("s1", source="cli")
+        db.record_auxiliary_usage(
+            "s1",
+            "background_review",
+            model="gpt-5.6-terra",
+            input_tokens=120_000,
+            output_tokens=1_500,
+            api_call_count=4,
+        )
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        assert rows[0]["task"] == "background_review"
+        assert rows[0]["api_call_count"] == 4
 
     def test_main_loop_and_aux_rows_coexist(self, db):
         db.create_session("s1", source="cli")
@@ -282,4 +296,3 @@ class TestInsightsAuxTotals:
         assert ov["total_output_tokens"] == 600
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
-
