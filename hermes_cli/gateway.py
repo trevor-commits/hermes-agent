@@ -143,6 +143,10 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
+        if get_system_launchd_gateway_plist_path().exists():
+            _loaded, system_pid, _output = _probe_system_launchd_gateway()
+            if system_pid is not None:
+                pids.add(system_pid)
         try:
             label = get_launchd_label()
             result = subprocess.run(
@@ -1252,7 +1256,7 @@ def _recover_pending_systemd_restart(
 
 
 def _parse_launchd_pid_from_list_output(output: str) -> int | None:
-    """Extract the PID from ``launchctl list <label>`` output.
+    """Extract the PID from ``launchctl list`` or ``launchctl print`` output.
 
     When launchd is actively supervising a process, the output includes a
     ``"PID" = <number>;`` line.  When the service definition is only *registered*
@@ -1262,16 +1266,38 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith('"PID"') or stripped.startswith("PID"):
-            parts = stripped.split("=", 1)
-            if len(parts) == 2:
-                val = parts[1].strip().rstrip(";").strip('"')
-                try:
-                    pid = int(val)
-                    return pid if pid > 0 else None
-                except ValueError:
-                    return None
+        parts = stripped.split("=", 1)
+        if len(parts) != 2 or parts[0].strip().strip('"').casefold() != "pid":
+            continue
+        val = parts[1].strip().rstrip(";").strip('"')
+        try:
+            pid = int(val)
+            return pid if pid > 0 else None
+        except ValueError:
+            return None
     return None
+
+
+def _probe_system_launchd_gateway() -> tuple[bool, int | None, str]:
+    """Return ``(loaded, pid, output)`` for the system-domain gateway."""
+    if not get_system_launchd_gateway_plist_path().exists():
+        return False, None, ""
+    target = f"system/{get_system_launchd_gateway_label()}"
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, None, ""
+    output = result.stdout or ""
+    if result.returncode != 0:
+        return False, None, output
+    return True, _parse_launchd_pid_from_list_output(output), output
 
 
 def _probe_launchd_service_running() -> bool:
@@ -1358,6 +1384,16 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
         )
 
     if is_macos():
+        system_plist = get_system_launchd_gateway_plist_path()
+        if system_plist.exists():
+            loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+            return GatewayRuntimeSnapshot(
+                manager="launchd (system daemon)",
+                service_installed=True,
+                service_running=loaded and daemon_pid is not None,
+                gateway_pids=gateway_pids,
+                service_scope="system",
+            )
         return GatewayRuntimeSnapshot(
             manager="launchd",
             service_installed=get_launchd_plist_path().exists(),
@@ -2487,6 +2523,28 @@ def get_launchd_plist_path() -> Path:
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+
+
+def get_system_launchd_gateway_plist_path() -> Path:
+    """Return the boot-persistent macOS gateway LaunchDaemon path.
+
+    This host intentionally runs one system-domain owner so Hermes survives
+    login-session churn. The upstream per-user LaunchAgent remains the portable
+    default on other Macs; when this plist exists, CLI lifecycle commands must
+    not create or operate that competing owner.
+    """
+    return Path("/Library/LaunchDaemons/ai.hermes.gateway.daemon.plist")
+
+
+def get_system_launchd_gateway_label() -> str:
+    return "ai.hermes.gateway.daemon"
+
+
+def _launchd_gateway_service_installed() -> bool:
+    return (
+        get_system_launchd_gateway_plist_path().exists()
+        or get_launchd_plist_path().exists()
+    )
 
 
 def _detect_venv_dir() -> Path | None:
@@ -4265,6 +4323,14 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False):
+    if get_system_launchd_gateway_plist_path().exists():
+        print(
+            "System gateway LaunchDaemon is already installed and is the "
+            "authoritative owner."
+        )
+        print("Refusing to install a competing user LaunchAgent.")
+        return
+
     plist_path = get_launchd_plist_path()
 
     if plist_path.exists() and not force:
@@ -4306,6 +4372,11 @@ def launchd_install(force: bool = False):
 
 
 def launchd_uninstall():
+    if get_system_launchd_gateway_plist_path().exists():
+        print("✗ The system gateway LaunchDaemon is authoritative on this host.")
+        print("  Refusing to remove only the retired user LaunchAgent and claim success.")
+        raise SystemExit(1)
+
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     subprocess.run(
@@ -4322,6 +4393,18 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    if get_system_launchd_gateway_plist_path().exists():
+        loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+        if loaded and daemon_pid is not None:
+            print(f"✓ System gateway daemon is already running (PID {daemon_pid})")
+            return
+        if loaded:
+            print("⏳ System gateway daemon is loaded; KeepAlive restart is pending")
+            return
+        print("✗ System gateway daemon is installed but not loaded.")
+        print("  Refusing to create a competing user LaunchAgent.")
+        raise SystemExit(1)
+
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
@@ -4380,6 +4463,11 @@ def launchd_start():
 
 
 def launchd_stop():
+    if get_system_launchd_gateway_plist_path().exists():
+        print("✗ Gateway stop is blocked while the system LaunchDaemon owns Hermes.")
+        print("  A user-level stop would be immediately undone by KeepAlive.")
+        raise SystemExit(1)
+
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     try:
@@ -4462,7 +4550,36 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _restart_system_launchd_gateway() -> None:
+    """Drain the gateway and let system-domain KeepAlive relaunch it."""
+    loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+    if not loaded:
+        print("✗ System gateway daemon is installed but not loaded.")
+        raise SystemExit(1)
+    if daemon_pid is None:
+        print("⏳ System gateway daemon is loaded; KeepAlive restart is already pending")
+        return
+
+    if _request_gateway_self_restart(daemon_pid):
+        print("✓ System daemon gateway restart requested")
+        return
+
+    drain_timeout = _get_restart_drain_timeout()
+    print(
+        f"→ Restarting system daemon gateway (PID {daemon_pid}) — draining "
+        f"in-flight runs (up to {drain_timeout:.0f}s)..."
+    )
+    if not _graceful_restart_via_sigusr1(daemon_pid, drain_timeout):
+        print("✗ Gateway did not complete its drain-aware restart handoff.")
+        raise SystemExit(1)
+    print("✓ Restart handed to the system daemon; launchd KeepAlive will relaunch it")
+
+
 def launchd_restart():
+    if get_system_launchd_gateway_plist_path().exists():
+        _restart_system_launchd_gateway()
+        return
+
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
@@ -4536,7 +4653,49 @@ def launchd_restart():
         _clear_launchd_unsupported_marker()
 
 
+def _system_launchd_status(deep: bool = False) -> None:
+    """Report the boot-persistent system LaunchDaemon without GUI guidance."""
+    plist_path = get_system_launchd_gateway_plist_path()
+    loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+
+    print(f"System LaunchDaemon plist: {plist_path}")
+    if loaded and daemon_pid is not None:
+        print(f"✓ Gateway is supervised by the system daemon (PID {daemon_pid})")
+        print("  Auto-start at boot and auto-restart on crash are available.")
+    elif loaded:
+        print("⏳ System daemon is loaded; launchd KeepAlive is waiting for the gateway")
+        print("  No competing user LaunchAgent will be started.")
+    else:
+        print("✗ System gateway daemon is installed but not loaded")
+        print("  The root observer owns recovery; the user LaunchAgent remains retired.")
+
+    user_plist = get_launchd_plist_path()
+    if user_plist.exists():
+        if _probe_launchd_service_running():
+            print("✗ Supervisor conflict: the retired user LaunchAgent is also running")
+        else:
+            print("  Retired user LaunchAgent plist is present but inactive.")
+
+    runtime_lines = _runtime_health_lines()
+    if runtime_lines:
+        print()
+        print("Recent gateway health:")
+        for line in runtime_lines:
+            print(f"  {line}")
+
+    if deep:
+        log_file = get_hermes_home() / "logs" / "gateway.log"
+        if log_file.exists():
+            print()
+            print("Recent logs:")
+            subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+
+
 def launchd_status(deep: bool = False):
+    if get_system_launchd_gateway_plist_path().exists():
+        _system_launchd_status(deep)
+        return
+
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     try:
@@ -5715,7 +5874,10 @@ def _is_service_installed() -> bool:
             or get_systemd_unit_path(system=True).exists()
         )
     elif is_macos():
-        return get_launchd_plist_path().exists()
+        return (
+            get_system_launchd_gateway_plist_path().exists()
+            or get_launchd_plist_path().exists()
+        )
     elif is_windows():
         from hermes_cli import gateway_windows
 
@@ -5758,7 +5920,10 @@ def _is_service_running() -> bool:
                 pass
 
         return False
-    elif is_macos() and get_launchd_plist_path().exists():
+    elif is_macos() and get_system_launchd_gateway_plist_path().exists():
+        loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+        return loaded and daemon_pid is not None
+    elif is_macos() and _launchd_gateway_service_installed():
         try:
             result = subprocess.run(
                 ["launchctl", "list", get_launchd_label()],
@@ -7068,7 +7233,7 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos() and _launchd_gateway_service_installed():
                 try:
                     launchd_stop()
                     service_available = True
@@ -7101,7 +7266,7 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos() and _launchd_gateway_service_installed():
                 try:
                     launchd_stop()
                     service_available = True
@@ -7165,7 +7330,7 @@ def _gateway_command_inner(args):
                     service_stopped = True
                 except subprocess.CalledProcessError:
                     pass
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos() and _launchd_gateway_service_installed():
                 try:
                     launchd_stop()
                     service_stopped = True
@@ -7193,7 +7358,7 @@ def _gateway_command_inner(args):
                 or get_systemd_unit_path(system=True).exists()
             ):
                 systemd_start(system=system)
-            elif is_macos() and get_launchd_plist_path().exists():
+            elif is_macos() and _launchd_gateway_service_installed():
                 launchd_start()
             elif is_windows():
                 from hermes_cli import gateway_windows
@@ -7219,7 +7384,7 @@ def _gateway_command_inner(args):
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and _launchd_gateway_service_installed():
             service_configured = True
             try:
                 launchd_restart()
@@ -7302,7 +7467,7 @@ def _gateway_command_inner(args):
         ):
             systemd_status(deep, system=system, full=full)
             _print_gateway_process_mismatch(snapshot)
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and _launchd_gateway_service_installed():
             launchd_status(deep)
             _print_gateway_process_mismatch(snapshot)
         elif _windows_service_installed:
