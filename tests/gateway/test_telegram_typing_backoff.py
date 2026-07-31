@@ -73,6 +73,56 @@ async def test_typing_transient_failure_enters_cooldown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_new_turn_initial_ack_probes_through_network_cooldown(monkeypatch):
+    """A newly received message gets one recovery probe after a network blip."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.get_running_loop",
+        lambda: type("Loop", (), {"time": lambda self: 1000.0})(),
+    )
+    monkeypatch.setattr(
+        adapter, "_telegram_typing_cooldown_seconds", 30.0, raising=False
+    )
+    adapter._record_typing_cooldown(
+        "123", OSError("temporary telegram network failure")
+    )
+    adapter._bot.send_chat_action = AsyncMock(return_value=None)
+
+    await adapter.send_typing("123")
+    adapter._bot.send_chat_action.assert_not_awaited()
+
+    await adapter.send_typing(
+        "123", metadata={"_hermes_initial_typing_attempt": True}
+    )
+
+    adapter._bot.send_chat_action.assert_awaited_once()
+    assert "123" not in adapter._telegram_typing_cooldown_until
+
+
+@pytest.mark.asyncio
+async def test_new_turn_initial_ack_respects_server_retry_after(monkeypatch):
+    """An explicit Telegram RetryAfter remains authoritative for new turns."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.get_running_loop",
+        lambda: type("Loop", (), {"time": lambda self: 1000.0})(),
+    )
+
+    class _RetryAfter(Exception):
+        retry_after = 30
+
+    adapter._record_typing_cooldown("123", _RetryAfter("retry later"))
+    adapter._bot.send_chat_action = AsyncMock(return_value=None)
+
+    await adapter.send_typing(
+        "123", metadata={"_hermes_initial_typing_attempt": True}
+    )
+
+    adapter._bot.send_chat_action.assert_not_awaited()
+    assert "123" in adapter._telegram_typing_server_backoff_chats
+
+
+@pytest.mark.asyncio
 async def test_typing_dm_topic_fallback_success_does_not_cool_down(monkeypatch):
     adapter = _make_adapter()
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.get_running_loop", lambda: type("Loop", (), {"time": lambda self: 10.0})())
