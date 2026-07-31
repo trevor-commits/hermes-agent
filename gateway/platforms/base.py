@@ -4661,6 +4661,7 @@ class BasePlatformAdapter(ABC):
         interval: float = 2.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
+        first_tick_done: asyncio.Event | None = None,
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
@@ -4686,27 +4687,42 @@ class BasePlatformAdapter(ABC):
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        first_tick_pending = True
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
-                    try:
-                        await asyncio.wait_for(
-                            self.send_typing(chat_id, metadata=metadata),
-                            timeout=_send_typing_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        # Slow network — abandon this tick, keep the loop
-                        # on schedule so the next send_typing fires fresh.
-                        pass
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as typing_err:
-                        logger.debug(
-                            "[%s] send_typing error (non-fatal): %s",
-                            self.name, typing_err,
-                        )
+                try:
+                    if chat_id not in self._typing_paused:
+                        tick_metadata = metadata
+                        if first_tick_pending:
+                            tick_metadata = dict(metadata or {})
+                            tick_metadata["_hermes_initial_typing_attempt"] = True
+                        try:
+                            await asyncio.wait_for(
+                                self.send_typing(chat_id, metadata=tick_metadata),
+                                timeout=_send_typing_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            # Slow network — abandon this tick, keep the loop
+                            # on schedule so the next send_typing fires fresh.
+                            pass
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as typing_err:
+                            logger.debug(
+                                "[%s] send_typing error (non-fatal): %s",
+                                self.name, typing_err,
+                            )
+                finally:
+                    # ``create_task`` only schedules this loop; it does not run
+                    # it. Signal the dispatch path after the first bounded
+                    # attempt so synchronous turn setup cannot create a silent
+                    # pre-acknowledgement gap.
+                    if first_tick_pending:
+                        first_tick_pending = False
+                        if first_tick_done is not None:
+                            first_tick_done.set()
                 if stop_event is None:
                     await asyncio.sleep(interval)
                     continue
@@ -4726,6 +4742,8 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            if first_tick_pending and first_tick_done is not None:
+                first_tick_done.set()
             # Ensure the underlying platform typing loop is stopped.
             # _keep_typing may have called send_typing() after an outer
             # stop_typing() cleared the task dict, recreating the loop.
@@ -5787,18 +5805,39 @@ class BasePlatformAdapter(ABC):
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
+            _first_typing_tick_done = asyncio.Event()
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
             except (TypeError, ValueError):
                 _keep_typing_sig = None
             if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
                 _keep_typing_kwargs["stop_event"] = interrupt_event
+            if _keep_typing_sig is None or "first_tick_done" in _keep_typing_sig.parameters:
+                _keep_typing_kwargs["first_tick_done"] = _first_typing_tick_done
+            else:
+                _first_typing_tick_done = None
             typing_task = asyncio.create_task(
                 self._keep_typing(
                     event.source.chat_id,
                     **_keep_typing_kwargs,
                 )
             )
+            if _first_typing_tick_done is not None:
+                try:
+                    # _keep_typing bounds the platform request to <=1.5s.
+                    # Wait for that first bounded attempt before entering the
+                    # message handler, whose synchronous setup can otherwise
+                    # starve the scheduled typing task for several seconds.
+                    await asyncio.wait_for(
+                        _first_typing_tick_done.wait(),
+                        timeout=1.75,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] Initial typing acknowledgement did not finish "
+                        "within 1.75s; continuing message processing",
+                        self.name,
+                    )
 
         async def _stop_typing_task() -> None:
             await self._stop_typing_refresh(
