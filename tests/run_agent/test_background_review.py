@@ -125,6 +125,7 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
+<<<<<<< HEAD
 def test_background_review_registers_on_active_children_for_interrupt(monkeypatch):
     """The review fork must be added to the parent's ``_active_children`` so
     ``AIAgent.interrupt()`` (which fans out to that list) can reach it, and
@@ -203,12 +204,60 @@ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
     assert calls == ["superseded by a new live turn"]
 
 
+def test_background_review_records_aggregate_usage_as_auxiliary(monkeypatch):
+    """The persistence-isolated fork must still be visible in usage analytics."""
+    recorded = []
 
+    class FakeSessionDB:
+        def record_auxiliary_usage(self, session_id, task, **usage):
+            recorded.append((session_id, task, usage))
 
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self.session_api_calls = 0
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.model = kwargs["model"]
+            self.provider = kwargs["provider"]
+            self.base_url = kwargs.get("base_url") or ""
 
+        def run_conversation(self, **kwargs):
+            self.session_api_calls = 4
+            self.session_input_tokens = 120_862
+            self.session_output_tokens = 1_568
+            self.session_cache_read_tokens = 88_576
+            self.session_reasoning_tokens = 321
 
+        def shutdown_memory_provider(self):
+            pass
 
+        def close(self):
+            pass
 
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent._session_db = FakeSessionDB()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_skills=True,
+    )
+
+    assert len(recorded) == 1
+    session_id, task, usage = recorded[0]
+    assert session_id == "test-session"
+    assert task == "background_review"
+    assert usage["api_call_count"] == 4
+    assert usage["input_tokens"] == 120_862
+    assert usage["cache_read_tokens"] == 88_576
 
 # ---------------------------------------------------------------------------
 # memory_notifications mode: off | on | verbose
