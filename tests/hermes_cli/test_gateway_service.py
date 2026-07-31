@@ -19,6 +19,16 @@ from gateway.restart import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_local_system_launchdaemon(tmp_path, monkeypatch):
+    """Do not let a developer's installed system daemon affect unit tests."""
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_system_launchd_gateway_plist_path",
+        lambda: tmp_path / "system-launchdaemon-not-installed.plist",
+    )
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
@@ -397,6 +407,126 @@ class TestLaunchdServiceRecovery:
         assert "PID 88888" in out
         assert "NOT available" in out
 
+    def test_pid_parser_accepts_system_launchctl_print_shape(self):
+        output = """
+        system/ai.hermes.gateway.daemon = {
+            state = running
+            pid = 86231
+        }
+        """
+
+        assert gateway_cli._parse_launchd_pid_from_list_output(output) == 86231
+
+    def test_runtime_snapshot_prefers_installed_system_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        system_plist = tmp_path / "ai.hermes.gateway.daemon.plist"
+        system_plist.write_text("plist", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [86231])
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_system_launchd_gateway_plist_path",
+            lambda: system_plist,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_system_launchd_gateway",
+            lambda: (True, 86231, "state = running\npid = 86231\n"),
+        )
+
+        snapshot = gateway_cli.get_gateway_runtime_snapshot()
+
+        assert snapshot.manager == "launchd (system daemon)"
+        assert snapshot.service_installed is True
+        assert snapshot.service_running is True
+        assert snapshot.service_scope == "system"
+        assert snapshot.has_process_service_mismatch is False
+
+    def test_status_reports_system_daemon_without_gui_start_guidance(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        system_plist = tmp_path / "ai.hermes.gateway.daemon.plist"
+        system_plist.write_text("plist", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_system_launchd_gateway_plist_path",
+            lambda: system_plist,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_system_launchd_gateway",
+            lambda: (True, 86231, "state = running\npid = 86231\n"),
+        )
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "System LaunchDaemon" in out
+        assert "PID 86231" in out
+        assert "auto-restart on crash" in out
+        assert "hermes gateway start" not in out
+
+    def test_start_does_not_create_gui_owner_beside_system_daemon(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        system_plist = tmp_path / "ai.hermes.gateway.daemon.plist"
+        system_plist.write_text("plist", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_system_launchd_gateway_plist_path",
+            lambda: system_plist,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_system_launchd_gateway",
+            lambda: (True, 86231, ""),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda: pytest.fail("retired GUI owner must not be refreshed"),
+        )
+
+        gateway_cli.launchd_start()
+
+        assert "already running" in capsys.readouterr().out
+
+    def test_restart_hands_off_to_system_daemon_without_gui_kickstart(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        system_plist = tmp_path / "ai.hermes.gateway.daemon.plist"
+        system_plist.write_text("plist", encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_system_launchd_gateway_plist_path",
+            lambda: system_plist,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_probe_system_launchd_gateway",
+            lambda: (True, 86231, ""),
+        )
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda _pid: False)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 180.0)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: pid == 86231 and timeout > 0,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("GUI launchctl must not be called"),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert "system daemon" in capsys.readouterr().out.lower()
+
 
 class TestLaunchdDomainDetection:
     """Regression tests for _launchd_domain() probing (#40831).
@@ -494,6 +624,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
@@ -1755,4 +1886,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-
