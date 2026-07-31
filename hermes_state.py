@@ -5739,8 +5739,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        api_call_count: int = 1,
     ) -> None:
-        """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
+        """Record auxiliary LLM usage against *session_id* (issue #23270).
 
         Auxiliary calls (vision, compression, title_generation, web_extract,
         session_search, ...) historically discarded their usage, leaving the
@@ -5751,6 +5752,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the gateway overwrites session counters with absolute main-loop totals,
         so folding aux tokens into the summary row would either be clobbered
         or double-counted. Insights/analytics read the union of both.
+
+        ``api_call_count`` defaults to one for the ordinary per-response path.
+        Persistence-isolated auxiliary agents may report one aggregate after
+        their fork exits, preserving the real call count without replaying one
+        database write per response.
 
         Best-effort by contract: callers must never fail an aux call because
         accounting failed.
@@ -5779,7 +5785,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 actual_cost_usd=None,
                 cost_status=None,
                 cost_source=None,
-                api_call_count=1,
+                api_call_count=max(0, int(api_call_count or 0)),
                 task=task,
             )
         self._execute_write(_do)
