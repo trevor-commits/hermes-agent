@@ -12082,6 +12082,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            # Disarm the lifetime loop-liveness watchdog before teardown can
+            # load the loop. Teardown legitimately blocks it (SessionDB close
+            # flushes WAL to disk; adapter disconnects wait on sockets), and
+            # the dedicated shutdown watchdog armed in _stop_impl() already
+            # bounds the whole teardown. Leaving the liveness guard armed here
+            # double-kills a stopping gateway: observed 2026-07-31 20:11 PDT,
+            # exit 75 mid-SessionDB-close under disk contention. This method
+            # existed but had no caller (the wiring gap was the bug).
+            self._stop_loop_liveness_guards()
+
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
                 await stop_watchdog()
@@ -12335,13 +12345,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
             _self_db = getattr(self, "_session_db", None)
             _self_db = getattr(_self_db, "_db", _self_db)
-            for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
+
+            def _close_session_dbs() -> None:
+                for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
+                    if _db is None or not hasattr(_db, "close"):
+                        continue
+                    try:
+                        _db.close()
+                    except Exception as _e:
+                        logger.debug("SessionDB close error: %s", _e)
+
+            # Run the close off-loop with a bound. sqlite close checkpoints the
+            # WAL to disk; on 2026-07-31 that blocked the event loop for 4+
+            # minutes under disk contention while adapters still needed the
+            # loop to disconnect. On timeout, continue teardown — the WAL lock
+            # releases at process exit, and the shutdown watchdog still bounds
+            # a truly wedged teardown.
+            try:
+                await asyncio.wait_for(asyncio.to_thread(_close_session_dbs), timeout=60.0)
+            except (asyncio.TimeoutError, RuntimeError) as _e:
+                logger.warning(
+                    "SessionDB close did not finish within 60s (%s); continuing "
+                    "shutdown — WAL lock releases at process exit.", _e,
+                )
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
