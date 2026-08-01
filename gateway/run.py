@@ -10781,7 +10781,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
             try:
-                self._loop_liveness_watchdog = start_loop_liveness_watchdog(loop)
+                # 6 strikes (~4 min) instead of the default 3 (~2 min): a
+                # DNS stall inside a Telegram call blocks the loop thread and
+                # measured ~2 min on 2026-07-31. The cost asymmetry is stark —
+                # a false kill costs a 15-40 min boot on this host, a true
+                # deadlock only waits ~2 extra min for KeepAlive to revive.
+                self._loop_liveness_watchdog = start_loop_liveness_watchdog(
+                    loop, max_strikes=6
+                )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
 
@@ -10888,8 +10895,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
-        if self._gateway_loop is not None:
-            self._start_loop_liveness_guards(self._gateway_loop)
+        # Liveness-guard arming is deferred until adapters have connected —
+        # see the call after "Gateway running": startup legitimately blocks
+        # the loop for minutes on a loaded host, and arming here let three
+        # 30 s strikes execute a healthy crawling boot (2026-07-31).
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -11568,7 +11577,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
-        
+
+        # Arm the loop-liveness guards only now that startup's loop-blocking
+        # phase (config/skills/memory reads, adapter connects) is behind us.
+        # A truly hung BOOT is still covered by the external supervisors and
+        # launchd KeepAlive; this guard exists for a wedged RUNNING loop.
+        if self._gateway_loop is not None:
+            self._start_loop_liveness_guards(self._gateway_loop)
+
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
