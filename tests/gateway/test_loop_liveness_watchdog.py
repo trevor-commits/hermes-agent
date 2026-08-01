@@ -188,7 +188,10 @@ def test_gateway_runner_liveness_guards_start_and_stop():
         runner._start_loop_liveness_guards(loop)
 
     arm_floor.assert_called_once_with(loop)
-    start_watchdog.assert_called_once_with(loop)
+    # max_strikes=6: a false liveness kill costs a 15-40 min boot on this
+    # host while a true deadlock only waits ~2 extra min for KeepAlive
+    # (2026-07-31 — two exit-75 kills in one evening at the default 3).
+    start_watchdog.assert_called_once_with(loop, max_strikes=6)
     assert runner._loop_floor_timer_handle is floor_timer
     assert runner._loop_liveness_watchdog is watchdog
 
