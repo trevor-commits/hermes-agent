@@ -1159,9 +1159,22 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
-        
+
         offset, limit = normalize_read_pagination(offset, limit)
-        
+
+        # Missing-file fast path (2026-07-31): the shell probes below boot the
+        # task's terminal environment on first use — under host load that
+        # snapshot bootstrap cost 420 s per read, paid even for files that
+        # never existed. When the backend is the local host, a pure-Python
+        # stat answers existence in microseconds with no shell involved.
+        # MRO-name check instead of an import so container/ssh/modal backends
+        # (whose paths the host cannot see) are untouched.
+        _env_is_local = any(
+            c.__name__ == "LocalEnvironment" for c in type(self.env).__mro__
+        )
+        if _env_is_local and not os.path.exists(path):
+            return self._suggest_similar_files(path)
+
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
