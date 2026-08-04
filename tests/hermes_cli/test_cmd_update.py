@@ -484,6 +484,33 @@ class TestCmdUpdateBranchFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_returns_to_original_branch_after_commits_land(self, mock_run, _mock_which):
+        """An update that lands commits must put HEAD back where it started.
+
+        Regression guard: the restore used to live only inside the
+        ``commit_count == 0`` branch, so a no-op update returned you to your
+        branch but a real one left you parked on the update target. That is
+        how this install silently ended up running upstream ``main`` instead
+        of its local keepers branch.
+        """
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="trevor-local-20260730",
+            target_branch="main",
+            commit_count="3",
+        )
+
+        cmd_update(SimpleNamespace(branch="main"))
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        merge_idx = next(i for i, c in enumerate(commands) if "merge --ff-only" in c)
+        restores = [
+            i for i, c in enumerate(commands) if "checkout trevor-local-20260730" in c
+        ]
+        assert restores, f"never switched back off main: {commands}"
+        assert max(restores) > merge_idx, f"switch-back did not follow the pull: {commands}"
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_branch_flag_fails_when_branch_missing_everywhere(self, mock_run, _mock_which, capsys):
         """If branch doesn't exist locally OR on origin, exit non-zero with clear error."""
         mock_run.side_effect = self._branch_side_effect(
