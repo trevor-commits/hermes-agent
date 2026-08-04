@@ -3778,6 +3778,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        def _restore_original_branch():
+            """Put HEAD back on the branch the user was on before the update.
+
+            Must run on EVERY exit path once we've switched away, not just the
+            "no new commits" one. Restoring only on the no-op path is what
+            silently stranded keepers-branch installs on ``main``: any update
+            that actually landed commits left HEAD switched, so the next
+            gateway start ran upstream code instead of the local branch.
+            """
+            if current_branch not in {branch, "HEAD"}:
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    check=False,
+                )
+
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
@@ -3859,14 +3877,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    check=False,
-                )
+            _restore_original_branch()
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -4058,6 +4069,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
+            # Runs after the stash is handled, and on the sys.exit() paths
+            # above (failed reset, syntax-guard rollback) as well as success —
+            # a failed update must not leave HEAD on the update target either.
+            _restore_original_branch()
 
         _invalidate_update_cache()
 
