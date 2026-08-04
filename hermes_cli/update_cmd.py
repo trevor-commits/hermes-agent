@@ -4872,6 +4872,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        parked_branch_switched = False
+
+        def _restore_original_branch():
+            """Put HEAD back on the branch the user was on before the update.
+
+            Must run on EVERY exit path once we've switched away, not just the
+            "no new commits" one. Restoring only on the no-op path is what
+            silently stranded keepers-branch installs on ``main``: any update
+            that actually landed commits left HEAD switched, so the next
+            gateway start ran upstream code instead of the local branch.
+
+            Exception: a parked feature branch that was clean and fully merged
+            stays on the update target. Switching back would re-park the
+            checkout on the stale branch.
+            """
+            if parked_branch_switched:
+                return
+            if current_branch not in {branch, "HEAD"}:
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    check=False,
+                )
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -4886,7 +4911,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # when the parked branch is clean AND fully merged into the target;
         # otherwise warn loudly, mark the code update SKIPPED, and stop
         # before the post-update steps reinforce the stale tree.
-        parked_branch_switched = False
         if current_branch != branch:
             if current_branch != "HEAD":
                 switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
@@ -5028,14 +5052,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"  ✓ Checkout was parked on '{current_branch}' (fully "
                     f"merged) — switched back to {branch}."
                 )
-            elif current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    check=False,
-                )
+            else:
+                _restore_original_branch()
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -5253,6 +5271,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
+            # Runs after the stash is handled, and on the sys.exit() paths
+            # above (failed reset, syntax-guard rollback) as well as success —
+            # a failed update must not leave HEAD on the update target either.
+            _restore_original_branch()
 
         _invalidate_update_cache()
 
