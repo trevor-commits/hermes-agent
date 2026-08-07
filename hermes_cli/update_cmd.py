@@ -3795,6 +3795,50 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
+                # Auto-rebase carried branch onto the updated main so the
+                # install never falls behind after an update.  Only fires when
+                # we were on a non-main branch (i.e. a carried/custom branch)
+                # and there are new upstream commits to absorb.
+                _auto_rebase_if_behind(git_cmd, _m().PROJECT_ROOT, branch)
+
+        def _auto_rebase_if_behind(git_cmd, cwd, upstream_branch):
+            """Rebase the current branch onto origin/<upstream_branch> if behind."""
+            try:
+                behind = subprocess.run(
+                    git_cmd + ["rev-list", f"HEAD..origin/{upstream_branch}", "--count"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    check=True,
+                )
+                n_behind = int(behind.stdout.strip())
+                if n_behind > 0:
+                    print(
+                        f"  → Rebasing {current_branch} onto "
+                        f"origin/{upstream_branch} ({n_behind} new commit"
+                        f"{'s' if n_behind != 1 else ''})..."
+                    )
+                    rebase = subprocess.run(
+                        git_cmd + ["rebase", f"origin/{upstream_branch}"],
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if rebase.returncode == 0:
+                        print("  ✓ Carried branch rebased onto latest upstream.")
+                    else:
+                        # Abort the rebase so we don't leave a mess
+                        subprocess.run(
+                            git_cmd + ["rebase", "--abort"],
+                            cwd=cwd, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        print("  ⚠ Auto-rebase had conflicts; skipped.")
+                        print(
+                            f"    Run manually: git rebase origin/{upstream_branch}"
+                        )
+            except Exception:
+                pass
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
