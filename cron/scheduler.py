@@ -2883,7 +2883,12 @@ def _build_job_prompt(
         # data (cron hint + prompt + script output + run context). Declare
         # that boundary for the Anthropic cache planner (#81867).
         stable_prefix = append_user_instruction(parts, prompt)
-    assembled = _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    assembled = _scan_assembled_cron_prompt(
+        "\n".join(parts),
+        job,
+        has_skills=True,
+        user_prompt=user_prompt,
+    )
     if stable_prefix and len(assembled) > len(stable_prefix) and assembled.startswith(stable_prefix):
         # Guarded because the injection scanner may sanitize (mutate) the
         # assembled bytes; a mismatch simply falls back to whole-message
@@ -2931,11 +2936,10 @@ def _scan_assembled_cron_prompt(
       code, the same trust class — and data feeds (e.g. a triage bot
       ingesting bug reports) legitimately quote dangerous commands.
 
-    When the looser tier is selected because of injected data only,
-    ``user_prompt`` (the raw, pre-assembly prompt) is additionally scanned
-    with the STRICT set so the user-authored surface keeps the full
-    create/update-time guarantee at runtime (defense-in-depth for legacy
-    jobs that predate the create-time scanner).
+    Whenever the looser tier is selected, ``user_prompt`` (the raw,
+    pre-assembly prompt) is additionally scanned with the STRICT set so the
+    user-authored surface keeps the full create/update-time guarantee at
+    runtime (defense-in-depth for legacy jobs that predate the scanner).
     """
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
@@ -2947,9 +2951,10 @@ def _scan_assembled_cron_prompt(
         # prompt is what actually runs.
         cleaned, scan_error = _scan_cron_skill_assembled(assembled)
         assembled = cleaned
-        if not scan_error and not has_skills and user_prompt:
-            # Data-injection path: keep the strict guarantee on the
-            # user-authored prompt itself.
+        if not scan_error and user_prompt:
+            # Keep the strict guarantee on the raw user-authored prompt. It
+            # must not inherit the installed-skill/data trust tier merely
+            # because those sources are assembled into the same string.
             scan_error = _scan_cron_prompt(user_prompt)
     else:
         scan_error = _scan_cron_prompt(assembled)
