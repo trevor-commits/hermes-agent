@@ -231,19 +231,14 @@ class TestLockContended413Defer:
 
 
 class TestPreApiLockDeferDoesNotBurnBudget:
-    def test_lock_loser_turn_recovers_after_lock_release(self, agent):
-        """End-to-end shape of the live bug at cap=1:
+    def test_lock_loser_turn_defers_without_sending_over_ceiling(self, agent):
+        """A lock loser preserves its budget and does not send over ceiling.
 
         1. Pre-API pressure gate fires; the compression pass loses the lock
-           (no-op + lock-skip flag). Pre-fix this burned the single shared
-           attempt.
-        2. The oversized request goes to the provider → 413.
-        3. The 413 handler compresses again — the lock has been released and
-           the pass now succeeds — and the retry completes.
-
-        Pre-fix, step 3 found ``compression_attempts`` already at the cap and
-        returned ``compression_exhausted`` → gateway session wipe. The defer
-        refund keeps the budget intact for the provider-proven retry.
+           (no-op + lock-skip flag), so the attempt is refunded.
+        2. The terminal hard-ceiling guard returns the existing soft defer
+           result without contacting the provider or resetting the session.
+        3. A later turn can retry after the lock winner finishes compaction.
         """
         agent.max_compression_attempts = 1
         # Compressor stub: pressure only on the fully-assembled request
@@ -260,10 +255,9 @@ class TestPreApiLockDeferDoesNotBurnBudget:
             get_active_compression_failure_cooldown=lambda: None,
         )
 
-        agent.client.chat.completions.create.side_effect = [
-            _make_413_error(),
-            _mock_response(content="Recovered after lock release"),
-        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="provider must not receive this request"
+        )
 
         compress_calls = []
 
@@ -300,10 +294,9 @@ class TestPreApiLockDeferDoesNotBurnBudget:
         ):
             result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
 
-        # Pass 1: pre-API (lock defer, refunded). Pass 2: 413 handler
-        # (succeeds within the cap because the defer did not count).
-        assert len(compress_calls) == 2
-        assert result.get("completed") is True
-        assert result["final_response"] == "Recovered after lock release"
+        assert len(compress_calls) == 1
+        agent.client.chat.completions.create.assert_not_called()
+        assert result.get("completed") is False
+        assert result.get("failed") is False
+        assert result.get("compression_deferred") is True
         assert not result.get("compression_exhausted")
-        assert not result.get("compression_deferred")
