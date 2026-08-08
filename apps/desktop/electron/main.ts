@@ -32,7 +32,10 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl } from './backend-child'
+import {
+  stopBackendChildAndWait as stopBackendChildAndWaitImpl,
+  stopBackendChild as stopBackendChildImpl
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -2627,6 +2630,9 @@ let isQuittingForHandoff = false
 // (the app.quit() that follows re-enters before-quit and must pass through).
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
+let backendQuitTeardownPromise: Promise<void> | null = null
+let backendQuitTeardownDone = false
+let sshQuitTeardownPromise: Promise<void> | null = null
 
 // Resolve the staged updater binary the desktop may hand an update to. On
 // Windows that binary owns ALL repo mutation — running `hermes update` +
@@ -2741,11 +2747,10 @@ function forceKillProcessTree(pid) {
 // pool backends and poll the shim until it's writable (or a bounded timeout),
 // so by the time we spawn the updater the lock is genuinely gone.
 //
-// Windows-only: the venv-shim mandatory lock is a Windows phenomenon. On
-// macOS/Linux there's no REPLACE-on-running-exe block, the existing before-quit
-// SIGTERM + app.quit() teardown already works (the macOS path is flawless), and
-// aggressively SIGKILL-ing the backend here would be an untested behavior change
-// for no benefit. So we no-op off Windows and leave that path exactly as it was.
+// Windows-only: the venv-shim mandatory lock is a Windows phenomenon. The
+// general quit path now waits for POSIX children and escalates after a bounded
+// grace period, but only Windows must prove that the shim itself is writable
+// before handing mutation to a second process.
 async function releaseBackendLockForUpdate(updateRoot) {
   return releaseBackendLock(updateRoot, 'updates')
 }
@@ -7926,6 +7931,10 @@ function stopBackendChild(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
+function stopBackendChildAndWait(child, timeoutMs = 5000) {
+  return stopBackendChildAndWaitImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS }, timeoutMs)
+}
+
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
 // reloading the renderer. The shell stays up; the renderer wipes session lists
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
@@ -7980,34 +7989,7 @@ function sendConnectionApplied() {
 }
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
-  }
-
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
-  }
-
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-
-      resolve()
-    }, timeoutMs)
-
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
+  await stopBackendChildAndWait(child, timeoutMs)
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -11980,19 +11962,27 @@ app.on('before-quit', event => {
 
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
     event.preventDefault()
-    sshBootstrapCoordinator.cancelAll()
-    const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
+    if (!sshQuitTeardownPromise) {
+      sshBootstrapCoordinator.cancelAll()
+      const scopes = [...sshConnections.keys()]
 
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
-      sshQuitTeardownDone = true
-      app.quit()
-    })
+      const pending = Promise.allSettled([
+        ...scopes.map(scope => teardownSshConnection(scope || null)),
+        ...sshBootstrapCoordinator.promises()
+      ])
+
+      sshQuitTeardownPromise = Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(
+        async () => {
+          await sshBootstrapCoordinator.forceCleanupAll()
+          sshQuitTeardownDone = true
+
+          if (backendQuitTeardownDone) {
+            app.quit()
+          }
+        }
+      )
+    }
   }
 
   // Clean quit mid-boot should not trip next-launch --no-sandbox (#38216).
@@ -12039,8 +12029,41 @@ app.on('before-quit', event => {
     disposeTerminalSession(id)
   }
 
-  stopBackendChild(backendConnectionState.getProcess())
-  stopAllPoolBackends()
+  if (!backendQuitTeardownDone) {
+    if (backendQuitTeardownPromise) {
+      event.preventDefault()
+    } else {
+      const primaryBackend = backendConnectionState.invalidate()
+      const managedBackends = [primaryBackend, ...[...backendPool.values()].map(entry => entry.process)].filter(Boolean)
+
+      backendPool.clear()
+
+      if (poolIdleReaper) {
+        clearInterval(poolIdleReaper)
+        poolIdleReaper = null
+      }
+
+      if (managedBackends.length === 0) {
+        backendQuitTeardownDone = true
+      } else {
+        event.preventDefault()
+        rememberLog(`[backend] waiting for ${managedBackends.length} managed backend(s) to exit before quit`)
+        flushDesktopLogBufferSync()
+
+        backendQuitTeardownPromise = Promise.allSettled(
+          managedBackends.map(child => stopBackendChildAndWait(child))
+        ).then(() => {
+          backendQuitTeardownDone = true
+          rememberLog('[backend] managed backend teardown complete; resuming quit')
+          flushDesktopLogBufferSync()
+
+          if (!sshQuitTeardownPromise || sshQuitTeardownDone) {
+            app.quit()
+          }
+        })
+      }
+    }
+  }
 })
 
 app.on('window-all-closed', () => {
