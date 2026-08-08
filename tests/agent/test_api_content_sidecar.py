@@ -600,7 +600,9 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent.context_compressor = types.SimpleNamespace(
             protect_first_n=0,
             protect_last_n=0,
-            threshold_tokens=1,
+            # The current "hello" input must fit; the oversized history is
+            # what this fixture asks preflight compression to compact.
+            threshold_tokens=100,
             context_length=1000,
             last_prompt_tokens=-1,
             should_compress=_should_compress,
@@ -947,7 +949,9 @@ class TestSessionRowExistsBeforePreflightCompaction:
         compressor = MagicMock()
         compressor.protect_first_n = 0
         compressor.protect_last_n = 0
-        compressor.threshold_tokens = 1
+        # Keep the current "hello" input below the hard input ceiling while
+        # the 8KB history remains unambiguously above it.
+        compressor.threshold_tokens = 100
         compressor.context_length = 1000
         compressor.last_prompt_tokens = -1
         compressor.should_compress = _should_compress

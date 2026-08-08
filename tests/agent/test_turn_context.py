@@ -206,6 +206,9 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1]["role"] == "user"
     assert ctx.messages[-1]["content"] == "hello"
     assert isinstance(ctx.messages[-1]["timestamp"], float)
+    assert ctx.messages[-1]["_current_turn_identity"] == (
+        agent._persist_user_turn_identity
+    )
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
 
@@ -281,6 +284,9 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert ctx.messages[-1]["role"] == "user"
     assert ctx.messages[-1]["content"] == "hello"
     assert isinstance(ctx.messages[-1]["timestamp"], float)
+    assert ctx.messages[-1]["_current_turn_identity"] == (
+        agent._persist_user_turn_identity
+    )
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
@@ -310,7 +316,12 @@ def test_applies_agent_side_effects():
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
-    staged = {"role": "user", "content": "clean prompt", "_db_persisted": True}
+    staged = {
+        "role": "user",
+        "content": "clean prompt",
+        "_db_persisted": True,
+        "_current_turn_identity": "cli-staged-current-input",
+    }
     agent._pending_cli_user_message = staged
 
     ctx = _build(
@@ -323,6 +334,8 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["content"] == "[MODEL NOTE]\n\nclean prompt"
     assert ctx.messages[-1]["_db_persisted"] is True
     assert isinstance(ctx.messages[-1]["timestamp"], float)
+    assert ctx.messages[-1]["_current_turn_identity"] == "cli-staged-current-input"
+    assert agent._persist_user_turn_identity == "cli-staged-current-input"
     assert agent._pending_cli_user_message is None
 
 
