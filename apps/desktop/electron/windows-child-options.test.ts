@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { stopBackendChild, stopBackendTreesForUpdate } from './backend-child'
+import { stopBackendChild, stopBackendChildAndWait, stopBackendTreesForUpdate } from './backend-child'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 test('hiddenWindowsChildOptions adds windowsHide:true on Windows when unset', () => {
@@ -52,6 +52,34 @@ function makeChild(overrides: Partial<{ pid: number | null; killed: boolean }> =
   }
 }
 
+function makeAwaitableChild({ exitOnTerm = false } = {}) {
+  const calls: string[] = []
+  let exitListener: (() => void) | null = null
+
+  const child = {
+    exitCode: null as number | null,
+    kill: (signal: string) => {
+      calls.push(signal)
+
+      if (signal === 'SIGTERM' && exitOnTerm) {
+        child.exitCode = 0
+        queueMicrotask(() => exitListener?.())
+      }
+    },
+    killed: false,
+    once: (event: string, listener: () => void) => {
+      assert.equal(event, 'exit')
+      exitListener = listener
+
+      return child
+    },
+    pid: 1234,
+    signalCode: null as string | null
+  }
+
+  return { calls, child }
+}
+
 test('stopBackendChild tree-kills on Windows when the child has a pid', () => {
   const { child, calls } = makeChild({ pid: 4242 })
   const treeKillCalls: number[] = []
@@ -93,6 +121,42 @@ test('stopBackendChild falls back to direct SIGTERM on POSIX when the group send
   })
 
   assert.deepEqual(calls, ['SIGTERM'], 'must fall back to signalling the direct child')
+})
+
+test('stopBackendChildAndWait resolves after a graceful non-Windows exit', async () => {
+  const { child, calls } = makeAwaitableChild({ exitOnTerm: true })
+
+  await stopBackendChildAndWait(
+    child,
+    {
+      forceKillProcessTree: () => {},
+      isWindows: false,
+      killGroup: () => {
+        throw new Error('ESRCH: no such process group')
+      }
+    },
+    25
+  )
+
+  assert.deepEqual(calls, ['SIGTERM'])
+})
+
+test('stopBackendChildAndWait force-kills a non-Windows child that outlives the grace period', async () => {
+  const { child, calls } = makeAwaitableChild()
+
+  await stopBackendChildAndWait(
+    child,
+    {
+      forceKillProcessTree: () => {},
+      isWindows: false,
+      killGroup: () => {
+        throw new Error('ESRCH: no such process group')
+      }
+    },
+    0
+  )
+
+  assert.deepEqual(calls, ['SIGTERM', 'SIGKILL'])
 })
 
 test('stopBackendChild falls back to SIGTERM on Windows when the pid is not an integer', () => {
