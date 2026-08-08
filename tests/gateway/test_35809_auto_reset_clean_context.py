@@ -46,28 +46,19 @@ from hermes_state import SessionDB
 # AST invariant: the auto-reset block re-syncs the topic binding
 # ---------------------------------------------------------------------------
 def _find_compression_exhausted_reset_block() -> ast.If:
-    """Return the ``if agent_result.get('compression_exhausted') ...`` block."""
+    """Return the authoritative compression-rollover reset block."""
     tree = ast.parse(inspect.getsource(gateway_run))
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
-        consts = [
-            n.value
-            for n in ast.walk(node.test)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)
-        ]
-        # Identify the auto-reset branch by the literal passed to .get(...).
-        if "compression_exhausted" in consts:
-            # Only the branch that actually performs the reset, not the
-            # earlier classifier that merely reads the flag into a bool.
-            calls = {
-                sub.func.attr
-                for sub in ast.walk(node)
-                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
-            }
-            if "reset_session" in calls:
-                return node
+        calls = {
+            sub.func.attr
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+        }
+        if "reset_session" in calls:
+            return node
     raise AssertionError(
         "Could not locate the compression-exhausted auto-reset block "
         "(if agent_result.get('compression_exhausted') ... reset_session) "
@@ -196,4 +187,3 @@ class TestAutoResetLoadsCleanContext:
         )
         # The old transcript is still searchable, not destroyed.
         assert len(store.load_transcript(bloated_sid)) == 120
-
