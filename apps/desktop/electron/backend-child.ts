@@ -12,7 +12,8 @@
  * (start_new_session=True), so `child.kill('SIGTERM')` would only reach the
  * backend and orphan its MCP grandchildren (the leak in #serve-orphans). We
  * signal the whole group via `process.kill(-pid, ...)` instead, falling back
- * to the direct child if the group send fails.
+ * to the direct child if the group send fails. Callers that are ending the
+ * owning Electron process must wait for exit and escalate if the child survives.
  *
  * Extracted into its own dependency-free module (no electron import) so the
  * tree-kill / group-kill branching can be asserted directly with a fake child
@@ -47,6 +48,12 @@ export interface BackendProcessRoot {
 export interface KillableChild extends BackendProcessRoot {
   killed?: boolean
   kill: (signal: string) => void
+}
+
+export interface AwaitableKillableChild extends KillableChild {
+  exitCode: number | null
+  signalCode: string | null
+  once: (event: 'exit', listener: () => void) => unknown
 }
 
 /**
@@ -100,4 +107,74 @@ export function stopBackendTreesForUpdate(
   }
 
   deps.stopAllPoolBackends()
+}
+
+/**
+ * Gracefully stop a managed backend and keep the owner alive until the child
+ * exits. A child that survives the bounded grace period is force-stopped so it
+ * cannot be orphaned when Electron exits.
+ */
+export async function stopBackendChildAndWait(
+  child: AwaitableKillableChild | null | undefined,
+  deps: StopBackendChildDeps,
+  timeoutMs = 5000
+): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return
+  }
+
+  await new Promise<void>(resolve => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let settled = false
+
+    const finish = () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      resolve()
+    }
+
+    child.once('exit', finish)
+    stopBackendChild(child, deps)
+
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish()
+
+      return
+    }
+
+    timer = setTimeout(
+      () => {
+        const isWindows = deps.isWindows ?? process.platform === 'win32'
+
+        try {
+          if (isWindows && Number.isInteger(child.pid)) {
+            deps.forceKillProcessTree(child.pid as number)
+          } else if (Number.isInteger(child.pid)) {
+            const killGroup =
+              deps.killGroup ?? ((pgid: number, signal: string) => process.kill(pgid, signal))
+            try {
+              killGroup(-(child.pid as number), 'SIGKILL')
+            } catch {
+              child.kill('SIGKILL')
+            }
+          } else {
+            child.kill('SIGKILL')
+          }
+        } catch {
+          // Already gone.
+        }
+
+        finish()
+      },
+      Math.max(0, timeoutMs)
+    )
+  })
 }
