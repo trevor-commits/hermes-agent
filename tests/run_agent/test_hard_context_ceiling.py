@@ -455,3 +455,43 @@ def test_sequence_repair_cannot_inherit_prior_turn_durability():
     assert len(messages) == 1
     assert messages[0][CURRENT_TURN_IDENTITY_KEY] == turn_identity
     assert messages[0].get("_db_persisted") is not True
+
+
+def test_sequence_repair_flushes_current_turn_instead_of_restamping_history(
+    monkeypatch, tmp_path
+):
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    db.append_message(agent.session_id, "user", content="durable prior turn")
+    history = [
+        {
+            "role": "user",
+            "content": "durable prior turn",
+            "_db_persisted": True,
+        }
+    ]
+    turn_identity = "hard-ceiling-e2e:unpersisted-active-turn"
+    messages = [
+        history[0],
+        {
+            "role": "user",
+            "content": "unpersisted active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        },
+    ]
+    agent._persist_user_message_idx = 1
+    agent._persist_user_turn_identity = turn_identity
+
+    repair_message_sequence(agent, messages)
+    agent._persist_user_message_idx = 0
+
+    assert agent._persist_session(messages, history) is True
+    assert agent._current_turn_user_is_durable(messages) is True
+    assert any(
+        row.get("role") == "user"
+        and "unpersisted active ask" in str(row.get("content") or "")
+        for row in db.get_messages(agent.session_id)
+    )
