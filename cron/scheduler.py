@@ -2749,6 +2749,11 @@ def _build_job_prompt(
 
     parts = []
     skipped: list[str] = []
+    benign_skill_deception_phrases: list[str] = []
+    from tools.cronjob_tools import (
+        _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+        _scan_cron_skill_assembled,
+    )
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2794,6 +2799,21 @@ def _build_job_prompt(
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
         content = str(loaded.get("content") or "").strip()
+        benign_phrases = ()
+        if (
+            normalize_skill_lookup_name(skill_name) == "source-card-intake"
+            and _CRON_SOURCE_CARD_BENIGN_DECEPTION in content
+        ):
+            benign_phrases = (_CRON_SOURCE_CARD_BENIGN_DECEPTION,)
+            benign_skill_deception_phrases.append(
+                _CRON_SOURCE_CARD_BENIGN_DECEPTION
+            )
+        content, skill_scan_error = _scan_cron_skill_assembled(
+            content,
+            benign_deception_phrases=benign_phrases,
+        )
+        if skill_scan_error:
+            raise CronPromptInjectionBlocked(skill_scan_error)
         if parts:
             parts.append("")
         parts.extend(
@@ -2820,6 +2840,7 @@ def _build_job_prompt(
         job,
         has_skills=True,
         user_prompt=user_prompt,
+        benign_skill_deception_phrases=tuple(benign_skill_deception_phrases),
     )
 
 
@@ -2830,6 +2851,7 @@ def _scan_assembled_cron_prompt(
     has_skills: bool = False,
     has_injected_data: bool = False,
     user_prompt: Optional[str] = None,
+    benign_skill_deception_phrases: tuple[str, ...] = (),
 ) -> str:
     """Scan the fully-assembled cron prompt for injection patterns. Raises
     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
@@ -2873,7 +2895,10 @@ def _scan_assembled_cron_prompt(
         # strings. Invisible unicode is sanitized (not blocked) so a stray
         # zero-width space can't permanently kill the job; the cleaned
         # prompt is what actually runs.
-        cleaned, scan_error = _scan_cron_skill_assembled(assembled)
+        cleaned, scan_error = _scan_cron_skill_assembled(
+            assembled,
+            benign_deception_phrases=benign_skill_deception_phrases,
+        )
         assembled = cleaned
         if not scan_error and user_prompt:
             # Keep the strict guarantee on the raw user-authored prompt. It

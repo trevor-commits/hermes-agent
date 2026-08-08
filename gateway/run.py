@@ -3716,6 +3716,43 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+_GATEWAY_CONTEXT_CEILING_RESULT_FIELDS = (
+    "compression_exhausted",
+    "compression_deferred",
+    "hard_context_ceiling_blocked",
+    "estimated_context_tokens",
+    "hard_context_ceiling_tokens",
+    "compression_block_reason",
+    "continuity_preserved",
+    "rollover_safe",
+)
+
+
+def _gateway_context_ceiling_result_fields(agent_result: dict) -> dict:
+    """Project the agent's context-safety contract without adapter drift."""
+    false_default_fields = {
+        "compression_exhausted",
+        "compression_deferred",
+        "hard_context_ceiling_blocked",
+        "continuity_preserved",
+        "rollover_safe",
+    }
+    return {
+        field: agent_result.get(field, False if field in false_default_fields else None)
+        for field in _GATEWAY_CONTEXT_CEILING_RESULT_FIELDS
+    }
+
+
+def _gateway_rollover_is_authorized(agent_result: dict) -> bool:
+    """Return whether the agent authoritatively proved reset is lossless."""
+    return (
+        agent_result.get("compression_deferred") is not True
+        and agent_result.get("compression_exhausted") is True
+        and agent_result.get("continuity_preserved") is True
+        and agent_result.get("rollover_safe") is True
+    )
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -5619,6 +5656,7 @@ class TurnRunner:
         _effective_history_offset = (
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
+        _context_ceiling_fields = _gateway_context_ceiling_result_fields(result)
 
         if not final_response:
             final_response = _normalize_empty_agent_response(
@@ -5644,8 +5682,8 @@ class TurnRunner:
                 "interrupted": result.get("interrupted", False),
                 "interrupt_message": result.get("interrupt_message"),
                 "error": result.get("error"),
-                "compression_exhausted": result.get("compression_exhausted", False),
-                "compression_deferred": result.get("compression_deferred", False),
+                **_context_ceiling_fields,
+                "agent_persisted": result.get("agent_persisted", True),
                 "tools": ctx.tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
@@ -5778,13 +5816,7 @@ class TurnRunner:
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
-            # Soft lock-contention defer (#69870 consumer): distinct from
-            # compression_exhausted so the gateway never auto-resets a
-            # session that a concurrent compressor is about to shrink.
-            "compression_deferred": (
-                ctx.result_holder[0].get("compression_deferred", False)
-                if ctx.result_holder[0] else False
-            ),
+            **_context_ceiling_fields,
             "tools": ctx.tools_holder[0] or [],
             "history_offset": _effective_history_offset,
             "compacted_in_place": _compacted_in_place,
@@ -18392,10 +18424,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result.get("error", "processing incomplete"),
                 )
 
-            # When compression is exhausted, the session is permanently too
-            # large to process.  Auto-reset it so the next message starts
-            # fresh instead of replaying the same oversized context in an
-            # infinite fail loop.  (#9893)
+            # When compression is exhausted AND the agent authoritatively
+            # proves the current user turn is durable, auto-reset the session
+            # so the next message starts fresh instead of replaying the same
+            # oversized context in an infinite fail loop. Missing/legacy
+            # rollover evidence fails closed and keeps the session. (#9893)
             #
             # A lock-contended defer is the OPPOSITE case: the session is
             # temporarily uncompressible only because a concurrent path holds
@@ -18409,7 +18442,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "session intact; the next message retries normally.",
                     session_entry.session_id if session_entry else "?",
                 )
-            elif agent_result.get("compression_exhausted") and session_entry and session_key:
+            elif (
+                _gateway_rollover_is_authorized(agent_result)
+                and session_entry
+                and session_key
+            ):
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,

@@ -85,12 +85,13 @@ def _notify_provider_jobs_changed_safe() -> None:
 #
 #      Skill bodies are user-curated and scanned at install time by
 #      `skills_guard.py`. The runtime cron scan only needs to catch the
-#      patterns whose phrasing does NOT survive normal English prose:
-#      classic prompt-injection directives ("ignore previous instructions",
-#      "disregard your rules") and invisible unicode. Raw user directives,
-#      including deception language, are scanned separately with the strict
-#      tier. `_scan_cron_skill_assembled()` runs against the assembled prompt
-#      with this tighter pattern set.
+#      patterns whose phrasing is itself directive: classic prompt injection
+#      ("ignore previous instructions", "disregard your rules"), deception
+#      ("do not tell the user"), and invisible unicode. One byte-exact benign
+#      source-card instruction is exempted only by the scheduler after it binds
+#      that text to the exact source-card skill class. Raw user directives are
+#      scanned separately with the strict tier. `_scan_cron_skill_assembled()`
+#      runs against the assembled prompt with this tighter pattern set.
 #
 # Both scanners share the invisible-unicode check and the GitHub Authorization
 # header exemption.
@@ -116,9 +117,15 @@ _CRON_THREAT_PATTERNS = [
 # through install.
 _CRON_SKILL_ASSEMBLED_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
+    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
 ]
+
+_CRON_SOURCE_CARD_BENIGN_DECEPTION = (
+    "Do not tell the user that a private agent browser tab is open for "
+    "them; report only the source-card outcome."
+)
 
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
 _CRON_EXFIL_COMMAND_PATTERNS = [
@@ -279,14 +286,19 @@ def _scan_cron_prompt(prompt: str) -> str:
     return ""
 
 
-def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
+def _scan_cron_skill_assembled(
+    assembled: str,
+    *,
+    benign_deception_phrases: tuple[str, ...] = (),
+) -> tuple[str, str]:
     """Scan an ASSEMBLED cron prompt that includes loaded skill content.
 
     Looser pattern set — only catches unambiguous prompt-injection
-    directives. Drops command-shape patterns (cat .env, rm -rf /,
-    authorized_keys, /etc/sudoers) and generic deception wording because
-    both false-positive on legitimate installed-skill guidance and prose.
-    The raw user-authored instruction is strict-scanned separately.
+    directives and deception language. Command-shape patterns (cat .env,
+    rm -rf /, authorized_keys, /etc/sudoers) remain prose-tolerant. The raw
+    user-authored instruction is strict-scanned separately. Callers may
+    remove a byte-exact, pre-classified benign phrase from this scan only;
+    all other mutable skill content remains covered.
 
     Invisible unicode is SANITIZED, not blocked. Skill bodies are
     user-curated and already scanned at install time by
@@ -307,6 +319,9 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
             len(removed), ", ".join(removed),
         )
     prompt_to_scan = _strip_cron_safe_constructs(cleaned)
+    for phrase in benign_deception_phrases:
+        if phrase:
+            prompt_to_scan = prompt_to_scan.replace(phrase, "")
     for pattern, pid in _CRON_SKILL_ASSEMBLED_PATTERNS:
         if re.search(pattern, prompt_to_scan, re.IGNORECASE):
             return cleaned, f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."

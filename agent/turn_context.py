@@ -330,6 +330,9 @@ class TurnContext:
     turn_id: str
     # Index of the current user turn within ``messages``.
     current_turn_user_idx: int
+    # The active user row alone consumes the reserved input ceiling, so
+    # summarizing or rotating healthy prior history cannot make it fit.
+    current_input_too_large: bool = False
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
@@ -575,6 +578,14 @@ def build_turn_context(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    _input_ceiling = int(
+        getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+    )
+    current_input_too_large = bool(
+        agent.compression_enabled
+        and _input_ceiling > 0
+        and estimate_messages_tokens_rough([user_msg]) >= _input_ceiling
+    )
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
@@ -674,7 +685,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        agent.compression_enabled
+        and not current_input_too_large
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -751,11 +767,15 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
+    if (
+        agent.compression_enabled
+        and not current_input_too_large
+        and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -1274,6 +1294,7 @@ def build_turn_context(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
+        current_input_too_large=current_input_too_large,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,

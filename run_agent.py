@@ -1897,10 +1897,18 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+    ) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
+
+        Returns ``True`` only when the canonical SQLite flush completed. JSON
+        logging and cleanup still run on every path, but they are not enough to
+        authorize continuity-sensitive session rollover.
 
         Trailing empty-response scaffolding is dropped from the live list in
         place (it is ephemeral junk the real transcript should shed). The
@@ -1918,24 +1926,42 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            db_persisted = self._flush_messages_to_session_db(
+                messages, conversation_history
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return db_persisted is True
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
+
+    def _current_turn_user_is_durable(self, messages: List[Dict]) -> bool:
+        """Verify the exact current user row reached the canonical session DB."""
+        idx = getattr(self, "_persist_user_message_idx", None)
+        if not isinstance(idx, int) or not (0 <= idx < len(messages)):
+            return False
+        message = messages[idx]
+        return bool(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and message.get(_DB_PERSISTED_MARKER) is True
+            and not any(
+                isinstance(later, dict) and later.get("role") == "user"
+                for later in messages[idx + 1 :]
+            )
+        )
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.

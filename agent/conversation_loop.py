@@ -1125,6 +1125,7 @@ def _hard_context_ceiling_reason(
     preflight_compression_blocked: bool,
     compression_cooldown: Any,
     preflight_deferred: bool,
+    current_input_too_large: bool = False,
 ) -> Optional[str]:
     """Return why an over-ceiling request must fail closed, if armed."""
     if (
@@ -1132,6 +1133,8 @@ def _hard_context_ceiling_reason(
         or ceiling_tokens <= 0
     ):
         return None
+    if current_input_too_large:
+        return "input_too_large"
     if compression_skipped_due_to_lock(agent):
         return "compression_lock"
     if preflight_compression_blocked:
@@ -1144,7 +1147,6 @@ def _hard_context_ceiling_reason(
         return None
     if estimated_tokens < ceiling_tokens:
         return None
-
     info = getattr(agent.context_compressor, "should_compress_info", None)
     if callable(info):
         try:
@@ -1167,10 +1169,15 @@ def _hard_context_ceiling_result(
     block_reason: str,
 ) -> Dict[str, Any]:
     """Return a truthful terminal result without sacrificing saved history."""
-    continuity_preserved = False
+    current_user_durable = False
     try:
-        agent._persist_session(messages, conversation_history)
-        continuity_preserved = True
+        persisted = agent._persist_session(messages, conversation_history)
+        verify_current_user = getattr(
+            agent, "_current_turn_user_is_durable", lambda _messages: False
+        )
+        current_user_durable = (
+            persisted is True and verify_current_user(messages) is True
+        )
     except Exception:
         logger.exception(
             "Hard context ceiling blocked provider send, but session persistence "
@@ -1178,7 +1185,23 @@ def _hard_context_ceiling_result(
             agent.session_id or "none",
         )
 
-    if continuity_preserved:
+    continuity_preserved = current_user_durable
+    input_too_large = block_reason == "input_too_large"
+    if input_too_large and continuity_preserved:
+        final = (
+            f"Request was not sent: the current input is too large (~{estimated_tokens:,} "
+            f"request tokens) for the {ceiling_tokens:,}-token input ceiling. "
+            "Shorten it or split it across messages; the existing session remains intact."
+        )
+    elif input_too_large:
+        final = (
+            f"Request was not sent: the current input is too large (~{estimated_tokens:,} "
+            f"request tokens) for the {ceiling_tokens:,}-token input ceiling. "
+            "Durable storage of this input could not be verified, so automatic "
+            "rollover is disabled; shorten or split the input and retry after "
+            "session storage is healthy."
+        )
+    elif continuity_preserved:
         final = (
             f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
             f"tokens, above the {ceiling_tokens:,}-token hard ceiling after "
@@ -1198,13 +1221,35 @@ def _hard_context_ceiling_result(
     messages.append({"role": "assistant", "content": final})
     if continuity_preserved:
         try:
-            agent._persist_session(messages, conversation_history)
+            explanation_persisted = agent._persist_session(
+                messages, conversation_history
+            )
+            if explanation_persisted is not True:
+                continuity_preserved = False
         except Exception:
+            continuity_preserved = False
             logger.warning(
                 "Hard-ceiling explanation could not be appended to saved session=%s",
                 agent.session_id or "none",
                 exc_info=True,
             )
+    if not continuity_preserved and current_user_durable:
+        if input_too_large:
+            final = (
+                f"Request was not sent: the current input is too large "
+                f"(~{estimated_tokens:,} request tokens) for the "
+                f"{ceiling_tokens:,}-token input ceiling. The current user message "
+                "was saved, but the terminal explanation could not be verified in "
+                "durable storage, so automatic rollover is disabled."
+            )
+        else:
+            final = (
+                f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
+                f"tokens, above the {ceiling_tokens:,}-token hard ceiling. The current "
+                "user message was saved, but the terminal explanation could not be "
+                "verified in durable storage, so automatic rollover is disabled."
+            )
+        messages[-1]["content"] = final
     try:
         agent._flush_status_buffer()
     except Exception:
@@ -1228,13 +1273,17 @@ def _hard_context_ceiling_result(
         "failed": True,
         # The gateway's existing continuity-preserving rollover is safe only
         # after this path has re-verified durable history.
-        "compression_exhausted": continuity_preserved,
+        "compression_exhausted": continuity_preserved and not input_too_large,
         "hard_context_ceiling_blocked": True,
         "estimated_context_tokens": estimated_tokens,
         "hard_context_ceiling_tokens": ceiling_tokens,
         "compression_block_reason": block_reason,
         "continuity_preserved": continuity_preserved,
-        "rollover_safe": continuity_preserved,
+        "rollover_safe": continuity_preserved and not input_too_large,
+        # The gateway's failed-result fallback owns only the current user row.
+        # Keep this independent from diagnostic-assistant persistence so a
+        # saved user turn is never duplicated after a later write failure.
+        "agent_persisted": current_user_durable,
         "session_id": agent.session_id,
     }
 
@@ -1651,6 +1700,7 @@ def run_conversation(
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
+    current_input_too_large = _ctx.current_input_too_large
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
@@ -2317,6 +2367,7 @@ def run_conversation(
         )()
         if (
             agent.compression_enabled
+            and not current_input_too_large
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2475,6 +2526,7 @@ def run_conversation(
             preflight_compression_blocked=_preflight_compression_blocked,
             compression_cooldown=_compression_cooldown,
             preflight_deferred=bool(_defer_preflight(request_pressure_tokens)),
+            current_input_too_large=current_input_too_large,
         )
         
         # Thinking spinner for quiet mode (animated during API call)
