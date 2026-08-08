@@ -745,6 +745,25 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             # content alone — collapsing image/audio blocks risks
             # mangling the attachment structure.
             if isinstance(prev_content, str) and isinstance(new_content, str):
+                from agent.turn_context import (
+                    CURRENT_TURN_IDENTITY_KEY,
+                    carry_current_turn_identity,
+                )
+
+                if (
+                    prev.get(CURRENT_TURN_IDENTITY_KEY)
+                    or msg.get(CURRENT_TURN_IDENTITY_KEY)
+                ):
+                    # ``messages`` is normally a shallow list copy of
+                    # ``conversation_history``. Never rewrite its history-owned
+                    # dict in place when an active turn is involved: the DB
+                    # flush treats identity-matched history objects as already
+                    # durable, so it could re-stamp the merged active turn
+                    # without appending its new content. A fresh dict breaks
+                    # that alias. Ordinary history-only repairs retain object
+                    # identity for the flush-cursor accounting contract.
+                    prev = dict(prev)
+                    merged[-1] = prev
                 prev["content"] = (
                     (prev_content + "\n\n" + new_content)
                     if prev_content and new_content
@@ -754,8 +773,6 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # bytes previously sent for the pre-merge message) — drop it
                 # so replay can't substitute stale bytes.
                 drop_stale_api_content(prev)
-                from agent.turn_context import carry_current_turn_identity
-
                 carry_current_turn_identity(prev, msg)
                 repairs += 1
                 continue
