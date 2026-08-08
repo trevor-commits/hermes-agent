@@ -604,7 +604,7 @@ class TestPreflightCompression:
             patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
             patch(
                 "agent.conversation_loop.estimate_messages_tokens_rough",
-                return_value=144_669,
+                side_effect=[144_669, 10_000, 10_000],
             ),
             patch.object(
                 agent,
@@ -630,10 +630,12 @@ class TestPreflightCompression:
         # Set a small context so the history is "oversized", but large enough
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
-        agent.context_compressor.threshold_tokens = 200
+        agent.context_compressor.threshold_tokens = 700
 
         # Build a history that will be large enough to trigger preflight
-        # (each message ~50 chars ≈ 13 tokens, 40 messages ≈ 520 tokens > 200 threshold)
+        # (the assembled history is ~818 tokens, above the 700 threshold;
+        # the compressed request is ~533, so it still fits after including
+        # the real system prompt).
         big_history = []
         for i in range(20):
             big_history.append({"role": "user", "content": f"Message number {i} with some extra text padding"})
@@ -883,10 +885,10 @@ class TestPreflightCompression:
         "rows_removed",
         [pytest.param(0, id="no-op"), pytest.param(1, id="marginal")],
     )
-    def test_provider_overflow_recovers_after_blocked_turn_start_preflight(
+    def test_blocked_turn_start_preflight_fails_closed_before_provider(
         self, agent, rows_removed
     ):
-        """The proactive retry block must not consume provider-overflow recovery."""
+        """A no-op/marginal preflight must not use the provider as a backstop."""
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
@@ -900,10 +902,10 @@ class TestPreflightCompression:
                 {"role": "assistant", "content": f"Response {i} padded text"}
             )
 
-        agent.client.chat.completions.create.side_effect = [
-            _make_413_error(),
-            _mock_response(content="Recovered after overflow", finish_reason="stop"),
-        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="provider must not receive this request",
+            finish_reason="stop",
+        )
 
         compress_calls = 0
 
@@ -942,9 +944,11 @@ class TestPreflightCompression:
                 "hello", conversation_history=big_history
             )
 
-        assert result["completed"] is True
-        assert result["final_response"] == "Recovered after overflow"
-        assert mock_compress.call_count == 2
+        agent.client.chat.completions.create.assert_not_called()
+        assert result["completed"] is False
+        assert result["hard_context_ceiling_blocked"] is True
+        assert result["compression_exhausted"] is True
+        assert mock_compress.call_count == 1
 
 
     def test_interrupt_before_first_provider_call_restores_preflight_display_seed(self, agent):
@@ -1116,8 +1120,9 @@ class TestToolResultPreflightCompression:
         ):
             result = agent.run_conversation("hello")
 
-        assert result["completed"] is True
-        assert result["final_response"] == "Done after one compression"
+        assert result["completed"] is False
+        assert result["hard_context_ceiling_blocked"] is True
+        assert agent.client.chat.completions.create.call_count == 1
         assert mock_compress.call_count == 1
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):

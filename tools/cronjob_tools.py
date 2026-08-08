@@ -87,9 +87,10 @@ def _notify_provider_jobs_changed_safe() -> None:
 #      `skills_guard.py`. The runtime cron scan only needs to catch the
 #      patterns whose phrasing does NOT survive normal English prose:
 #      classic prompt-injection directives ("ignore previous instructions",
-#      "disregard your rules"), deception directives, and invisible
-#      unicode. `_scan_cron_skill_assembled()` runs against the assembled
-#      prompt with this tighter pattern set.
+#      "disregard your rules") and invisible unicode. Raw user directives,
+#      including deception language, are scanned separately with the strict
+#      tier. `_scan_cron_skill_assembled()` runs against the assembled prompt
+#      with this tighter pattern set.
 #
 # Both scanners share the invisible-unicode check and the GitHub Authorization
 # header exemption.
@@ -115,7 +116,6 @@ _CRON_THREAT_PATTERNS = [
 # through install.
 _CRON_SKILL_ASSEMBLED_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
 ]
@@ -284,9 +284,9 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
 
     Looser pattern set — only catches unambiguous prompt-injection
     directives. Drops command-shape patterns (cat .env, rm -rf /,
-    authorized_keys, /etc/sudoers) because they false-positive on
-    legitimate skill markdown that *describes* attack commands in
-    security postmortems and runbooks.
+    authorized_keys, /etc/sudoers) and generic deception wording because
+    both false-positive on legitimate installed-skill guidance and prose.
+    The raw user-authored instruction is strict-scanned separately.
 
     Invisible unicode is SANITIZED, not blocked. Skill bodies are
     user-curated and already scanned at install time by
