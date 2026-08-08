@@ -2748,8 +2748,8 @@ def _build_job_prompt(
     from agent.skill_utils import normalize_skill_lookup_name
 
     parts = []
+    scan_parts = []
     skipped: list[str] = []
-    benign_skill_deception_phrases: list[str] = []
     from tools.cronjob_tools import (
         _CRON_SOURCE_CARD_BENIGN_DECEPTION,
         _scan_cron_skill_assembled,
@@ -2765,12 +2765,49 @@ def _build_job_prompt(
                 bundle_key,
                 user_instruction="",
                 task_id=str(job.get("id") or "") or None,
+                include_skill_segments=True,
             )
             if bundle_payload:
-                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
+                (
+                    bundle_message,
+                    _loaded_bundle_skills,
+                    _missing_bundle_skills,
+                    bundle_skill_segments,
+                ) = bundle_payload
+                bundle_scan_blocks = []
+                for bundle_skill_name, bundle_skill_block in bundle_skill_segments:
+                    bundle_benign_phrases = ()
+                    if (
+                        bundle_skill_name is not None
+                        and normalize_skill_lookup_name(bundle_skill_name)
+                        == "source-card-intake"
+                        and _CRON_SOURCE_CARD_BENIGN_DECEPTION
+                        in bundle_skill_block
+                    ):
+                        bundle_benign_phrases = (
+                            _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+                        )
+                    _, bundle_scan_error = _scan_cron_skill_assembled(
+                        bundle_skill_block,
+                        benign_deception_phrases=bundle_benign_phrases,
+                    )
+                    if bundle_scan_error:
+                        raise CronPromptInjectionBlocked(bundle_scan_error)
+                    if bundle_benign_phrases:
+                        bundle_scan_blocks.append(
+                            bundle_skill_block.replace(
+                                _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+                                "",
+                            )
+                        )
+                    else:
+                        bundle_scan_blocks.append(bundle_skill_block)
+                bundle_scan_message = "\n\n".join(bundle_scan_blocks)
                 if parts:
                     parts.append("")
+                    scan_parts.append("")
                 parts.append(bundle_message)
+                scan_parts.append(bundle_scan_message)
                 continue
             logger.warning(
                 "Cron job '%s': bundle '%s' could not load any skills, skipping",
@@ -2800,13 +2837,15 @@ def _build_job_prompt(
 
         content = str(loaded.get("content") or "").strip()
         benign_phrases = ()
+        scan_content = content
         if (
             normalize_skill_lookup_name(skill_name) == "source-card-intake"
             and _CRON_SOURCE_CARD_BENIGN_DECEPTION in content
         ):
             benign_phrases = (_CRON_SOURCE_CARD_BENIGN_DECEPTION,)
-            benign_skill_deception_phrases.append(
-                _CRON_SOURCE_CARD_BENIGN_DECEPTION
+            scan_content = content.replace(
+                _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+                "",
             )
         content, skill_scan_error = _scan_cron_skill_assembled(
             content,
@@ -2816,11 +2855,19 @@ def _build_job_prompt(
             raise CronPromptInjectionBlocked(skill_scan_error)
         if parts:
             parts.append("")
+            scan_parts.append("")
         parts.extend(
             [
                 f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
                 "",
                 content,
+            ]
+        )
+        scan_parts.extend(
+            [
+                f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+                "",
+                scan_content,
             ]
         )
 
@@ -2832,15 +2879,17 @@ def _build_job_prompt(
             f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
         )
         parts.insert(0, notice)
+        scan_parts.insert(0, notice)
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
+        scan_parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
     return _scan_assembled_cron_prompt(
         "\n".join(parts),
         job,
         has_skills=True,
         user_prompt=user_prompt,
-        benign_skill_deception_phrases=tuple(benign_skill_deception_phrases),
+        assembled_for_scan="\n".join(scan_parts),
     )
 
 
@@ -2851,7 +2900,7 @@ def _scan_assembled_cron_prompt(
     has_skills: bool = False,
     has_injected_data: bool = False,
     user_prompt: Optional[str] = None,
-    benign_skill_deception_phrases: tuple[str, ...] = (),
+    assembled_for_scan: Optional[str] = None,
 ) -> str:
     """Scan the fully-assembled cron prompt for injection patterns. Raises
     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
@@ -2887,7 +2936,11 @@ def _scan_assembled_cron_prompt(
     user-authored surface keeps the full create/update-time guarantee at
     runtime (defense-in-depth for legacy jobs that predate the scanner).
     """
-    from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
+    from tools.cronjob_tools import (
+        _scan_cron_prompt,
+        _scan_cron_skill_assembled,
+        _strip_invisible_unicode,
+    )
 
     if has_skills or has_injected_data:
         # Runtime-loaded content (vetted skill markdown and/or data from
@@ -2895,11 +2948,12 @@ def _scan_assembled_cron_prompt(
         # strings. Invisible unicode is sanitized (not blocked) so a stray
         # zero-width space can't permanently kill the job; the cleaned
         # prompt is what actually runs.
-        cleaned, scan_error = _scan_cron_skill_assembled(
-            assembled,
-            benign_deception_phrases=benign_skill_deception_phrases,
-        )
-        assembled = cleaned
+        scan_target = assembled if assembled_for_scan is None else assembled_for_scan
+        cleaned_scan_target, scan_error = _scan_cron_skill_assembled(scan_target)
+        if assembled_for_scan is None:
+            assembled = cleaned_scan_target
+        else:
+            assembled, _ = _strip_invisible_unicode(assembled)
         if not scan_error and user_prompt:
             # Keep the strict guarantee on the raw user-authored prompt. It
             # must not inherit the installed-skill/data trust tier merely

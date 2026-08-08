@@ -2810,7 +2810,11 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                _hard_ceiling_trip = None
+                _hard_ceiling_trip = (
+                    (request_pressure_tokens, _hard_ceiling_reason)
+                    if _hard_ceiling_reason == "input_too_large"
+                    else None
+                )
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal _hard_ceiling_trip
@@ -2862,42 +2866,45 @@ def run_conversation(
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
-                    _model_request_active.set()
                 _redirect_crossed_response = False
-                try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
-                finally:
+                if _hard_ceiling_trip is not None:
+                    response = _HARD_CONTEXT_CEILING_BLOCKED
+                else:
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
+                                _model_request_active.set()
+                    elif _model_request_active is not None:
+                        _model_request_active.set()
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    finally:
+                        if _redirect_lock is not None:
+                            with _redirect_lock:
+                                if _model_request_active is not None:
+                                    _model_request_active.clear()
+                                _redirect_crossed_response = bool(
+                                    agent._pending_redirect
+                                )
+                        else:
+                            if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                            _redirect_crossed_response = agent._has_pending_redirect()
                 if _hard_ceiling_trip is not None:
                     if thinking_spinner:
                         thinking_spinner.stop("")
@@ -6172,7 +6179,11 @@ def run_conversation(
             # this turn's real user ask (restore path), and the anchor must
             # land on that restored row, not on -1 / a pre-restore index.
             current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
+                messages,
+                user_message,
+                turn_identity=getattr(
+                    agent, "_persist_user_turn_identity", None
+                ),
             )
             agent._persist_user_message_idx = current_turn_user_idx
             continue

@@ -6222,7 +6222,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         and cursor state are never collateral damage of the downstream repair.
         Multimodal (list) content is left alone, mirroring the repair pass.
         """
-        from agent.turn_context import drop_stale_api_content
+        from agent.turn_context import (
+            carry_current_turn_identity,
+            drop_stale_api_content,
+        )
 
         merged: List[Dict[str, Any]] = []
         for msg in result:
@@ -6247,6 +6250,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Merged content invalidates the api_content sidecar (exact
                 # bytes previously sent for the pre-merge message).
                 drop_stale_api_content(prev)
+                carry_current_turn_identity(prev, msg)
                 continue
             merged.append(msg)
         return merged

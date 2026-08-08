@@ -34,7 +34,9 @@ def _pressured_compressor():
     return types.SimpleNamespace(
         protect_first_n=0,
         protect_last_n=0,
-        threshold_tokens=1,
+        # Keep the short current input below the hard input ceiling while the
+        # three-message transcript still opens the preflight path.
+        threshold_tokens=100,
         context_length=100_000,
         last_prompt_tokens=0,
         should_compress=lambda _tokens=None: True,

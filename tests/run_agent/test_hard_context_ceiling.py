@@ -248,10 +248,17 @@ def test_failed_terminal_explanation_persist_disables_rollover_without_user_dupl
     monkeypatch, tmp_path
 ):
     agent, _db = _make_agent(monkeypatch, tmp_path)
+    turn_identity = "hard-ceiling-e2e:current-turn"
     messages = [
-        {"role": "user", "content": "durable user", "_db_persisted": True}
+        {
+            "role": "user",
+            "content": "durable user",
+            "_db_persisted": True,
+            "_current_turn_identity": turn_identity,
+        }
     ]
     agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
 
     from agent.conversation_loop import _hard_context_ceiling_result
 
@@ -304,3 +311,147 @@ def test_single_oversized_current_input_never_calls_provider_or_rolls_session(
         row.get("role") == "user" and row.get("content") == oversized_input
         for row in db.get_messages(original_session_id)
     )
+
+
+def test_execution_middleware_cannot_shrink_oversized_input_past_terminal_guard(
+    monkeypatch, tmp_path
+):
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent.context_compressor.threshold_tokens = 1_000
+    oversized_input = "x" * 8_000
+
+    def _replace_with_short_request(request, next_call, **_kwargs):
+        shortened = dict(request)
+        shortened["messages"] = [{"role": "user", "content": "shortened"}]
+        return next_call(shortened)
+
+    with (
+        patch(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            side_effect=_replace_with_short_request,
+        ) as middleware,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(oversized_input, conversation_history=[])
+
+    middleware.assert_not_called()
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["api_calls"] == 0
+    assert result["hard_context_ceiling_blocked"] is True
+    assert result["compression_block_reason"] == "input_too_large"
+    assert result["rollover_safe"] is False
+
+
+def test_prior_durable_user_cannot_authorize_missing_current_turn(
+    monkeypatch, tmp_path
+):
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    messages = [
+        {
+            "role": "user",
+            "content": "durable prior turn",
+            "_db_persisted": True,
+            "_current_turn_identity": "prior-turn",
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = "missing-current-turn"
+
+    from agent.conversation_loop import _hard_context_ceiling_result
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
+    assert result["continuity_preserved"] is False
+    assert result["rollover_safe"] is False
+    assert result["compression_exhausted"] is False
+    assert result["agent_persisted"] is False
+    assert [m["content"] for m in messages if m.get("role") == "user"] == [
+        "durable prior turn"
+    ]
+
+
+def test_turn_identity_reanchors_rewritten_compaction_copy():
+    from agent.turn_context import (
+        CURRENT_TURN_IDENTITY_KEY,
+        reanchor_current_turn_user_idx,
+    )
+
+    turn_identity = "session:active-turn"
+    messages = [
+        {
+            "role": "user",
+            "content": "durable prior turn",
+            "_db_persisted": True,
+        },
+        {
+            "role": "user",
+            "content": "summary prefix\n\nactive ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        },
+    ]
+
+    assert reanchor_current_turn_user_idx(
+        messages,
+        "active ask",
+        turn_identity=turn_identity,
+    ) == 1
+    assert reanchor_current_turn_user_idx(
+        messages[:1],
+        "active ask",
+        turn_identity=turn_identity,
+    ) == -1
+
+
+def test_compaction_user_merge_carries_current_turn_identity():
+    from agent.context_compressor import ContextCompressor
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    turn_identity = "session:merged-active-turn"
+    merged = ContextCompressor._merge_adjacent_user_turns(
+        [
+            {"role": "user", "content": "preserved scaffold"},
+            {
+                "role": "user",
+                "content": "active ask",
+                CURRENT_TURN_IDENTITY_KEY: turn_identity,
+            },
+        ]
+    )
+
+    assert len(merged) == 1
+    assert merged[0][CURRENT_TURN_IDENTITY_KEY] == turn_identity
+
+
+def test_sequence_repair_cannot_inherit_prior_turn_durability():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    turn_identity = "session:unpersisted-active-turn"
+    messages = [
+        {
+            "role": "user",
+            "content": "durable prior turn",
+            "_db_persisted": True,
+        },
+        {
+            "role": "user",
+            "content": "unpersisted active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        },
+    ]
+
+    repair_message_sequence(SimpleNamespace(), messages)
+
+    assert len(messages) == 1
+    assert messages[0][CURRENT_TURN_IDENTITY_KEY] == turn_identity
+    assert messages[0].get("_db_persisted") is not True

@@ -185,9 +185,47 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     )
 
 
+@pytest.mark.asyncio
+async def test_missing_hard_ceiling_user_is_fallback_persisted_exactly_once(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "completed": False,
+            "final_response": "hard ceiling blocked",
+            "error": "hard_context_ceiling_blocked:compression_stalled",
+            "messages": [
+                {"role": "user", "content": "durable prior turn"},
+            ],
+            "history_offset": 1,
+            "compression_exhausted": False,
+            "continuity_preserved": False,
+            "rollover_safe": False,
+            "agent_persisted": False,
+            "last_prompt_tokens": 2_000,
+        }
+    )
+
+    await runner._handle_message_with_agent(_event(), _source(), session_key, 1)
+
+    user_calls = [
+        call
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") == "user"
+    ]
+    assert len(user_calls) == 1
+    assert user_calls[0].args[1]["content"] == "hello world"
+    assert user_calls[0].kwargs.get("skip_db") is False
+    runner.session_store.reset_session.assert_not_called()
+
+
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
-
 

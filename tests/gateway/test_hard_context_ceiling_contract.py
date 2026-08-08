@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
-import textwrap
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from gateway import run as gateway_run
+from gateway.config import Platform
+from gateway.session import SessionEntry
+from tests.gateway.test_42039_duplicate_user_message import (
+    _bootstrap,
+    _event,
+    _source,
+)
 
 
 _STRUCTURED_FIELDS = {
@@ -26,23 +33,6 @@ def test_gateway_context_ceiling_projection_preserves_every_structured_field():
     assert callable(project), "gateway needs one shared structured-result adapter"
     source = {name: f"value:{name}" for name in _STRUCTURED_FIELDS}
     assert project(source) == source
-
-
-def test_both_agent_result_return_branches_use_the_shared_projection():
-    tree = ast.parse(textwrap.dedent(inspect.getsource(gateway_run.TurnRunner.run_sync)))
-    projected_expansions = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values):
-            if key is not None:
-                continue
-            if isinstance(value, ast.Name) and value.id == "_context_ceiling_fields":
-                projected_expansions += 1
-    assert projected_expansions == 2, (
-        "the empty- and non-empty-response gateway returns must expand the "
-        "same structured hard-ceiling result projection"
-    )
 
 
 def test_rollover_requires_explicit_authoritative_continuity():
@@ -67,29 +57,79 @@ def test_rollover_requires_explicit_authoritative_continuity():
     ) is True
 
 
-def test_reset_branch_uses_the_authoritative_rollover_predicate():
-    tree = ast.parse(
-        textwrap.dedent(
-            inspect.getsource(gateway_run.GatewayRunner._handle_message_with_agent)
-        )
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollover_fields", "should_reset"),
+    [
+        ({"compression_exhausted": True}, False),
+        (
+            {
+                "compression_exhausted": True,
+                "continuity_preserved": True,
+                "rollover_safe": "true",
+            },
+            False,
+        ),
+        (
+            {
+                "compression_exhausted": True,
+                "continuity_preserved": True,
+                "rollover_safe": True,
+                "compression_deferred": True,
+            },
+            False,
+        ),
+        (
+            {
+                "compression_exhausted": True,
+                "continuity_preserved": True,
+                "rollover_safe": True,
+            },
+            True,
+        ),
+    ],
+)
+async def test_gateway_resets_and_resyncs_only_for_authoritative_rollover(
+    monkeypatch,
+    tmp_path,
+    rollover_fields,
+    should_reset,
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    session_key = "agent:main:telegram:group:-1001:12345"
+    fresh_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-after-authoritative-reset",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
     )
-    authorized_reset_blocks = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        calls = [
-            sub
-            for sub in ast.walk(node)
-            if isinstance(sub, ast.Call)
-            and isinstance(sub.func, ast.Attribute)
-            and sub.func.attr == "reset_session"
-        ]
-        if calls:
-            guard_calls = [
-                sub.func.id
-                for sub in ast.walk(node.test)
-                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-            ]
-            if "_gateway_rollover_is_authorized" in guard_calls:
-                authorized_reset_blocks.append(node)
-    assert len(authorized_reset_blocks) == 1
+    runner.session_store.reset_session.return_value = fresh_entry
+    runner._sync_telegram_topic_binding = MagicMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "completed": False,
+            "final_response": "hard ceiling blocked",
+            "error": "hard_context_ceiling_blocked:compression_stalled",
+            "messages": [{"role": "user", "content": "hello world"}],
+            "history_offset": 0,
+            "agent_persisted": True,
+            "last_prompt_tokens": 2_000,
+            **rollover_fields,
+        }
+    )
+
+    await runner._handle_message_with_agent(_event(), _source(), session_key, 1)
+
+    if should_reset:
+        runner.session_store.reset_session.assert_called_once_with(session_key)
+        runner._sync_telegram_topic_binding.assert_called_once_with(
+            _source(),
+            fresh_entry,
+            reason="compression-exhausted-reset",
+        )
+    else:
+        runner.session_store.reset_session.assert_not_called()
+        runner._sync_telegram_topic_binding.assert_not_called()

@@ -50,6 +50,28 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+CURRENT_TURN_IDENTITY_KEY = "_current_turn_identity"
+
+
+def carry_current_turn_identity(
+    target: Dict[str, Any], source: Mapping[str, Any]
+) -> None:
+    """Carry active-turn provenance without inheriting stale durability.
+
+    User-message repair and compaction can merge the active user row into an
+    earlier dict. If that target is already marked durable but the active row
+    is not, retaining the target's marker would falsely prove that the new
+    input reached the session DB. Clear it so the merged row must be flushed
+    before continuity or rollover can be authorized.
+    """
+    turn_identity = source.get(CURRENT_TURN_IDENTITY_KEY)
+    if not isinstance(turn_identity, str) or not turn_identity:
+        return
+    target[CURRENT_TURN_IDENTITY_KEY] = turn_identity
+    if source.get("_db_persisted") is not True:
+        target.pop("_db_persisted", None)
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -170,7 +192,12 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
         return False
 
 
-def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
+def reanchor_current_turn_user_idx(
+    messages: List[Any],
+    user_message: Any,
+    *,
+    turn_identity: Optional[str] = None,
+) -> int:
     """Locate this turn's user message after compaction rebuilt ``messages``.
 
     Compression replaces list entries with fresh copies (and may append a
@@ -184,9 +211,23 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     content but the trackers still need a live anchor). Compaction handoffs
     must never become the fallback anchor (#80622) — they are reference-only
     scaffolding, not the active ask. Returns -1 when the list has no
-    user-originated message at all.
+    user-originated message at all. When ``turn_identity`` is supplied it is
+    authoritative: only the row carrying that exact per-turn marker may be
+    selected, and a missing row returns ``-1`` instead of falling back to an
+    earlier durable user turn.
     """
     from agent.context_compressor import is_user_originated_turn
+
+    if turn_identity:
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and msg.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
+            ):
+                return i
+        return -1
 
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
@@ -544,6 +585,14 @@ def build_turn_context(
         user_msg = {"role": "user", "content": user_message}
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+    staged_turn_identity = user_msg.get(CURRENT_TURN_IDENTITY_KEY)
+    current_turn_identity = (
+        staged_turn_identity
+        if isinstance(staged_turn_identity, str) and staged_turn_identity
+        else f"{agent.session_id or 'session'}:{turn_id}"
+    )
+    user_msg[CURRENT_TURN_IDENTITY_KEY] = current_turn_identity
+    agent._persist_user_turn_identity = current_turn_identity
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -755,7 +804,9 @@ def build_turn_context(
                     # just-appended user message is stale — re-anchor it the
                     # same way the preflight path does below.
                     current_turn_user_idx = reanchor_current_turn_user_idx(
-                        messages, user_message
+                        messages,
+                        user_message,
+                        turn_identity=current_turn_identity,
                     )
                     agent._persist_user_message_idx = current_turn_user_idx
 
@@ -1078,7 +1129,9 @@ def build_turn_context(
         # position. Exact-content match first so a todo-snapshot user message
         # appended after the tail can't steal the anchor.
         current_turn_user_idx = reanchor_current_turn_user_idx(
-            messages, user_message
+            messages,
+            user_message,
+            turn_identity=current_turn_identity,
         )
         agent._persist_user_message_idx = current_turn_user_idx
 

@@ -13905,10 +13905,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         persist_lock = getattr(agent, "_session_persist_lock", None)
 
         def _stage_user_message() -> None:
+            from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
             agent._persist_user_message_idx = None
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
-            staged_user_message = {"role": "user", "content": message}
+            identity_session = (
+                getattr(agent, "session_id", None)
+                or getattr(self, "session_id", None)
+                or "session"
+            )
+            current_input_identity = f"{identity_session}:cli:{uuid.uuid4().hex}"
+            staged_user_message = {
+                "role": "user",
+                "content": message,
+                CURRENT_TURN_IDENTITY_KEY: current_input_identity,
+            }
+            agent._persist_user_turn_identity = current_input_identity
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 

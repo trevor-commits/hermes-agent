@@ -1950,12 +1950,18 @@ class AIAgent:
     def _current_turn_user_is_durable(self, messages: List[Dict]) -> bool:
         """Verify the exact current user row reached the canonical session DB."""
         idx = getattr(self, "_persist_user_message_idx", None)
+        turn_identity = getattr(self, "_persist_user_turn_identity", None)
         if not isinstance(idx, int) or not (0 <= idx < len(messages)):
             return False
+        if not isinstance(turn_identity, str) or not turn_identity:
+            return False
+        from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
         message = messages[idx]
         return bool(
             isinstance(message, dict)
             and message.get("role") == "user"
+            and message.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
             and message.get(_DB_PERSISTED_MARKER) is True
             and not any(
                 isinstance(later, dict) and later.get("role") == "user"
