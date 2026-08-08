@@ -1642,6 +1642,7 @@ computer-use = [
     { name = "starlette" },
 ]
 daytona = [
+    { name = "aiohttp" },
     { name = "daytona" },
 ]
 dev = [
@@ -1656,11 +1657,13 @@ dev = [
     { name = "ty" },
 ]
 dingtalk = [
+    { name = "aiohttp" },
     { name = "alibabacloud-dingtalk" },
     { name = "dingtalk-stream" },
     { name = "qrcode" },
 ]
 edge-tts = [
+    { name = "aiohttp" },
     { name = "edge-tts" },
 ]
 exa = [
@@ -1674,6 +1677,7 @@ feishu = [
     { name = "qrcode" },
 ]
 firecrawl = [
+    { name = "aiohttp" },
     { name = "firecrawl-py" },
 ]
 google = [
@@ -1685,6 +1689,7 @@ google = [
     { name = "pyasn1" },
 ]
 hindsight = [
+    { name = "aiohttp" },
     { name = "hindsight-client" },
 ]
 homeassistant = [
@@ -1706,6 +1711,7 @@ mcp = [
     { name = "starlette" },
 ]
 mem0 = [
+    { name = "h2" },
     { name = "mem0ai" },
 ]
 messaging = [
@@ -1721,6 +1727,8 @@ mistral = [
     { name = "mistralai" },
 ]
 modal = [
+    { name = "aiohttp" },
+    { name = "h2" },
     { name = "modal" },
 ]
 otlp = [
@@ -1812,9 +1820,15 @@ youtube = [
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = "==0.9.0" },
     { name = "ai-edge-litert", marker = "sys_platform == 'darwin' and extra == 'wake'", specifier = "==2.1.6" },
+    { name = "aiohttp", marker = "extra == 'daytona'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'dingtalk'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'edge-tts'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'firecrawl'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'hindsight'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'homeassistant'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'matrix'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'messaging'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'modal'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'slack'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'sms'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'teams'", specifier = "==3.14.3" },
@@ -1849,6 +1863,8 @@ requires-dist = [
     { name = "google-auth", marker = "extra == 'vertex'", specifier = "==2.55.1" },
     { name = "google-auth-httplib2", marker = "extra == 'google'", specifier = "==0.3.1" },
     { name = "google-auth-oauthlib", marker = "extra == 'google'", specifier = "==1.3.1" },
+    { name = "h2", marker = "extra == 'mem0'", specifier = "==4.4.1" },
+    { name = "h2", marker = "extra == 'modal'", specifier = "==4.4.1" },
     { name = "hermes-agent", extras = ["acp"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["acp"], marker = "extra == 'termux'" },
     { name = "hermes-agent", extras = ["cron"], marker = "extra == 'all'" },
