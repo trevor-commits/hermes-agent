@@ -294,16 +294,29 @@ def _lazy_deps_by_feature():
 # each security package -> the lazy features that bundle an SDK pulling it and
 # must therefore carry the same pin as the pyproject extra.
 _REQUIRED_SECURITY_PINS = {
-    # Every lazy messaging feature whose SDK pulls aiohttp transitively must
-    # carry the patched floor directly: discord.py (aiohttp<4), slack-bolt,
-    # mautrix/aiohttp-socks (aiohttp<4 / >=3.10), and microsoft-teams-apps —
-    # none of those upper/lower bounds excludes a vulnerable already-installed
-    # aiohttp, so the lazy path would not upgrade it without an explicit pin.
+    # Every lazy feature whose SDK pulls aiohttp transitively must carry the
+    # patched floor directly. Their broad transitive ranges still accept a
+    # vulnerable already-installed aiohttp, so the lazy update path would not
+    # upgrade it without an explicit pin.
     "aiohttp": {
+        "memory.hindsight",
         "platform.discord",
+        "platform.dingtalk",
         "platform.slack",
         "platform.matrix",
         "platform.teams",
+        "search.firecrawl",
+        "terminal.daytona",
+        "terminal.modal",
+        "tts.edge",
+    },
+    # modal/grpclib and mem0/qdrant-client[http2] both accept vulnerable h2
+    # releases, so an update of an already-installed lazy feature must carry
+    # the request-smuggling fix explicitly instead of leaving h2==4.3.0 in
+    # place as a still-satisfied transitive.
+    "h2": {
+        "memory.mem0",
+        "terminal.modal",
     },
 }
 

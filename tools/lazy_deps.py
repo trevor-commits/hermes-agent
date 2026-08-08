@@ -116,7 +116,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),
-    "search.firecrawl": ("firecrawl-py==4.17.0",),
+    "search.firecrawl": ("firecrawl-py==4.17.0", "aiohttp==3.14.3"),
     "search.parallel": ("parallel-web==0.4.2",),
 
     # ─── Monitoring ─────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
     # STT + TTS share the same SDK.
     "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
+    "tts.edge": ("edge-tts==7.2.7", "aiohttp==3.14.3"),
     "tts.elevenlabs": ("elevenlabs==1.59.0",),
 
     # ─── Speech-to-text providers ──────────────────────────────────────────
@@ -191,7 +191,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    "memory.hindsight": ("hindsight-client==0.6.1", "aiohttp==3.14.3"),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -200,7 +200,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ensure() call at the import site, the SDK never installs on a hosted
     # instance and the provider silently reports itself unavailable.
     "memory.supermemory": ("supermemory==3.50.0",),
-    "memory.mem0": ("mem0ai==2.0.10",),
+    "memory.mem0": ("mem0ai==2.0.10", "h2==4.4.1"),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
@@ -216,12 +216,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # backbone. Pin the patched floor here too so the lazy Discord path
         # can't keep an already-installed vulnerable aiohttp satisfying that
         # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 + GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.slack": (
         "slack-bolt==1.29.0",
         "slack-sdk==3.43.0",
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 + GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
@@ -231,12 +231,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
         # aiohttp transitively, so a vulnerable already-installed aiohttp still
         # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 + GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
         "alibabacloud-dingtalk==2.2.42",
         "qrcode==7.4.2",
+        "aiohttp==3.14.3",
     ),
     "platform.feishu": (
         "lark-oapi==1.6.8",
@@ -250,11 +251,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
+    "platform.teams": (
+        "microsoft-teams-apps==2.0.13.4",
+        "aiohttp==3.14.3",
+    ),  # aiohttp 3.14.3: GHSA-cq5v-8q36-5273 + GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
 
     # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
+    "terminal.modal": ("modal==1.3.4", "aiohttp==3.14.3", "h2==4.4.1"),
+    "terminal.daytona": ("daytona==0.155.0", "aiohttp==3.14.3"),
     "terminal.vercel": ("vercel==0.7.2",),
 
     # ─── Skills ────────────────────────────────────────────────────────────

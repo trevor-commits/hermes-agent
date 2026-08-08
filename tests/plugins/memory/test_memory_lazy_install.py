@@ -213,15 +213,19 @@ class TestSealedVenvDurableTarget:
             "the path honcho/hindsight use on hosted Fly instances"
         )
 
-        # Drive ensure(): missing first, satisfied after the (stubbed) install.
-        states = iter([False, True])
-        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
+        # Drive ensure(): every requirement is missing first, then every
+        # requirement is satisfied after the (stubbed) install. Features may
+        # deliberately carry multiple exact security pins.
+        installed = False
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: installed)
 
         captured = {}
 
         def fake_install(specs, **kw):
+            nonlocal installed
             captured["specs"] = specs
             captured["target_env"] = os.environ.get("HERMES_LAZY_INSTALL_TARGET")
+            installed = True
             return ld._InstallResult(True, "ok", "")
 
         monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
