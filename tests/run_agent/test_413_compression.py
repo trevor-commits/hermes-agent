@@ -947,7 +947,12 @@ class TestPreflightCompression:
         agent.client.chat.completions.create.assert_not_called()
         assert result["completed"] is False
         assert result["hard_context_ceiling_blocked"] is True
-        assert result["compression_exhausted"] is True
+        # This test deliberately replaces persistence with a no-op. A blocked
+        # provider send is real, but without a committed current-user marker
+        # it must not claim continuity or authorize gateway rollover.
+        assert result["compression_exhausted"] is False
+        assert result["continuity_preserved"] is False
+        assert result["rollover_safe"] is False
         assert mock_compress.call_count == 1
 
 

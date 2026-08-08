@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import gateway.run as gateway_run
+import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource
 
@@ -235,6 +236,78 @@ def test_empty_rate_limit_response_preserves_failure_metadata(monkeypatch):
     assert result["failure_reason"] == "rate_limit"
     assert result["completed"] is False
 
+
+class _HardCeilingAgent(_CompressionThenFailureAgent):
+    final_response = "hard ceiling blocked"
+
+    def run_conversation(
+        self, user_message, conversation_history=None, task_id=None, **_kwargs
+    ):
+        return {
+            "final_response": self.final_response,
+            "failed": True,
+            "completed": False,
+            "error": "hard_context_ceiling_blocked:compression_stalled",
+            "messages": [
+                *(conversation_history or []),
+                {"role": "user", "content": user_message},
+            ],
+            "api_calls": 0,
+            "compression_exhausted": True,
+            "compression_deferred": False,
+            "hard_context_ceiling_blocked": True,
+            "estimated_context_tokens": 2_000,
+            "hard_context_ceiling_tokens": 1_000,
+            "compression_block_reason": "compression_stalled",
+            "continuity_preserved": True,
+            "rollover_safe": True,
+            "agent_persisted": True,
+        }
+
+
+class _EmptyHardCeilingAgent(_HardCeilingAgent):
+    final_response = ""
+
+
+@pytest.mark.parametrize("agent_cls", [_HardCeilingAgent, _EmptyHardCeilingAgent])
+def test_gateway_return_branches_preserve_hard_ceiling_contract(
+    monkeypatch, agent_cls
+):
+    _install_compression_failure_agent(monkeypatch, agent_cls)
+    runner = _runner(_SessionStore())
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = _run_compression_failure_turn(runner, source)
+
+    assert {
+        field: result[field]
+        for field in (
+            "compression_exhausted",
+            "compression_deferred",
+            "hard_context_ceiling_blocked",
+            "estimated_context_tokens",
+            "hard_context_ceiling_tokens",
+            "compression_block_reason",
+            "continuity_preserved",
+            "rollover_safe",
+        )
+    } == {
+        "compression_exhausted": True,
+        "compression_deferred": False,
+        "hard_context_ceiling_blocked": True,
+        "estimated_context_tokens": 2_000,
+        "hard_context_ceiling_tokens": 1_000,
+        "compression_block_reason": "compression_stalled",
+        "continuity_preserved": True,
+        "rollover_safe": True,
+    }
+    assert result["agent_persisted"] is True
+
 class _ProviderSwitchAgent(_CompressionThenFailureAgent):
     created_providers = []
     second_turn_history = None
@@ -281,5 +354,4 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
 
