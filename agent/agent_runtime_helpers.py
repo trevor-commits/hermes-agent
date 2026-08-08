@@ -754,6 +754,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # bytes previously sent for the pre-merge message) — drop it
                 # so replay can't substitute stale bytes.
                 drop_stale_api_content(prev)
+                from agent.turn_context import carry_current_turn_identity
+
+                carry_current_turn_identity(prev, msg)
                 repairs += 1
                 continue
         merged.append(msg)

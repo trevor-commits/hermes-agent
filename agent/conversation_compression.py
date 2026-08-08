@@ -2015,6 +2015,9 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
         target["content"] = merged
     for flag in _SYNTHETIC_USER_FLAGS:
         target.pop(flag, None)
+    from agent.turn_context import carry_current_turn_identity
+
+    carry_current_turn_identity(target, anchor)
 
 
 def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
