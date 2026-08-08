@@ -2817,7 +2817,7 @@ def _build_job_prompt(
     scan_parts = []
     skipped: list[str] = []
     from tools.cronjob_tools import (
-        _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+        _CRON_SOURCE_CARD_BENIGN_DECEPTIONS,
         _scan_cron_skill_assembled,
     )
     for skill_name in skill_names:
@@ -2847,11 +2847,11 @@ def _build_job_prompt(
                         bundle_skill_name is not None
                         and normalize_skill_lookup_name(bundle_skill_name)
                         == "source-card-intake"
-                        and _CRON_SOURCE_CARD_BENIGN_DECEPTION
-                        in bundle_skill_block
                     ):
-                        bundle_benign_phrases = (
-                            _CRON_SOURCE_CARD_BENIGN_DECEPTION,
+                        bundle_benign_phrases = tuple(
+                            phrase
+                            for phrase in _CRON_SOURCE_CARD_BENIGN_DECEPTIONS
+                            if phrase in bundle_skill_block
                         )
                     _, bundle_scan_error = _scan_cron_skill_assembled(
                         bundle_skill_block,
@@ -2860,12 +2860,10 @@ def _build_job_prompt(
                     if bundle_scan_error:
                         raise CronPromptInjectionBlocked(bundle_scan_error)
                     if bundle_benign_phrases:
-                        bundle_scan_blocks.append(
-                            bundle_skill_block.replace(
-                                _CRON_SOURCE_CARD_BENIGN_DECEPTION,
-                                "",
-                            )
-                        )
+                        bundle_scan_block = bundle_skill_block
+                        for phrase in bundle_benign_phrases:
+                            bundle_scan_block = bundle_scan_block.replace(phrase, "")
+                        bundle_scan_blocks.append(bundle_scan_block)
                     else:
                         bundle_scan_blocks.append(bundle_skill_block)
                 bundle_scan_message = "\n\n".join(bundle_scan_blocks)
@@ -2904,15 +2902,14 @@ def _build_job_prompt(
         content = str(loaded.get("content") or "").strip()
         benign_phrases = ()
         scan_content = content
-        if (
-            normalize_skill_lookup_name(skill_name) == "source-card-intake"
-            and _CRON_SOURCE_CARD_BENIGN_DECEPTION in content
-        ):
-            benign_phrases = (_CRON_SOURCE_CARD_BENIGN_DECEPTION,)
-            scan_content = content.replace(
-                _CRON_SOURCE_CARD_BENIGN_DECEPTION,
-                "",
+        if normalize_skill_lookup_name(skill_name) == "source-card-intake":
+            benign_phrases = tuple(
+                phrase
+                for phrase in _CRON_SOURCE_CARD_BENIGN_DECEPTIONS
+                if phrase in content
             )
+            for phrase in benign_phrases:
+                scan_content = scan_content.replace(phrase, "")
         content, skill_scan_error = _scan_cron_skill_assembled(
             content,
             benign_deception_phrases=benign_phrases,
