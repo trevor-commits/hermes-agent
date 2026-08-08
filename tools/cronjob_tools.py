@@ -122,9 +122,15 @@ _CRON_SKILL_ASSEMBLED_PATTERNS = [
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
 ]
 
-_CRON_SOURCE_CARD_BENIGN_DECEPTION = (
-    "Do not tell the user that a private agent browser tab is open for "
-    "them; report only the source-card outcome."
+_CRON_SOURCE_CARD_BENIGN_DECEPTIONS = (
+    (
+        "Do not tell the user that a private agent browser tab is open for "
+        "them; report only the source-card outcome."
+    ),
+    (
+        "Do not tell the user that a private agent browser tab is “open for "
+        "them” or instruct them to switch to it."
+    ),
 )
 
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
