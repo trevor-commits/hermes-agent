@@ -255,11 +255,20 @@ def build_bundle_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     platform: str | None = None,
-) -> Optional[Tuple[str, List[str], List[str]]]:
+    include_skill_segments: bool = False,
+) -> Optional[
+    Tuple[str, List[str], List[str]]
+    | Tuple[str, List[str], List[str], List[Tuple[Optional[str], str]]]
+]:
     """Build the user message content for a bundle slash command invocation.
 
     Returns ``(message, loaded_skill_names, missing_skill_names)`` or
-    ``None`` if the bundle wasn't found.
+    ``None`` if the bundle wasn't found. When ``include_skill_segments`` is
+    true, a fourth item carries rendered provenance segments. Its first pair
+    is ``(None, bundle_header)`` and each remaining pair is
+    ``(canonical_skill_name, rendered_skill_block)`` so trust-boundary callers
+    can scan and reconstruct without string-wide replacement. The default
+    three-item contract remains unchanged.
 
     A bundle that references skills the user doesn't have installed still
     loads — the agent gets a note about which ones were skipped. This is
@@ -295,6 +304,7 @@ def build_bundle_invocation_message(
     missing: List[str] = []
     disabled: List[str] = []
     skill_blocks: List[str] = []
+    skill_segments: List[Tuple[str, str]] = []
     seen: set[str] = set()
 
     bundle_name = info["name"]
@@ -328,14 +338,14 @@ def build_bundle_invocation_message(
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'
         )
-        skill_blocks.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-                session_id=task_id,
-            )
+        skill_block = _build_skill_message(
+            loaded_skill,
+            skill_dir,
+            activation_note,
+            session_id=task_id,
         )
+        skill_blocks.append(skill_block)
+        skill_segments.append((skill_name, skill_block))
         loaded_names.append(skill_name)
 
     if not skill_blocks:
@@ -365,7 +375,10 @@ def build_bundle_invocation_message(
         )
 
     header = "\n".join(header_lines)
-    return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
+    result = ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
+    if include_skill_segments:
+        return (*result, [(None, header), *skill_segments])
+    return result
 
 
 # ---------------------------------------------------------------------------

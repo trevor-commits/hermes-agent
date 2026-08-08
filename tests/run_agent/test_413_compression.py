@@ -141,6 +141,9 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
         == "new message that must survive a crash"
     )
     assert isinstance(persisted_messages[-1]["timestamp"], float)
+    assert persisted_messages[-1]["_current_turn_identity"] == (
+        agent._persist_user_turn_identity
+    )
 
 
 class TestHTTP413Compression:
