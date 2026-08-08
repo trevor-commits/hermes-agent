@@ -2815,7 +2815,12 @@ def _build_job_prompt(
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    return _scan_assembled_cron_prompt(
+        "\n".join(parts),
+        job,
+        has_skills=True,
+        user_prompt=user_prompt,
+    )
 
 
 def _scan_assembled_cron_prompt(
@@ -2855,11 +2860,10 @@ def _scan_assembled_cron_prompt(
       code, the same trust class — and data feeds (e.g. a triage bot
       ingesting bug reports) legitimately quote dangerous commands.
 
-    When the looser tier is selected because of injected data only,
-    ``user_prompt`` (the raw, pre-assembly prompt) is additionally scanned
-    with the STRICT set so the user-authored surface keeps the full
-    create/update-time guarantee at runtime (defense-in-depth for legacy
-    jobs that predate the create-time scanner).
+    Whenever the looser tier is selected, ``user_prompt`` (the raw,
+    pre-assembly prompt) is additionally scanned with the STRICT set so the
+    user-authored surface keeps the full create/update-time guarantee at
+    runtime (defense-in-depth for legacy jobs that predate the scanner).
     """
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
@@ -2871,9 +2875,10 @@ def _scan_assembled_cron_prompt(
         # prompt is what actually runs.
         cleaned, scan_error = _scan_cron_skill_assembled(assembled)
         assembled = cleaned
-        if not scan_error and not has_skills and user_prompt:
-            # Data-injection path: keep the strict guarantee on the
-            # user-authored prompt itself.
+        if not scan_error and user_prompt:
+            # Keep the strict guarantee on the raw user-authored prompt. It
+            # must not inherit the installed-skill/data trust tier merely
+            # because those sources are assembled into the same string.
             scan_error = _scan_cron_prompt(user_prompt)
     else:
         scan_error = _scan_cron_prompt(assembled)

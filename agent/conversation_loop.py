@@ -69,6 +69,7 @@ from agent.model_metadata import (
     _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    estimate_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
@@ -97,6 +98,8 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_HARD_CONTEXT_CEILING_BLOCKED = object()
 
 
 def _restore_user_after_reference_handoff(
@@ -1074,6 +1077,164 @@ def _compression_deferred_result(
         "partial": True,
         "failed": False,
         "compression_deferred": True,
+        "session_id": agent.session_id,
+    }
+
+
+def _provider_request_tokens_rough(request: Any) -> int:
+    """Estimate the actual provider payload at the terminal send boundary."""
+    if not isinstance(request, dict):
+        return 0
+
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        messages = request.get("input")
+    if isinstance(messages, list):
+        total = estimate_messages_tokens_rough(messages)
+    elif isinstance(messages, str):
+        total = estimate_tokens_rough(messages)
+    else:
+        total = 0
+
+    system = request.get("instructions")
+    if system is None:
+        system = request.get("system")
+    if isinstance(system, str):
+        total += estimate_tokens_rough(system)
+    elif system:
+        total += estimate_messages_tokens_rough(
+            [{"role": "system", "content": system}]
+        )
+
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        tool_config = request.get("toolConfig")
+        tools = tool_config.get("tools") if isinstance(tool_config, dict) else None
+    if isinstance(tools, list):
+        total += _estimate_tools_tokens_rough(tools)
+    return total
+
+
+def _hard_context_ceiling_reason(
+    agent: Any,
+    *,
+    estimated_tokens: int,
+    ceiling_tokens: int,
+    compression_attempts: int,
+    max_compression_attempts: int,
+    preflight_compression_blocked: bool,
+    compression_cooldown: Any,
+    preflight_deferred: bool,
+) -> Optional[str]:
+    """Return why an over-ceiling request must fail closed, if armed."""
+    if (
+        not getattr(agent, "compression_enabled", False)
+        or ceiling_tokens <= 0
+    ):
+        return None
+    if compression_skipped_due_to_lock(agent):
+        return "compression_lock"
+    if preflight_compression_blocked:
+        return "compression_stalled"
+    if compression_attempts >= max_compression_attempts:
+        return "compression_attempts_exhausted"
+    if compression_cooldown:
+        return "compression_failure_cooldown"
+    if preflight_deferred:
+        return None
+    if estimated_tokens < ceiling_tokens:
+        return None
+
+    info = getattr(agent.context_compressor, "should_compress_info", None)
+    if callable(info):
+        try:
+            should_compress, reason = info(estimated_tokens)
+        except Exception:
+            return None
+        if not should_compress and reason:
+            return f"compression_blocked:{reason}"
+    return None
+
+
+def _hard_context_ceiling_result(
+    agent: Any,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]],
+    api_call_count: int,
+    *,
+    estimated_tokens: int,
+    ceiling_tokens: int,
+    block_reason: str,
+) -> Dict[str, Any]:
+    """Return a truthful terminal result without sacrificing saved history."""
+    continuity_preserved = False
+    try:
+        agent._persist_session(messages, conversation_history)
+        continuity_preserved = True
+    except Exception:
+        logger.exception(
+            "Hard context ceiling blocked provider send, but session persistence "
+            "could not be verified (session=%s)",
+            agent.session_id or "none",
+        )
+
+    if continuity_preserved:
+        final = (
+            f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
+            f"tokens, above the {ceiling_tokens:,}-token hard ceiling after "
+            f"compression could not continue ({block_reason}). Your history is "
+            "saved. Start a fresh session, or repair/force compression and resume "
+            "this saved session."
+        )
+    else:
+        final = (
+            f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
+            f"tokens, above the {ceiling_tokens:,}-token hard ceiling after "
+            f"compression could not continue ({block_reason}). Durable session "
+            "persistence could not be verified, so automatic rollover is disabled; "
+            "retry after session storage is healthy."
+        )
+
+    messages.append({"role": "assistant", "content": final})
+    if continuity_preserved:
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "Hard-ceiling explanation could not be appended to saved session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+    try:
+        agent._flush_status_buffer()
+    except Exception:
+        pass
+    logger.error(
+        "Provider send blocked by hard context ceiling: estimated=%d ceiling=%d "
+        "reason=%s session=%s continuity_preserved=%s",
+        estimated_tokens,
+        ceiling_tokens,
+        block_reason,
+        agent.session_id or "none",
+        continuity_preserved,
+    )
+    return {
+        "final_response": final,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": f"hard_context_ceiling_blocked:{block_reason}",
+        "partial": True,
+        "failed": True,
+        # The gateway's existing continuity-preserving rollover is safe only
+        # after this path has re-verified durable history.
+        "compression_exhausted": continuity_preserved,
+        "hard_context_ceiling_blocked": True,
+        "estimated_context_tokens": estimated_tokens,
+        "hard_context_ceiling_tokens": ceiling_tokens,
+        "compression_block_reason": block_reason,
+        "continuity_preserved": continuity_preserved,
+        "rollover_safe": continuity_preserved,
         "session_id": agent.session_id,
     }
 
@@ -2298,6 +2459,23 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
+
+        # Arm a terminal fail-closed guard only after compression is known to
+        # be unavailable for this over-ceiling request. The guard itself runs
+        # inside the execution-middleware terminal callback below, so request
+        # middleware and every main provider transport share the same last
+        # safe boundary. A noisy rough estimate explicitly deferred to recent
+        # real usage remains compatible and does not arm the guard.
+        _hard_ceiling_reason = _hard_context_ceiling_reason(
+            agent,
+            estimated_tokens=request_pressure_tokens,
+            ceiling_tokens=_preflight_threshold,
+            compression_attempts=compression_attempts,
+            max_compression_attempts=max_compression_attempts,
+            preflight_compression_blocked=_preflight_compression_blocked,
+            compression_cooldown=_compression_cooldown,
+            preflight_deferred=bool(_defer_preflight(request_pressure_tokens)),
+        )
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -2580,7 +2758,10 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                _hard_ceiling_trip = None
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _hard_ceiling_trip
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2588,6 +2769,16 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if _hard_ceiling_reason:
+                        _terminal_estimate = _provider_request_tokens_rough(
+                            next_api_kwargs
+                        )
+                        if _terminal_estimate >= _preflight_threshold:
+                            _hard_ceiling_trip = (
+                                _terminal_estimate,
+                                _hard_ceiling_reason,
+                            )
+                            return _HARD_CONTEXT_CEILING_BLOCKED
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2655,6 +2846,34 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                if _hard_ceiling_trip is not None:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    try:
+                        agent.iteration_budget.refund()
+                    except Exception:
+                        pass
+                    _terminal_estimate, _terminal_reason = _hard_ceiling_trip
+                    if _terminal_reason == "compression_lock":
+                        return _compression_deferred_result(
+                            agent,
+                            messages,
+                            api_call_count,
+                        )
+                    return _hard_context_ceiling_result(
+                        agent,
+                        messages,
+                        conversation_history,
+                        api_call_count,
+                        estimated_tokens=_terminal_estimate,
+                        ceiling_tokens=_preflight_threshold,
+                        block_reason=_terminal_reason,
+                    )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
