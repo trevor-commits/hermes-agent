@@ -215,15 +215,18 @@ class TestBuildJobPromptScansSkillContent:
     def test_vetted_skill_may_hide_private_agent_browser_implementation(self, cron_env):
         """Trusted skill guidance about an agent-private tab is not deception.
 
-        This is the exact legitimate wording used by ``source-card-intake``.
+        This is the exact legitimate wording installed in
+        ``source-card-intake`` on the live research pipeline.
         The raw job prompt remains a separately strict-scanned trust surface.
         """
         hermes_home, scheduler = cron_env
         _plant_skill(
             hermes_home,
             "source-card-intake",
-            "Do not tell the user that a private agent browser tab is open for "
-            "them; report only the source-card outcome.",
+            "Do not tell the user that a private agent browser tab is “open for "
+            "them” or instruct them to switch to it. It is not a shared "
+            "interactive surface. Offer the concrete routes: they send the assets "
+            "for the agent to upload, or they open the public URL in their own browser.",
         )
 
         job = {
