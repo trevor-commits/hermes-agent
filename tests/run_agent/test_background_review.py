@@ -125,7 +125,6 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
-<<<<<<< HEAD
 def test_background_review_registers_on_active_children_for_interrupt(monkeypatch):
     """The review fork must be added to the parent's ``_active_children`` so
     ``AIAgent.interrupt()`` (which fans out to that list) can reach it, and
