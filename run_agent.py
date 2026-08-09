@@ -1990,7 +1990,9 @@ class AIAgent:
             and message.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
             and message.get(_DB_PERSISTED_MARKER) is True
             and not any(
-                isinstance(later, dict) and later.get("role") == "user"
+                isinstance(later, dict)
+                and later.get("role") == "user"
+                and not later.get(COMPRESSED_SUMMARY_METADATA_KEY)
                 for later in messages[idx + 1 :]
             )
         )
