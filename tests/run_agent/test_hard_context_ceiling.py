@@ -495,3 +495,31 @@ def test_sequence_repair_flushes_current_turn_instead_of_restamping_history(
         and "unpersisted active ask" in str(row.get("content") or "")
         for row in db.get_messages(agent.session_id)
     )
+
+
+def test_later_compaction_summary_does_not_revoke_current_turn_durability(
+    monkeypatch, tmp_path
+):
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    turn_identity = "hard-ceiling:active-turn-before-summary"
+    messages = [
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+            "_db_persisted": True,
+        },
+        {
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] saved context",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            "_db_persisted": True,
+        },
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+
+    assert agent._current_turn_user_is_durable(messages) is True
