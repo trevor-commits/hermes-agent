@@ -763,6 +763,69 @@ def _commit_staged_replacements(staged) -> None:
                 pass
 
 
+def try_rebase_carried_branch(git_cmd, cwd, current_branch, upstream_branch) -> bool:
+    """Rebase *current_branch* onto origin/*upstream_branch* if behind.
+
+    Returns True when HEAD is already current or the rebase succeeded.
+    Returns False when rebase hit conflicts (aborted) or otherwise failed.
+    A False return MUST be treated as update failure — never "Update complete".
+    """
+    try:
+        behind = subprocess.run(
+            git_cmd + ["rev-list", f"HEAD..origin/{upstream_branch}", "--count"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        n_behind = int(behind.stdout.strip())
+        if n_behind <= 0:
+            return True
+        print(
+            f"  → Rebasing {current_branch} onto "
+            f"origin/{upstream_branch} ({n_behind} new commit"
+            f"{'s' if n_behind != 1 else ''})..."
+        )
+        rebase = subprocess.run(
+            git_cmd + ["rebase", f"origin/{upstream_branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if rebase.returncode == 0:
+            print("  ✓ Carried branch rebased onto latest upstream.")
+            return True
+        subprocess.run(
+            git_cmd + ["rebase", "--abort"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        print("  ✗ Auto-rebase had conflicts; aborted.")
+        print(f"    Resolve manually: git rebase origin/{upstream_branch}")
+        print("    The running checkout was NOT updated.")
+        return False
+    except Exception:
+        print("  ✗ Auto-rebase failed unexpectedly; running checkout unchanged.")
+        return False
+
+
+def _print_carried_rebase_failure() -> None:
+    """Tell the operator the update banner was a lie last time. Exit 1."""
+    print()
+    print("✗ Update did not apply: keeper branch is still behind upstream.")
+    print("  Hermes fast-forwarded `main`, then failed to rebase your local")
+    print("  branch on top. The app you are running did not move.")
+    print("  Do not trust an in-app 'Update complete' after this message.")
+    sys.exit(1)
+
+
 def _print_update_completion(message: str) -> None:
     """Print an update outcome plus, when the dashboard launched this run
     with an action id, a terminal receipt line the Desktop can match after
@@ -4065,6 +4128,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        carried_rebase_ok = True
 
         def _restore_original_branch():
             """Put HEAD back on the branch the user was on before the update.
@@ -4075,6 +4139,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             that actually landed commits left HEAD switched, so the next
             gateway start ran upstream code instead of the local branch.
             """
+            nonlocal carried_rebase_ok
             if current_branch not in {branch, "HEAD"}:
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
@@ -4087,46 +4152,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # install never falls behind after an update.  Only fires when
                 # we were on a non-main branch (i.e. a carried/custom branch)
                 # and there are new upstream commits to absorb.
-                _auto_rebase_if_behind(git_cmd, _m().PROJECT_ROOT, branch)
-
-        def _auto_rebase_if_behind(git_cmd, cwd, upstream_branch):
-            """Rebase the current branch onto origin/<upstream_branch> if behind."""
-            try:
-                behind = subprocess.run(
-                    git_cmd + ["rev-list", f"HEAD..origin/{upstream_branch}", "--count"],
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    check=True,
+                carried_rebase_ok = try_rebase_carried_branch(
+                    git_cmd, _m().PROJECT_ROOT, current_branch, branch
                 )
-                n_behind = int(behind.stdout.strip())
-                if n_behind > 0:
-                    print(
-                        f"  → Rebasing {current_branch} onto "
-                        f"origin/{upstream_branch} ({n_behind} new commit"
-                        f"{'s' if n_behind != 1 else ''})..."
-                    )
-                    rebase = subprocess.run(
-                        git_cmd + ["rebase", f"origin/{upstream_branch}"],
-                        cwd=cwd,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if rebase.returncode == 0:
-                        print("  ✓ Carried branch rebased onto latest upstream.")
-                    else:
-                        # Abort the rebase so we don't leave a mess
-                        subprocess.run(
-                            git_cmd + ["rebase", "--abort"],
-                            cwd=cwd, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                        )
-                        print("  ⚠ Auto-rebase had conflicts; skipped.")
-                        print(
-                            f"    Run manually: git rebase origin/{upstream_branch}"
-                        )
-            except Exception:
-                pass
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -4269,11 +4297,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
+                    if not carried_rebase_ok:
+                        _print_carried_rebase_failure()
                     _print_update_completion("✓ Update complete!")
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
+                if not carried_rebase_ok:
+                    _print_carried_rebase_failure()
                 _print_update_completion("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
@@ -4969,6 +5001,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         print()
+        if not carried_rebase_ok:
+            _print_carried_rebase_failure()
         if node_failures:
             print(
                 "⚠ Update partially complete — Node.js dependencies for "

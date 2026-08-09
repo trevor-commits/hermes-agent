@@ -817,3 +817,68 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+class TestTryRebaseCarriedBranch:
+    """Keeper-branch rebase must not report success when it aborts."""
+
+    def test_returns_true_when_not_behind(self, tmp_path):
+        from hermes_cli.update_cmd import try_rebase_carried_branch
+
+        def fake_run(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+            raise AssertionError(f"unexpected git command: {joined}")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
+            assert try_rebase_carried_branch(
+                ["git"], tmp_path, "trevor-local-20260730", "main"
+            ) is True
+
+    def test_returns_true_when_rebase_succeeds(self, tmp_path, capsys):
+        from hermes_cli.update_cmd import try_rebase_carried_branch
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(" ".join(str(c) for c in cmd))
+            joined = calls[-1]
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="12\n", stderr="")
+            if "rebase" in joined and "--abort" not in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected git command: {joined}")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
+            assert try_rebase_carried_branch(
+                ["git"], tmp_path, "trevor-local-20260730", "main"
+            ) is True
+        out = capsys.readouterr().out
+        assert "Carried branch rebased onto latest upstream" in out
+        assert any("rebase origin/main" in c for c in calls)
+
+    def test_returns_false_and_aborts_on_conflict(self, tmp_path, capsys):
+        from hermes_cli.update_cmd import try_rebase_carried_branch
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(" ".join(str(c) for c in cmd))
+            joined = calls[-1]
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="287\n", stderr="")
+            if "rebase --abort" in joined or joined.endswith("rebase --abort"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rebase" in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="conflict")
+            raise AssertionError(f"unexpected git command: {joined}")
+
+        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
+            assert try_rebase_carried_branch(
+                ["git"], tmp_path, "trevor-local-20260730", "main"
+            ) is False
+        out = capsys.readouterr().out
+        assert "Auto-rebase had conflicts" in out
+        assert "Update complete" not in out
+        assert any("rebase --abort" in c for c in calls)
