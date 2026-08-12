@@ -34,16 +34,16 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
-    conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
+    CURRENT_TURN_IDENTITY_KEY,
     _compression_warrants_another_preflight_pass,
     build_turn_context,
     compose_user_api_content,
-    reanchor_current_turn_user_idx,
+    rebind_turn_after_compression,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
@@ -109,7 +109,10 @@ _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correctio
 
 
 def _restore_user_after_reference_handoff(
-    messages: List[Dict[str, Any]], user_message: Any
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+    *,
+    turn_identity: Optional[str] = None,
 ) -> bool:
     """Re-append this turn's real user ask when compaction left only a handoff.
 
@@ -136,19 +139,29 @@ def _restore_user_after_reference_handoff(
         and messages[-1].get("content") == content
     ):
         return False
-    messages.append({"role": "user", "content": content})
+    restored = {"role": "user", "content": content}
+    if isinstance(turn_identity, str) and turn_identity:
+        restored[CURRENT_TURN_IDENTITY_KEY] = turn_identity
+    messages.append(restored)
     return True
 
 
 def _should_skip_model_call_for_reference_handoff(
-    messages: List[Dict[str, Any]], user_message: Any
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+    *,
+    turn_identity: Optional[str] = None,
 ) -> bool:
     """Guard post-compaction continues against sole-handoff active turns (#80622)."""
     from agent.context_compressor import reference_handoff_would_drive_next_model_call
 
     if not reference_handoff_would_drive_next_model_call(messages):
         return False
-    if _restore_user_after_reference_handoff(messages, user_message):
+    if _restore_user_after_reference_handoff(
+        messages,
+        user_message,
+        turn_identity=turn_identity,
+    ):
         # The restored ask is an actionable non-synthetic user row appended
         # after the handoff — by construction the handoff no longer drives.
         return False
@@ -2638,9 +2651,15 @@ def run_conversation(
                 # context and retriggering compression. Mirrors the post-response
                 # and preflight compaction sites; see
                 # conversation_history_after_compression().
-                conversation_history = conversation_history_after_compression(
-                    agent, messages, conversation_history
-                )
+                if messages is not _pre_api_input:
+                    (
+                        conversation_history,
+                        current_turn_user_idx,
+                    ) = rebind_turn_after_compression(
+                        agent,
+                        messages,
+                        conversation_history,
+                    )
                 # This preflight iteration never reaches the provider whether
                 # we skip the turn (handoff guard below) or re-run the loop —
                 # refund the consumed call/budget in BOTH cases, mirroring the
@@ -2652,8 +2671,15 @@ def run_conversation(
                 api_call_count -= 1
                 agent._api_call_count = api_call_count
                 agent.iteration_budget.refund()
+                _handoff_message_count = len(messages)
                 if _should_skip_model_call_for_reference_handoff(
-                    messages, user_message
+                    messages,
+                    user_message,
+                    turn_identity=getattr(
+                        agent,
+                        "_persist_user_turn_identity",
+                        None,
+                    ),
                 ):
                     # Reference-only handoff must not become the active turn
                     # after a completed assistant response (#80622).
@@ -2665,6 +2691,16 @@ def run_conversation(
                         final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                     _turn_exit_reason = "compaction_handoff_not_actionable"
                     break
+                if len(messages) != _handoff_message_count:
+                    (
+                        conversation_history,
+                        current_turn_user_idx,
+                    ) = rebind_turn_after_compression(
+                        agent,
+                        messages,
+                        conversation_history,
+                        rebaseline=False,
+                    )
                 continue
         elif (
             agent.compression_enabled
@@ -5194,14 +5230,21 @@ def run_conversation(
                         original_len = len(messages)
                         # Option A (LCM issue 441): overhead-aware request size so recovery arms on
                         # the true request (msgs + tools + system), not the tool-blind message count.
+                        _long_context_input = messages
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
                         )
-                        conversation_history = conversation_history_after_compression(
-                            agent, messages, conversation_history
-                        )
+                        if messages is not _long_context_input:
+                            (
+                                conversation_history,
+                                current_turn_user_idx,
+                            ) = rebind_turn_after_compression(
+                                agent,
+                                messages,
+                                conversation_history,
+                            )
                         if len(messages) < original_len or old_ctx > _reduced_ctx:
                             agent._buffer_status(
                                 COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
@@ -5472,9 +5515,15 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages, conversation_history
-                    )
+                    if messages is not _overflow_input:
+                        (
+                            conversation_history,
+                            current_turn_user_idx,
+                        ) = rebind_turn_after_compression(
+                            agent,
+                            messages,
+                            conversation_history,
+                        )
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -5613,9 +5662,15 @@ def run_conversation(
                                 return _compression_deferred_result(
                                     agent, messages, api_call_count
                                 )
-                            conversation_history = conversation_history_after_compression(
-                                agent, messages, conversation_history
-                            )
+                            if messages is not _overflow_input:
+                                (
+                                    conversation_history,
+                                    current_turn_user_idx,
+                                ) = rebind_turn_after_compression(
+                                    agent,
+                                    messages,
+                                    conversation_history,
+                                )
                             new_tokens = estimate_messages_tokens_rough(messages)
                             if len(messages) < original_len:
                                 agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
@@ -5773,9 +5828,15 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages, conversation_history
-                    )
+                    if messages is not _overflow_input:
+                        (
+                            conversation_history,
+                            current_turn_user_idx,
+                        ) = rebind_turn_after_compression(
+                            agent,
+                            messages,
+                            conversation_history,
+                        )
 
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
@@ -6443,7 +6504,13 @@ def run_conversation(
             retry_count += 1
             _retry.restart_with_compressed_messages = False
             if _should_skip_model_call_for_reference_handoff(
-                messages, user_message
+                messages,
+                user_message,
+                turn_identity=getattr(
+                    agent,
+                    "_persist_user_turn_identity",
+                    None,
+                ),
             ):
                 logger.info(
                     "Skipping compressed-restart model call: reference-only "
@@ -6462,14 +6529,15 @@ def run_conversation(
             # Ordered AFTER the handoff guard: the guard may have re-appended
             # this turn's real user ask (restore path), and the anchor must
             # land on that restored row, not on -1 / a pre-restore index.
-            current_turn_user_idx = reanchor_current_turn_user_idx(
+            (
+                conversation_history,
+                current_turn_user_idx,
+            ) = rebind_turn_after_compression(
+                agent,
                 messages,
-                user_message,
-                turn_identity=getattr(
-                    agent, "_persist_user_turn_identity", None
-                ),
+                conversation_history,
+                rebaseline=False,
             )
-            agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -7336,11 +7404,24 @@ def run_conversation(
                         # compression_exhausted (#9893/#35809).
                         compression_attempts -= 1
                     else:
-                        conversation_history = conversation_history_after_compression(
-                            agent, messages, conversation_history
-                        )
+                        if messages is not _post_tool_input:
+                            (
+                                conversation_history,
+                                current_turn_user_idx,
+                            ) = rebind_turn_after_compression(
+                                agent,
+                                messages,
+                                conversation_history,
+                            )
+                        _handoff_message_count = len(messages)
                         if _should_skip_model_call_for_reference_handoff(
-                            messages, user_message
+                            messages,
+                            user_message,
+                            turn_identity=getattr(
+                                agent,
+                                "_persist_user_turn_identity",
+                                None,
+                            ),
                         ):
                             logger.info(
                                 "Skipping post-tool compaction model call: "
@@ -7351,6 +7432,16 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
+                        if len(messages) != _handoff_message_count:
+                            (
+                                conversation_history,
+                                current_turn_user_idx,
+                            ) = rebind_turn_after_compression(
+                                agent,
+                                messages,
+                                conversation_history,
+                                rebaseline=False,
+                            )
                 elif agent.compression_enabled:
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so

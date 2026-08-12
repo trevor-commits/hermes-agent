@@ -129,6 +129,66 @@ def test_provider_is_not_called_after_compression_stalls_above_ceiling(
     )
 
 
+def test_pre_api_compression_rebinds_before_next_iteration_hard_ceiling(
+    monkeypatch, tmp_path
+):
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent.context_compressor.threshold_tokens = 1_000
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"history {index}",
+        }
+        for index in range(8)
+    ]
+
+    def _compress_to_index_six(messages, _system_message, **_kwargs):
+        active = next(
+            message
+            for message in messages
+            if message.get(CURRENT_TURN_IDENTITY_KEY)
+            == agent._persist_user_turn_identity
+        )
+        compressed = [dict(message) for message in messages[:6]]
+        compressed.append(dict(active))
+        assert agent._persist_user_message_idx == 8
+        assert len(compressed) - 1 == 6
+        agent._last_compression_attempt_recorded = True
+        agent._last_compression_attempt_in_place = True
+        return compressed, agent._cached_system_prompt
+
+    with (
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            return_value=500,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=2_000,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_compress_to_index_six),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "active ask",
+            conversation_history=history,
+        )
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["hard_context_ceiling_blocked"] is True
+    assert result["continuity_preserved"] is True
+    assert result["agent_persisted"] is True
+    assert result["rollover_safe"] is True
+    assert agent._persist_user_message_idx == 6
+    assert any(
+        row.get("role") == "user" and row.get("content") == "active ask"
+        for row in db.get_messages(agent.session_id)
+    )
+
+
 def test_execution_middleware_cannot_expand_stalled_turn_over_ceiling(
     monkeypatch, tmp_path
 ):
@@ -410,6 +470,112 @@ def test_turn_identity_reanchors_rewritten_compaction_copy():
         "active ask",
         turn_identity=turn_identity,
     ) == -1
+
+
+def test_committed_compression_rebinds_current_turn_before_hard_ceiling(
+    monkeypatch, tmp_path
+):
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import (
+        CURRENT_TURN_IDENTITY_KEY,
+        rebind_turn_after_compression,
+    )
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    turn_identity = "hard-ceiling-e2e:compressed-current-turn"
+    original_messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"original {index}",
+            "_db_persisted": True,
+        }
+        for index in range(8)
+    ]
+    original_messages.append(
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+            "_db_persisted": True,
+        }
+    )
+    assert len(original_messages) - 1 == 8
+
+    compressed_messages = [dict(message) for message in original_messages[:6]]
+    compressed_messages.append(dict(original_messages[8]))
+    assert len(compressed_messages) - 1 == 6
+
+    agent._persist_user_message_idx = 8
+    agent._persist_user_turn_identity = turn_identity
+    agent._last_compression_attempt_recorded = True
+    agent._last_compression_attempt_in_place = True
+
+    conversation_history, current_turn_user_idx = rebind_turn_after_compression(
+        agent,
+        compressed_messages,
+        original_messages,
+    )
+
+    assert current_turn_user_idx == 6
+    assert agent._persist_user_message_idx == 6
+    assert conversation_history == compressed_messages
+
+    result = _hard_context_ceiling_result(
+        agent,
+        compressed_messages,
+        conversation_history,
+        0,
+        estimated_tokens=2_000,
+        ceiling_tokens=1_000,
+        block_reason="compression_stalled",
+    )
+
+    assert result["continuity_preserved"] is True
+    assert result["agent_persisted"] is True
+    assert result["rollover_safe"] is True
+
+
+def test_compression_rebind_missing_identity_remains_fail_closed(
+    monkeypatch, tmp_path
+):
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import rebind_turn_after_compression
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    messages = [
+        {
+            "role": "user",
+            "content": "durable prior turn",
+            "_db_persisted": True,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = "missing-current-turn"
+    agent._last_compression_attempt_recorded = True
+    agent._last_compression_attempt_in_place = True
+
+    conversation_history, current_turn_user_idx = rebind_turn_after_compression(
+        agent,
+        messages,
+        list(messages),
+    )
+
+    assert current_turn_user_idx == -1
+    assert agent._persist_user_message_idx == -1
+
+    result = _hard_context_ceiling_result(
+        agent,
+        messages,
+        conversation_history,
+        0,
+        estimated_tokens=2_000,
+        ceiling_tokens=1_000,
+        block_reason="compression_stalled",
+    )
+
+    assert result["continuity_preserved"] is False
+    assert result["agent_persisted"] is False
+    assert result["rollover_safe"] is False
 
 
 def test_compaction_user_merge_carries_current_turn_identity():
