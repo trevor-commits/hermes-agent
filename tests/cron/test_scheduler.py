@@ -660,6 +660,80 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert mock_agent_cls.call_args.kwargs["tool_result_max_chars"] == 4_000
 
+    def test_explicit_provider_model_pin_disables_runtime_fallback(self, tmp_path):
+        job = {
+            "id": "hard-pinned-job",
+            "name": "hard pinned",
+            "prompt": "hello",
+            "provider": "zai",
+            "model": "glm-5.2",
+        }
+        configured_fallback = [
+            {"provider": "deepseek", "model": "deepseek-v4-pro"}
+        ]
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch(
+                    "cron.scheduler.get_fallback_chain",
+                    return_value=configured_fallback,
+                ),
+            ),
+        ) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["fallback_model"] is None
+
+    def test_explicit_provider_model_pin_does_not_auth_fallback(self, tmp_path):
+        from hermes_cli.auth import AuthError
+
+        job = {
+            "id": "hard-pinned-auth-job",
+            "name": "hard pinned auth",
+            "prompt": "hello",
+            "provider": "zai",
+            "model": "glm-5.2",
+        }
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") == "zai":
+                raise AuthError("pinned ZAI credential unavailable")
+            return {
+                "api_key": "fallback-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "deepseek",
+                "api_mode": "chat_completions",
+            }
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch(
+                    "cron.scheduler.get_fallback_chain",
+                    return_value=[
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                        }
+                    ],
+                ),
+                patch(
+                    "hermes_cli.runtime_provider.resolve_runtime_provider",
+                    side_effect=resolve_runtime,
+                ),
+            ),
+        ) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "credential" in (error or "").lower()
+        assert requested == ["zai"]
+        mock_agent_cls.assert_not_called()
+
     def test_run_job_disables_memory_even_when_per_job_enables_it(self, tmp_path):
         """Cron runs pass skip_memory=True, so memory must not be exposed.
 
