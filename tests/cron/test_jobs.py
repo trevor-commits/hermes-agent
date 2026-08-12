@@ -838,6 +838,22 @@ class TestEnabledToolsets:
         job = create_job(prompt="monitor", schedule="every 1h", enabled_toolsets=["web", "terminal"])
         assert job["enabled_toolsets"] == ["web", "terminal"]
 
+    def test_job_scoped_tool_result_cap_is_validated_and_stored(self, tmp_cron_dir):
+        job = create_job(
+            prompt="monitor",
+            schedule="every 1h",
+            tool_result_max_chars=4_000,
+        )
+        assert job["tool_result_max_chars"] == 4_000
+
+        for invalid in (True, 0, 999, 50_001, "4000"):
+            with pytest.raises(ValueError, match="tool_result_max_chars"):
+                create_job(
+                    prompt="monitor",
+                    schedule="every 1h",
+                    tool_result_max_chars=invalid,
+                )
+
 
 class TestMarkJobRunConcurrency:
     """Regression tests for concurrent parallel job state writes.

@@ -272,6 +272,41 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["prompt_preview"] == ""
         assert listing["jobs"][0]["schedule"] == "every 60m"
 
+    def test_create_and_update_job_scoped_tool_budgets(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Bounded research audit",
+                schedule="every 1h",
+                enabled_toolsets=["web", "terminal", "file", "no_mcp"],
+                tool_result_max_chars=4_000,
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["enabled_toolsets"] == [
+            "web",
+            "terminal",
+            "file",
+            "no_mcp",
+        ]
+        assert created["job"]["tool_result_max_chars"] == 4_000
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                enabled_toolsets=["terminal", "file", "no_mcp"],
+                tool_result_max_chars=3_000,
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["enabled_toolsets"] == [
+            "terminal",
+            "file",
+            "no_mcp",
+        ]
+        assert updated["job"]["tool_result_max_chars"] == 3_000
+
     def test_pause_and_resume(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]

@@ -87,9 +87,18 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        budget = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
-        return DEFAULT_BUDGET
+        budget = DEFAULT_BUDGET
+
+    job_cap = getattr(agent, "tool_result_max_chars", None)
+    if type(job_cap) is not int or job_cap <= 0:
+        return budget
+    return BudgetConfig(
+        default_result_size=min(budget.default_result_size, job_cap),
+        turn_budget=min(budget.turn_budget, job_cap * 3),
+        preview_size=min(budget.preview_size, max(1, job_cap // 2)),
+    )
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
