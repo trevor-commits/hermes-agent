@@ -133,3 +133,45 @@ async def test_gateway_resets_and_resyncs_only_for_authoritative_rollover(
     else:
         runner.session_store.reset_session.assert_not_called()
         runner._sync_telegram_topic_binding.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_hard_ceiling_result_has_no_duplicate_user_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "completed": False,
+            "final_response": "hard ceiling blocked",
+            "error": "hard_context_ceiling_blocked:compression_stalled",
+            "messages": [
+                {"role": "user", "content": "prior"},
+                {"role": "assistant", "content": "prior reply"},
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "hard ceiling blocked"},
+            ],
+            "history_offset": 2,
+            "agent_persisted": True,
+            "compression_exhausted": True,
+            "hard_context_ceiling_blocked": True,
+            "continuity_preserved": True,
+            "rollover_safe": True,
+            "compression_deferred": False,
+            "last_prompt_tokens": 2_000,
+        }
+    )
+
+    await runner._handle_message_with_agent(_event(), _source(), session_key, 1)
+
+    user_calls = [
+        call
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") == "user"
+    ]
+    assert user_calls == []
