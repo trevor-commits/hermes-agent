@@ -105,6 +105,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--toolset",
+        dest="enabled_toolsets",
+        action="append",
+        help="Restrict the job agent to this toolset. Repeat to add toolsets.",
+    )
+    cron_create.add_argument(
+        "--tool-result-max-chars",
+        type=int,
+        help="Cap each text tool result added to this job's model context.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -196,6 +207,22 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--toolset",
+        dest="enabled_toolsets",
+        action="append",
+        help="Replace the job's toolset allowlist. Repeat to add toolsets.",
+    )
+    cron_edit.add_argument(
+        "--clear-toolsets",
+        action="store_true",
+        help="Clear the job's toolset allowlist.",
+    )
+    cron_edit.add_argument(
+        "--tool-result-max-chars",
+        type=int,
+        help="Set the per-result model-context cap for this job.",
     )
 
     # lifecycle actions
