@@ -392,6 +392,8 @@ def cron_create(args):
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
+        enabled_toolsets=getattr(args, "enabled_toolsets", None),
+        tool_result_max_chars=getattr(args, "tool_result_max_chars", None),
         no_agent=getattr(args, "no_agent", False) or None,
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
@@ -453,6 +455,12 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    final_toolsets = None
+    if getattr(args, "clear_toolsets", False):
+        final_toolsets = []
+    elif getattr(args, "enabled_toolsets", None) is not None:
+        final_toolsets = list(dict.fromkeys(args.enabled_toolsets))
+
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -466,6 +474,8 @@ def cron_edit(args):
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
+        enabled_toolsets=final_toolsets,
+        tool_result_max_chars=getattr(args, "tool_result_max_chars", None),
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),

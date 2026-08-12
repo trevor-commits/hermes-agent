@@ -15,6 +15,7 @@ from cron.scheduler import (
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_tool_result_max_chars,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -117,6 +118,23 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronToolResultBudget:
+    @pytest.mark.parametrize("value", [True, False, 0, -1, 999, 50_001, "4000"])
+    def test_rejects_invalid_job_scoped_caps(self, value):
+        with pytest.raises(ValueError, match="tool_result_max_chars"):
+            _resolve_cron_tool_result_max_chars({"tool_result_max_chars": value})
+
+    @pytest.mark.parametrize("value", [1_000, 4_000, 50_000])
+    def test_accepts_bounded_integer_caps(self, value):
+        assert (
+            _resolve_cron_tool_result_max_chars({"tool_result_max_chars": value})
+            == value
+        )
+
+    def test_omitted_cap_preserves_existing_behavior(self):
+        assert _resolve_cron_tool_result_max_chars({}) is None
 
 
 class TestResolveOrigin:
@@ -627,6 +645,20 @@ class TestRunJobSessionPersistence:
         assert "memory" in (kwargs["disabled_toolsets"] or []), (
             "memory toolset should be disabled in cron to match skip_memory=True"
         )
+
+    def test_run_job_passes_job_scoped_tool_result_cap(self, tmp_path):
+        job = {
+            "id": "bounded-tool-output-job",
+            "name": "bounded tool output",
+            "prompt": "hello",
+            "tool_result_max_chars": 4_000,
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert mock_agent_cls.call_args.kwargs["tool_result_max_chars"] == 4_000
 
     def test_run_job_disables_memory_even_when_per_job_enables_it(self, tmp_path):
         """Cron runs pass skip_memory=True, so memory must not be exposed.

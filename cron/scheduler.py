@@ -454,6 +454,27 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+_CRON_TOOL_RESULT_MIN_CHARS = 1_000
+_CRON_TOOL_RESULT_MAX_CHARS = 50_000
+
+
+def _resolve_cron_tool_result_max_chars(job: dict) -> int | None:
+    """Resolve an optional per-job cap for tool results sent to the model."""
+    value = job.get("tool_result_max_chars")
+    if value is None:
+        return None
+    if (
+        type(value) is not int
+        or value < _CRON_TOOL_RESULT_MIN_CHARS
+        or value > _CRON_TOOL_RESULT_MAX_CHARS
+    ):
+        raise ValueError(
+            "cron job tool_result_max_chars must be an integer between "
+            f"{_CRON_TOOL_RESULT_MIN_CHARS} and {_CRON_TOOL_RESULT_MAX_CHARS}"
+        )
+    return value
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -5656,6 +5677,7 @@ def run_job(
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            tool_result_max_chars=_resolve_cron_tool_result_max_chars(job),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
