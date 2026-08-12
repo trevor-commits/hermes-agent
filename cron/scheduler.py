@@ -3144,6 +3144,14 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return cron_cfg.get("preflight", True) is not False
 
 
+def _job_has_explicit_inference_pin(job: dict) -> bool:
+    """Return whether a cron job owns both inference-routing axes."""
+    return bool(
+        str(job.get("provider") or "").strip()
+        and str(job.get("model") or "").strip()
+    )
+
+
 def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key?
 
@@ -3155,7 +3163,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     already guaranteed by the fallback resolution being config-local).
     """
     try:
-        if get_fallback_chain(cfg):
+        if get_fallback_chain(cfg) and not _job_has_explicit_inference_pin(job):
             return None
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
@@ -4089,6 +4097,10 @@ def run_job(
                 or primary_provider_for_drift
             )
         except AuthError as auth_exc:
+            if _job_has_explicit_inference_pin(job):
+                raise RuntimeError(
+                    format_runtime_provider_error(auth_exc)
+                ) from auth_exc
             # Primary provider auth failed — try each configured provider/model
             # pair atomically. Keeping the primary model while changing only the
             # provider can silently route a paid GPT model through OpenRouter.
@@ -4208,7 +4220,14 @@ def run_job(
                     f"(or pin the original values to keep them). See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        # An explicit provider+model pair is a hard route pin. Passing the
+        # global fallback chain into AIAgent would silently move a quota or
+        # transport failure onto another provider/model despite that pin.
+        fallback_model = (
+            None
+            if _job_has_explicit_inference_pin(job)
+            else get_fallback_chain(_cfg) or None
+        )
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
