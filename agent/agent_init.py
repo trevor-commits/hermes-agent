@@ -567,6 +567,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    tool_result_max_chars: int | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -581,6 +582,7 @@ def init_agent(
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
+        tool_result_max_chars (int): Optional per-result context cap for this agent.
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
         verbose_logging (bool): Enable verbose logging for debugging (default: False)
         quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
@@ -888,6 +890,7 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    agent.tool_result_max_chars = tool_result_max_chars
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default

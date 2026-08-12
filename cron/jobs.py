@@ -1481,6 +1481,25 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+MIN_TOOL_RESULT_MAX_CHARS = 1_000
+MAX_TOOL_RESULT_MAX_CHARS = 50_000
+
+
+def _normalize_tool_result_max_chars(value: Any) -> int | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not int
+        or value < MIN_TOOL_RESULT_MAX_CHARS
+        or value > MAX_TOOL_RESULT_MAX_CHARS
+    ):
+        raise ValueError(
+            "tool_result_max_chars must be an integer between "
+            f"{MIN_TOOL_RESULT_MAX_CHARS} and {MAX_TOOL_RESULT_MAX_CHARS}"
+        )
+    return value
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1581,6 +1600,7 @@ def create_job(
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
+    tool_result_max_chars: Optional[int] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
@@ -1617,6 +1637,9 @@ def create_job(
                           When set, only tools from these toolsets are loaded, reducing
                           token overhead. When omitted, all default tools are loaded.
                           Ignored when ``no_agent=True``.
+        tool_result_max_chars: Optional job-scoped cap for each text tool result
+                          added to model context. Oversized results use the
+                          existing persisted-output preview path.
         workdir: Optional absolute path.  When set, the job runs as if launched
                 from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
                 that directory are injected into the system prompt, and the
@@ -1672,6 +1695,9 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
+    normalized_tool_result_max_chars = _normalize_tool_result_max_chars(
+        tool_result_max_chars
+    )
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -1778,6 +1804,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_tool_result_max_chars is not None:
+        job["tool_result_max_chars"] = normalized_tool_result_max_chars
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1880,6 +1908,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "tool_result_max_chars" in updates:
+                updates["tool_result_max_chars"] = _normalize_tool_result_max_chars(
+                    updates["tool_result_max_chars"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
