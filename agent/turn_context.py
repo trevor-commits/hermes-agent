@@ -330,6 +330,47 @@ def reanchor_current_turn_user_idx(
     return fallback
 
 
+def rebind_turn_after_compression(
+    agent: Any,
+    messages: List[Any],
+    previous_history: Optional[List[Any]] = None,
+    *,
+    rebaseline: bool = True,
+) -> tuple[Optional[List[Any]], int]:
+    """Rebind current-turn persistence after a committed history mutation.
+
+    A compression commit replaces message dicts and can move the active user
+    row. Rebaseline the flush cursor only for callers that just proved a real
+    commit, then locate the exact per-turn identity and update the persistence
+    override index immediately. Missing identity is authoritative failure: do
+    not fall back to an older user row.
+
+    Reference-handoff restoration calls this with ``rebaseline=False`` because
+    the restored user row was appended after the compression commit and has not
+    reached durable storage yet.
+    """
+    conversation_history = (
+        conversation_history_after_compression(
+            agent,
+            messages,
+            previous_history,
+        )
+        if rebaseline
+        else previous_history
+    )
+    turn_identity = getattr(agent, "_persist_user_turn_identity", None)
+    if not isinstance(turn_identity, str) or not turn_identity:
+        current_turn_user_idx = -1
+    else:
+        current_turn_user_idx = reanchor_current_turn_user_idx(
+            messages,
+            None,
+            turn_identity=turn_identity,
+        )
+    agent._persist_user_message_idx = current_turn_user_idx
+    return conversation_history, current_turn_user_idx
+
+
 def compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
@@ -884,18 +925,14 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages, conversation_history
-                    )
-                    # Compaction rebuilt the list, so the index of this turn's
-                    # just-appended user message is stale — re-anchor it the
-                    # same way the preflight path does below.
-                    current_turn_user_idx = reanchor_current_turn_user_idx(
+                    (
+                        conversation_history,
+                        current_turn_user_idx,
+                    ) = rebind_turn_after_compression(
+                        agent,
                         messages,
-                        user_message,
-                        turn_identity=current_turn_identity,
+                        conversation_history,
                     )
-                    agent._persist_user_message_idx = current_turn_user_idx
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
@@ -1013,7 +1050,6 @@ def build_turn_context(
                     except Exception:
                         _compress_block_reason = None
         if _should_compress_now:
-            _preflight_compressed = True
             # Compression is actually running (block cleared / was never
             # blocked) — reset the dedup so a future blocked-over-threshold
             # turn can warn again. Real session boundary.
@@ -1075,6 +1111,16 @@ def build_turn_context(
                         agent.session_id or "none",
                     )
                     break
+                if messages is not _preflight_input:
+                    _preflight_compressed = True
+                    (
+                        conversation_history,
+                        current_turn_user_idx,
+                    ) = rebind_turn_after_compression(
+                        agent,
+                        messages,
+                        conversation_history,
+                    )
                 # Re-estimate now so size-only compression (same row count,
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
@@ -1089,9 +1135,6 @@ def build_turn_context(
                 ):
                     _preflight_compression_blocked = True
                     break  # Cannot compress further: neither rows nor tokens moved
-                conversation_history = conversation_history_after_compression(
-                    agent, messages, conversation_history
-                )
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
                 agent._last_content_with_tools = None
@@ -1198,29 +1241,19 @@ def build_turn_context(
                 # leave the turn's bookkeeping untouched.
                 if messages is not _engine_input:
                     _preflight_compressed = True
-                    conversation_history = conversation_history_after_compression(
-                        agent, messages
+                    (
+                        conversation_history,
+                        current_turn_user_idx,
+                    ) = rebind_turn_after_compression(
+                        agent,
+                        messages,
+                        conversation_history,
                     )
                     agent._empty_content_retries = 0
                     agent._thinking_prefill_retries = 0
                     agent._last_content_with_tools = None
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
-
-    if _preflight_compressed:
-        # Compression rebuilt the list (tail messages are fresh compaction
-        # copies), so the pre-compression index of this turn's user message
-        # is stale. Re-anchor both index trackers: the api_content stamp
-        # below, the loop's injection site, and the flush's persist-override
-        # row (#48677) must all target the surviving dict, not a stale
-        # position. Exact-content match first so a todo-snapshot user message
-        # appended after the tail can't steal the anchor.
-        current_turn_user_idx = reanchor_current_turn_user_idx(
-            messages,
-            user_message,
-            turn_identity=current_turn_identity,
-        )
-        agent._persist_user_message_idx = current_turn_user_idx
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""

@@ -101,6 +101,7 @@ class TestReferenceHandoffWouldDriveNextModelCall:
 
 class TestSkipGuardRestoresRealUser:
     def test_restores_pending_user_then_allows_continue(self):
+        turn_identity = "session:restored-active-turn"
         messages = [
             {
                 "role": "assistant",
@@ -110,10 +111,13 @@ class TestSkipGuardRestoresRealUser:
             _standalone_handoff(),
         ]
         assert _should_skip_model_call_for_reference_handoff(
-            messages, "new ask after compaction"
+            messages,
+            "new ask after compaction",
+            turn_identity=turn_identity,
         ) is False
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == "new ask after compaction"
+        assert messages[-1]["_current_turn_identity"] == turn_identity
 
     def test_skips_when_no_real_user_to_restore(self):
         messages = [
