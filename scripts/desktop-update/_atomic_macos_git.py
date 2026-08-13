@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
 from pathlib import Path
@@ -11,11 +10,14 @@ import stat
 import subprocess
 from typing import Any, Dict, Optional
 
+from _atomic_macos_candidate import (
+    reserve_source_candidate as _reserve_source_candidate,
+    validate_reserved_candidate as _validate_reserved_candidate,
+)
 from _atomic_macos_transaction import (
     PathLike,
     TransactionReceipt,
     _redact_sensitive_text,
-    validate_generated_leaf,
 )
 
 
@@ -228,6 +230,7 @@ def _checkout_snapshot(repository: Path, *, _run_git_command=None) -> Dict[str, 
         "st_dev": root_stat.st_dev,
         "st_ino": root_stat.st_ino,
         "st_uid": root_stat.st_uid,
+        "st_mode": stat.S_IFMT(root_stat.st_mode) | stat.S_IMODE(root_stat.st_mode),
         "head": head,
         "status": status_output,
         "status_digest": hashlib.sha256(status_output.encode("utf-8")).hexdigest(),
@@ -248,7 +251,7 @@ def _record_candidate_failure(
     message: str,
     live_before: Optional[Dict[str, Any]],
     live_after: Optional[Dict[str, Any]],
-    candidate_path: Path,
+    candidate_path: Optional[Path],
     **updates: Any,
 ) -> None:
     unchanged = live_before is not None and live_before == live_after
@@ -263,7 +266,7 @@ def _record_candidate_failure(
         failure_message=message,
         live_before=live_before,
         live_after=live_after,
-        candidate_path=str(candidate_path),
+        candidate_path=(str(candidate_path) if candidate_path is not None else None),
         **updates,
     )
 
@@ -299,7 +302,7 @@ def prepare_keeper_candidate(
     def checkout_snapshot(repository: Path) -> Dict[str, Any]:
         return _checkout_snapshot(repository, _run_git_command=runner)
 
-    candidate = receipt.transaction_dir / validate_generated_leaf("candidate")
+    candidate: Optional[Path] = None
     live_before: Optional[Dict[str, Any]] = None
     live_after: Optional[Dict[str, Any]] = None
 
@@ -318,28 +321,32 @@ def prepare_keeper_candidate(
             message="target must be an exact 40- or 64-hex commit id",
             live_before=live_before,
             live_after=live_after,
-            candidate_path=candidate,
+            candidate_path=None,
         )
         raise ValueError("target must be an exact commit id")
 
     target = target_commit.lower()
     try:
         live_before = checkout_snapshot(live)
+        candidate = _reserve_source_candidate(
+            live,
+            receipt=receipt,
+            live_before=live_before,
+        )
         receipt.record_phase(
             "candidate_clone_intent",
             live_before=live_before,
             candidate_path=str(candidate),
             target_commit=target,
         )
+        _validate_reserved_candidate(live, receipt=receipt)
         runner(["clone", "--no-local", "--", str(live), str(candidate)])
-        os.chmod(str(candidate), 0o700, follow_symlinks=False)
-        if not (candidate / ".git").is_dir():
+        _validate_reserved_candidate(live, receipt=receipt)
+        git_directory_stat = (candidate / ".git").lstat()
+        if stat.S_ISLNK(git_directory_stat.st_mode) or not stat.S_ISDIR(
+            git_directory_stat.st_mode
+        ):
             raise RuntimeError("candidate clone is not an independent Git repository")
-        if candidate.stat().st_dev != live.stat().st_dev:
-            raise OSError(
-                errno.EXDEV,
-                "candidate clone and live checkout are not on the same device",
-            )
 
         receipt.record_phase(
             "candidate_cloned",
@@ -523,13 +530,29 @@ def prepare_keeper_candidate(
                 live_after = checkout_snapshot(live)
             except (OSError, ValueError, subprocess.SubprocessError, GitCommandError):
                 live_after = None
+            failure_code = getattr(
+                error,
+                "failure_code",
+                "candidate_preparation_failed",
+            )
+            failure_phase = getattr(
+                error,
+                "failure_phase",
+                "candidate_preparation_failed",
+            )
+            failure_candidate = candidate or getattr(error, "candidate_path", None)
+            failure_updates = {}
+            candidate_artifact = getattr(error, "candidate_artifact", None)
+            if candidate_artifact is not None:
+                failure_updates["candidate_artifact"] = candidate_artifact
             _record_candidate_failure(
                 receipt,
-                phase="candidate_preparation_failed",
-                code="candidate_preparation_failed",
+                phase=failure_phase,
+                code=failure_code,
                 message=str(error),
                 live_before=live_before,
                 live_after=live_after,
-                candidate_path=candidate,
+                candidate_path=failure_candidate,
+                **failure_updates,
             )
         raise

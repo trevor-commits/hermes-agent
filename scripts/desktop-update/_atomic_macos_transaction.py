@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ctypes
 import copy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -21,6 +23,7 @@ PathLike = Union[str, os.PathLike]
 
 _RENAME_SWAP = 0x00000002
 _RECEIPT_NAME = "receipt.json"
+_TRANSACTION_LOCK_NAME = ".transaction.lock"
 _TERMINAL_STATUSES = frozenset(
     {
         "succeeded",
@@ -193,6 +196,132 @@ def _open_verified_directory(
         raise
 
 
+def _canonical_transactions_root(path: PathLike) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _receipt_lock_transaction_id(data: Dict[str, Any]) -> str:
+    lock_transaction_id = data.get("lock_transaction_id")
+    if lock_transaction_id is None:
+        recovery_of = data.get("recovery_of")
+        if isinstance(recovery_of, dict):
+            lock_transaction_id = recovery_of.get("transaction_id")
+    if lock_transaction_id is None:
+        lock_transaction_id = data.get("transaction_id")
+    if not isinstance(lock_transaction_id, str):
+        raise ValueError("transaction lock identity is invalid")
+    return validate_generated_leaf(lock_transaction_id)
+
+
+class _TransactionGuard:
+    """One held advisory lock for a root transaction and its descendants."""
+
+    def __init__(
+        self,
+        transactions_root: Path,
+        transaction_id: str,
+        descriptor: int,
+    ) -> None:
+        self.transactions_root = transactions_root
+        self.transaction_id = transaction_id
+        self.descriptor = descriptor
+        self._active = True
+
+    def require(self, transactions_root: PathLike, transaction_id: str) -> None:
+        if not self._active:
+            raise RuntimeError("transaction guard is no longer active")
+        expected_root = _canonical_transactions_root(transactions_root)
+        expected_id = validate_generated_leaf(transaction_id)
+        if (
+            expected_root != self.transactions_root
+            or expected_id != self.transaction_id
+        ):
+            raise RuntimeError("transaction guard does not match the receipt lock root")
+
+    def release(self) -> None:
+        self._active = False
+
+
+def _validate_transaction_lock(
+    descriptor: int,
+    directory_fd: int,
+) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
+        raise PermissionError("transaction lock must be an owner-owned regular file")
+    if stat.S_IMODE(opened.st_mode) != 0o600:
+        raise PermissionError("transaction lock must have mode 0600")
+    current = os.stat(
+        _TRANSACTION_LOCK_NAME,
+        dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    if _identity_tuple(current) != _identity_tuple(opened):
+        raise RuntimeError("transaction lock identity changed while opening")
+    return opened
+
+
+@contextmanager
+def _transaction_guard(
+    transactions_root: PathLike,
+    transaction_id: str,
+):
+    root = _canonical_transactions_root(transactions_root)
+    lock_transaction_id = validate_generated_leaf(transaction_id)
+    transaction_dir = root / lock_transaction_id
+    directory_fd = _open_verified_directory(transaction_dir, owner_only=True)
+    base_flags = (
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    lock_fd: Optional[int] = None
+    created = False
+    locked = False
+    guard: Optional[_TransactionGuard] = None
+    try:
+        try:
+            lock_fd = os.open(
+                _TRANSACTION_LOCK_NAME,
+                base_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            created = True
+        except FileExistsError:
+            lock_fd = os.open(
+                _TRANSACTION_LOCK_NAME,
+                base_flags,
+                dir_fd=directory_fd,
+            )
+        _validate_transaction_lock(lock_fd, directory_fd)
+        if created:
+            os.fsync(lock_fd)
+            os.fsync(directory_fd)
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                locked = True
+                break
+            except InterruptedError:
+                continue
+        _validate_transaction_lock(lock_fd, directory_fd)
+        guard = _TransactionGuard(root, lock_transaction_id, lock_fd)
+        yield guard
+    finally:
+        if guard is not None:
+            guard.release()
+        try:
+            if lock_fd is not None:
+                try:
+                    if locked:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+        finally:
+            os.close(directory_fd)
+
+
 def _atomic_json_write(directory: Path, payload: Dict[str, Any]) -> Path:
     directory_fd = _open_verified_directory(directory, owner_only=True)
     temporary_leaf = ".receipt-{}.tmp".format(uuid.uuid4().hex)
@@ -239,6 +368,21 @@ def _atomic_json_write(directory: Path, payload: Dict[str, Any]) -> Path:
     return directory / _RECEIPT_NAME
 
 
+@contextmanager
+def _receipt_write_guard(
+    receipt,
+    guard: Optional[_TransactionGuard] = None,
+):
+    transactions_root = receipt.transaction_dir.parent
+    lock_transaction_id = _receipt_lock_transaction_id(receipt.data)
+    if guard is not None:
+        guard.require(transactions_root, lock_transaction_id)
+        yield guard
+        return
+    with _transaction_guard(transactions_root, lock_transaction_id) as acquired:
+        yield acquired
+
+
 class TransactionReceipt:
     """Durable schema-v1 state for one updater transaction."""
 
@@ -261,8 +405,16 @@ class TransactionReceipt:
         self._receipt_identity = refreshed._receipt_identity
         self._receipt_digest = refreshed._receipt_digest
 
-    def _ensure_writable(self) -> None:
+    def _ensure_writable(self, guard: _TransactionGuard) -> None:
+        guard.require(
+            self.transaction_dir.parent,
+            _receipt_lock_transaction_id(self.data),
+        )
         current = load_transaction(self.transaction_dir)
+        guard.require(
+            current.transaction_dir.parent,
+            _receipt_lock_transaction_id(current.data),
+        )
         if current.is_terminal:
             raise RuntimeError("terminal transaction receipts are immutable")
         if (
@@ -275,18 +427,31 @@ class TransactionReceipt:
     def is_terminal(self) -> bool:
         return self.data.get("status") in _TERMINAL_STATUSES
 
-    def record_phase(self, phase: str, **updates: Any) -> None:
-        if self.is_terminal:
-            raise RuntimeError("terminal transaction receipts are immutable")
-        self._ensure_writable()
+    def record_phase(
+        self,
+        phase: str,
+        *,
+        _guard: Optional[_TransactionGuard] = None,
+        **updates: Any,
+    ) -> None:
         if not isinstance(phase, str) or not phase:
             raise ValueError("receipt phase must be a non-empty string")
-        self.data.update(_sanitize_receipt_value(updates))
-        self.data["phase"] = phase
-        self.data["updated_at"] = _utc_now()
-        self.data = _sanitize_receipt_value(self.data)
-        _atomic_json_write(self.transaction_dir, self.data)
-        self._refresh_metadata()
+        with _receipt_write_guard(self, _guard) as guard:
+            if self.is_terminal:
+                raise RuntimeError("terminal transaction receipts are immutable")
+            self._ensure_writable(guard)
+            proposed = dict(self.data)
+            proposed.update(_sanitize_receipt_value(updates))
+            proposed["phase"] = phase
+            proposed["updated_at"] = _utc_now()
+            proposed = _sanitize_receipt_value(proposed)
+            guard.require(
+                self.transaction_dir.parent,
+                _receipt_lock_transaction_id(proposed),
+            )
+            _atomic_json_write(self.transaction_dir, proposed)
+            self.data = proposed
+            self._refresh_metadata()
 
     def finish(
         self,
@@ -295,44 +460,55 @@ class TransactionReceipt:
         phase: str,
         failure_code: Optional[str] = None,
         failure_message: Optional[str] = None,
+        _guard: Optional[_TransactionGuard] = None,
         **updates: Any,
     ) -> None:
-        if self.is_terminal:
-            raise RuntimeError("terminal transaction receipts are immutable")
-        self._ensure_writable()
         if status not in _TERMINAL_STATUSES:
             raise ValueError(f"unknown terminal status: {status}")
         if not isinstance(phase, str) or not phase:
             raise ValueError("receipt phase must be a non-empty string")
-
-        now = _utc_now()
-        self.data.update(_sanitize_receipt_value(updates))
-        self.data.update(
-            {
-                "status": status,
-                "phase": phase,
-                "ok": status == "succeeded",
-                "failure_code": failure_code,
-                "failure_message": failure_message,
-                "updated_at": now,
-                "completed_at": now,
-            }
-        )
-        self.data = _sanitize_receipt_value(self.data)
-        _atomic_json_write(self.transaction_dir, self.data)
-        self._refresh_metadata()
+        with _receipt_write_guard(self, _guard) as guard:
+            if self.is_terminal:
+                raise RuntimeError("terminal transaction receipts are immutable")
+            self._ensure_writable(guard)
+            now = _utc_now()
+            proposed = dict(self.data)
+            proposed.update(_sanitize_receipt_value(updates))
+            proposed.update(
+                {
+                    "status": status,
+                    "phase": phase,
+                    "ok": status == "succeeded",
+                    "failure_code": failure_code,
+                    "failure_message": failure_message,
+                    "updated_at": now,
+                    "completed_at": now,
+                }
+            )
+            proposed = _sanitize_receipt_value(proposed)
+            guard.require(
+                self.transaction_dir.parent,
+                _receipt_lock_transaction_id(proposed),
+            )
+            _atomic_json_write(self.transaction_dir, proposed)
+            self.data = proposed
+            self._refresh_metadata()
 
 
 def create_transaction(
     transactions_root: PathLike,
     transaction_id: Optional[str] = None,
+    *,
+    lock_transaction_id: Optional[str] = None,
+    _guard: Optional[_TransactionGuard] = None,
 ) -> TransactionReceipt:
     """Create an owner-only transaction directory and initial receipt."""
-    root = Path(os.path.abspath(os.fspath(transactions_root)))
+    root = _canonical_transactions_root(transactions_root)
     root.mkdir(parents=True, exist_ok=True)
     leaf = validate_generated_leaf(
         transaction_id or "txn-{}".format(uuid.uuid4().hex)
     )
+    lock_leaf = validate_generated_leaf(lock_transaction_id or leaf)
     transaction_dir = root / leaf
     root_fd = _open_verified_directory(root)
     try:
@@ -345,6 +521,7 @@ def create_transaction(
     data: Dict[str, Any] = {
         "schema_version": 1,
         "transaction_id": leaf,
+        "lock_transaction_id": lock_leaf,
         "status": "in_progress",
         "phase": "created",
         "ok": False,
@@ -358,7 +535,12 @@ def create_transaction(
         "updated_at": now,
         "completed_at": None,
     }
-    _atomic_json_write(transaction_dir, data)
+    if _guard is not None:
+        _guard.require(root, lock_leaf)
+        _atomic_json_write(transaction_dir, data)
+    else:
+        with _transaction_guard(root, lock_leaf):
+            _atomic_json_write(transaction_dir, data)
     return load_transaction(transaction_dir)
 
 
@@ -638,6 +820,7 @@ def _finish_manual_recovery(
     identities: Optional[Dict[str, Any]] = None,
     exchanges: Optional[Dict[str, Any]] = None,
     finish: bool = True,
+    _guard: Optional[_TransactionGuard] = None,
 ) -> TransactionReceipt:
     updates: Dict[str, Any] = {
         "switched": bool(receipt.data.get("switched")),
@@ -654,6 +837,7 @@ def _finish_manual_recovery(
             phase=phase,
             failure_code=failure_code,
             failure_message=failure_message,
+            _guard=_guard,
             **updates,
         )
     else:
@@ -661,6 +845,7 @@ def _finish_manual_recovery(
             phase,
             failure_code=failure_code,
             failure_message=failure_message,
+            _guard=_guard,
             **updates,
         )
     return receipt
@@ -692,7 +877,7 @@ def _aggregate_exchange_state(exchanges: Dict[str, Any]) -> Dict[str, bool]:
     return {
         "switched": switched,
         "rolled_back": rolled_back,
-        "no_live_mutation": not switched,
+        "no_live_mutation": not switched and not unresolved,
     }
 
 
@@ -706,6 +891,7 @@ def _persist_exchange_failure(
     failure_message: str,
     manual_recovery_required: bool,
     finish: bool,
+    _guard: Optional[_TransactionGuard] = None,
 ) -> None:
     selected = dict(exchanges.get(resource, {}))
     selected.update(
@@ -724,6 +910,7 @@ def _persist_exchange_failure(
             failure_code=failure_code,
             failure_message=failure_message,
             exchanges=exchanges,
+            _guard=_guard,
             **aggregate,
         )
     else:
@@ -732,6 +919,7 @@ def _persist_exchange_failure(
             failure_code=failure_code,
             failure_message=failure_message,
             exchanges=exchanges,
+            _guard=_guard,
             **aggregate,
         )
 
@@ -752,6 +940,7 @@ def _persist_verified_recovery(
     failure_code: str,
     failure_message: str,
     finish: bool,
+    _guard: Optional[_TransactionGuard] = None,
 ) -> TransactionReceipt:
     aggregate = _aggregate_exchange_state(exchanges)
     phase = _recovery_phase(resource, suffix, finish)
@@ -768,10 +957,11 @@ def _persist_verified_recovery(
             phase=phase,
             failure_code=failure_code,
             failure_message=failure_message,
+            _guard=_guard,
             **updates,
         )
     else:
-        receipt.record_phase(phase, **updates)
+        receipt.record_phase(phase, _guard=_guard, **updates)
     return receipt
 
 
@@ -835,6 +1025,31 @@ def recover_exchange(
     _mapping_kind_command=None,
 ) -> TransactionReceipt:
     """Recover one exact receipt-recorded exchange without guessing."""
+    preliminary = load_transaction(transaction_dir)
+    lock_transaction_id = _receipt_lock_transaction_id(preliminary.data)
+    with _transaction_guard(
+        preliminary.transaction_dir.parent,
+        lock_transaction_id,
+    ) as guard:
+        return _recover_exchange_locked(
+            transaction_dir,
+            resource=resource,
+            finish=finish,
+            _rename_swap_command=_rename_swap_command,
+            _mapping_kind_command=_mapping_kind_command,
+            _guard=guard,
+        )
+
+
+def _recover_exchange_locked(
+    transaction_dir: PathLike,
+    *,
+    resource: str,
+    finish: bool,
+    _rename_swap_command,
+    _mapping_kind_command,
+    _guard: _TransactionGuard,
+) -> TransactionReceipt:
     rename_swap = (
         _rename_swap_at if _rename_swap_command is None else _rename_swap_command
     )
@@ -842,6 +1057,10 @@ def recover_exchange(
         _mapping_kind if _mapping_kind_command is None else _mapping_kind_command
     )
     receipt = load_transaction(transaction_dir)
+    _guard.require(
+        receipt.transaction_dir.parent,
+        _receipt_lock_transaction_id(receipt.data),
+    )
     resource = validate_generated_leaf(resource)
     recorded_root_reference = receipt.data.get("recovery_of")
     if recorded_root_reference is not None:
@@ -866,6 +1085,8 @@ def recover_exchange(
         attempt = create_transaction(
             original.transaction_dir.parent,
             "recovery-{}".format(uuid.uuid4().hex),
+            lock_transaction_id=_guard.transaction_id,
+            _guard=_guard,
         )
         attempt.record_phase(
             "recovery_attempt_created",
@@ -876,6 +1097,7 @@ def recover_exchange(
             no_live_mutation=False,
             recovery_of=recovery_of,
             recovery_parent=parent_reference,
+            _guard=_guard,
         )
         receipt = attempt
 
@@ -896,6 +1118,7 @@ def recover_exchange(
             failure_message="receipt identity map is incomplete",
             identities=identities,
             exchanges=exchanges,
+            _guard=_guard,
         )
 
     try:
@@ -923,6 +1146,7 @@ def recover_exchange(
             failure_message=str(error),
             identities=identities,
             exchanges=exchanges,
+            _guard=_guard,
         )
 
     descriptors = []
@@ -974,6 +1198,7 @@ def recover_exchange(
                 failure_message=str(error),
                 manual_recovery_required=True,
                 finish=False,
+                _guard=_guard,
             )
             return receipt
         return _finish_manual_recovery(
@@ -983,6 +1208,7 @@ def recover_exchange(
             failure_message=str(error),
             identities=identities,
             exchanges=exchanges,
+            _guard=_guard,
         )
 
     try:
@@ -1054,6 +1280,7 @@ def recover_exchange(
                 failure_code="recovered_original_mapping",
                 failure_message="original endpoint mapping already present",
                 finish=finish,
+                _guard=_guard,
             )
 
         if mapping != "transposed":
@@ -1071,6 +1298,7 @@ def recover_exchange(
                 failure_message="endpoint identities match neither known mapping",
                 identities=identities,
                 exchanges=exchanges,
+                _guard=_guard,
             )
 
         selected.update(
@@ -1089,6 +1317,7 @@ def recover_exchange(
             no_live_mutation=aggregate["no_live_mutation"],
             identities=identities,
             exchanges=exchanges,
+            _guard=_guard,
         )
         try:
             rename_swap(
@@ -1108,6 +1337,7 @@ def recover_exchange(
                     failure_message=str(error),
                     manual_recovery_required=True,
                     finish=False,
+                    _guard=_guard,
                 )
                 return receipt
             return _finish_manual_recovery(
@@ -1117,6 +1347,7 @@ def recover_exchange(
                 failure_message=str(error),
                 identities=identities,
                 exchanges=exchanges,
+                _guard=_guard,
             )
 
         left_restored = _observe_endpoint(
@@ -1164,6 +1395,7 @@ def recover_exchange(
                     failure_message="rollback did not restore the exact original mapping",
                     manual_recovery_required=True,
                     finish=False,
+                    _guard=_guard,
                 )
                 return receipt
             return _finish_manual_recovery(
@@ -1173,6 +1405,7 @@ def recover_exchange(
                 failure_message="rollback did not restore the exact original mapping",
                 identities=identities,
                 exchanges=exchanges,
+                _guard=_guard,
             )
 
         _fsync_parents(left_parent_fd, right_parent_fd)
@@ -1193,6 +1426,7 @@ def recover_exchange(
             failure_code="recovered_transposed_mapping",
             failure_message="exact transposition was exchanged once back",
             finish=finish,
+            _guard=_guard,
         )
     finally:
         for descriptor in reversed(descriptors):
@@ -1308,9 +1542,15 @@ def atomic_exchange(
                 pass
         raise
 
+    guard_context = None
+    guard_entered = False
+    transaction_guard: Optional[_TransactionGuard] = None
     try:
         if receipt is None:
             receipt = _default_receipt(left_path.parent)
+        guard_context = _receipt_write_guard(receipt)
+        transaction_guard = guard_context.__enter__()
+        guard_entered = True
 
         parent_identities = {
             "left": _stat_identity(os.fstat(left_parent_fd), path=left_path.parent),
@@ -1342,6 +1582,7 @@ def atomic_exchange(
                 "before": before_identities,
                 "after": {},
             },
+            _guard=transaction_guard,
             **aggregate,
         )
 
@@ -1389,6 +1630,7 @@ def atomic_exchange(
                         failure_code="exchange_error",
                         failure_message=str(error),
                         exchanges=exchanges,
+                        _guard=transaction_guard,
                         **aggregate,
                     )
                 else:
@@ -1397,6 +1639,7 @@ def atomic_exchange(
                         failure_code="exchange_error",
                         failure_message=str(error),
                         exchanges=exchanges,
+                        _guard=transaction_guard,
                         **aggregate,
                     )
                 raise
@@ -1415,6 +1658,7 @@ def atomic_exchange(
                     failure_code="exchange_error",
                     failure_message=str(error),
                     exchanges=exchanges,
+                    _guard=transaction_guard,
                     **aggregate,
                 )
                 try:
@@ -1442,6 +1686,7 @@ def atomic_exchange(
                         failure_message=str(rollback_error),
                         manual_recovery_required=True,
                         finish=finish_on_success,
+                        _guard=transaction_guard,
                     )
                     raise RuntimeError(
                         "atomic exchange rollback failed; manual recovery required"
@@ -1484,6 +1729,7 @@ def atomic_exchange(
                         failure_message=str(error),
                         manual_recovery_required=True,
                         finish=finish_on_success,
+                        _guard=transaction_guard,
                     )
                     raise RuntimeError("atomic exchange rollback could not be verified")
                 _fsync_parents(left_parent_fd, right_parent_fd)
@@ -1504,6 +1750,7 @@ def atomic_exchange(
                         failure_code="exchange_error",
                         failure_message=str(error),
                         exchanges=exchanges,
+                        _guard=transaction_guard,
                         **aggregate,
                     )
                 else:
@@ -1512,6 +1759,7 @@ def atomic_exchange(
                         failure_code="exchange_error",
                         failure_message=str(error),
                         exchanges=exchanges,
+                        _guard=transaction_guard,
                         **aggregate,
                     )
                 raise
@@ -1534,6 +1782,7 @@ def atomic_exchange(
                 failure_message=str(error),
                 manual_recovery_required=True,
                 finish=finish_on_success,
+                _guard=transaction_guard,
             )
             raise RuntimeError("exchange mapping is ambiguous; manual recovery required")
 
@@ -1576,6 +1825,7 @@ def atomic_exchange(
                 failure_message="endpoint identities are not an exact transposition",
                 manual_recovery_required=True,
                 finish=finish_on_success,
+                _guard=transaction_guard,
             )
             raise RuntimeError("atomic exchange did not produce an exact transposition")
 
@@ -1605,6 +1855,7 @@ def atomic_exchange(
                 no_live_mutation=False,
                 identities=identities,
                 exchanges=exchanges,
+                _guard=transaction_guard,
             )
         else:
             receipt.record_phase(
@@ -1614,6 +1865,7 @@ def atomic_exchange(
                 no_live_mutation=False,
                 identities=identities,
                 exchanges=exchanges,
+                _guard=transaction_guard,
             )
         return receipt
     finally:
@@ -1622,3 +1874,5 @@ def atomic_exchange(
                 os.close(descriptor)
             except OSError:
                 pass
+        if guard_entered and guard_context is not None:
+            guard_context.__exit__(None, None, None)

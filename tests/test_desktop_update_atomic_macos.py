@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -118,6 +119,32 @@ def checkout_fingerprint(repository):
     }
 
 
+def wait_for_paths(paths, timeout=10):
+    """Wait for bounded subprocess readiness markers."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(path.exists() for path in paths):
+            return
+        time.sleep(0.01)
+    missing = [str(path) for path in paths if not path.exists()]
+    raise AssertionError("timed out waiting for paths: {}".format(missing))
+
+
+def finish_processes(processes, timeout=15):
+    """Collect bounded subprocess results and fail with their stderr."""
+    completed = []
+    try:
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=timeout)
+            completed.append((process.returncode, stdout, stderr))
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    return completed
+
+
 class FacadePackagingTests(unittest.TestCase):
     _IMPORT_PROBE = (
         "import importlib.util, pathlib, sys; "
@@ -132,12 +159,13 @@ class FacadePackagingTests(unittest.TestCase):
         "print('facade-api-ok')"
     )
 
-    def test_packaged_facade_imports_with_both_sibling_modules(self):
+    def test_packaged_facade_imports_with_all_sibling_modules(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             runtime = Path(raw_tmp)
             for name in (
                 "atomic_macos.py",
                 "_atomic_macos_transaction.py",
+                "_atomic_macos_candidate.py",
                 "_atomic_macos_git.py",
             ):
                 shutil.copy2(MODULE_PATH.with_name(name), runtime / name)
@@ -157,6 +185,10 @@ class FacadePackagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             runtime = Path(raw_tmp)
             shutil.copy2(MODULE_PATH, runtime / "atomic_macos.py")
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_candidate.py"),
+                runtime / "_atomic_macos_candidate.py",
+            )
             shutil.copy2(
                 MODULE_PATH.with_name("_atomic_macos_git.py"),
                 runtime / "_atomic_macos_git.py",
@@ -181,6 +213,10 @@ class FacadePackagingTests(unittest.TestCase):
                 MODULE_PATH.with_name("_atomic_macos_transaction.py"),
                 runtime / "_atomic_macos_transaction.py",
             )
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_candidate.py"),
+                runtime / "_atomic_macos_candidate.py",
+            )
 
             result = subprocess.run(
                 [sys.executable, "-c", self._IMPORT_PROBE, str(runtime / "atomic_macos.py")],
@@ -192,6 +228,30 @@ class FacadePackagingTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("_atomic_macos_git.py", result.stderr)
+
+    def test_packaged_facade_fails_honestly_without_candidate_sibling(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            runtime = Path(raw_tmp)
+            shutil.copy2(MODULE_PATH, runtime / "atomic_macos.py")
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_transaction.py"),
+                runtime / "_atomic_macos_transaction.py",
+            )
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_git.py"),
+                runtime / "_atomic_macos_git.py",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", self._IMPORT_PROBE, str(runtime / "atomic_macos.py")],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("_atomic_macos_candidate.py", result.stderr)
 
 
 class TransactionReceiptTests(unittest.TestCase):
@@ -221,6 +281,7 @@ class TransactionReceiptTests(unittest.TestCase):
             self.assertEqual(receipt.transaction_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(receipt.path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(receipt.data["schema_version"], 1)
+            self.assertEqual(receipt.data["lock_transaction_id"], "txn-fixed")
             self.assertEqual(receipt.data["status"], "in_progress")
             self.assertEqual(receipt.data["phase"], "created")
             self.assertFalse(receipt.data["ok"])
@@ -233,6 +294,10 @@ class TransactionReceiptTests(unittest.TestCase):
             self.assertIsNone(receipt.data["completed_at"])
             self.assertTrue(receipt.data["created_at"].endswith("Z"))
             self.assertTrue(receipt.data["updated_at"].endswith("Z"))
+            lock_stat = (receipt.transaction_dir / ".transaction.lock").lstat()
+            self.assertTrue(stat.S_ISREG(lock_stat.st_mode))
+            self.assertEqual(lock_stat.st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(lock_stat.st_mode), 0o600)
 
             receipt.finish(
                 "succeeded",
@@ -287,6 +352,167 @@ class TransactionReceiptTests(unittest.TestCase):
                 stale.record_phase("stale-write")
 
             self.assertEqual(receipt.path.read_bytes(), terminal_bytes)
+
+    def test_receipt_cannot_rekey_its_root_transaction_lock(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(Path(raw_tmp), "txn-lock-root")
+            original_bytes = receipt.path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "guard"):
+                receipt.record_phase(
+                    "invalid-lock-rekey",
+                    lock_transaction_id="different-root",
+                )
+
+            self.assertEqual(receipt.path.read_bytes(), original_bytes)
+
+    def test_nested_guarded_process_writes_do_not_deadlock(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            receipt = atomic_macos.create_transaction(root, "txn-nested-guard")
+            worker = root / "nested-guard-worker.py"
+            worker.write_text(
+                """\
+import importlib.util
+import pathlib
+import sys
+
+module_path = pathlib.Path(sys.argv[1])
+transaction_dir = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("nested_guard_transaction", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+receipt = module.load_transaction(transaction_dir)
+with module._transaction_guard(
+    receipt.transaction_dir.parent,
+    receipt.data["lock_transaction_id"],
+) as guard:
+    receipt.record_phase("nested-one", _guard=guard)
+    receipt.record_phase("nested-two", _guard=guard)
+""",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(worker),
+                    str(MODULE_PATH.with_name("_atomic_macos_transaction.py")),
+                    str(receipt.transaction_dir),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["phase"], "nested-two")
+
+    def test_released_guard_cannot_authorize_a_receipt_write(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(Path(raw_tmp), "txn-stale-guard")
+            transaction_module = atomic_macos._transaction
+            with transaction_module._transaction_guard(
+                receipt.transaction_dir.parent,
+                receipt.data["lock_transaction_id"],
+            ) as released_guard:
+                pass
+
+            with self.assertRaisesRegex(RuntimeError, "no longer active"):
+                receipt.record_phase("stale-guard-write", _guard=released_guard)
+
+    def test_concurrent_process_cannot_overwrite_terminal_receipt(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            receipt = atomic_macos.create_transaction(root, "txn-process-race")
+            go = root / "go"
+            worker = root / "receipt-worker.py"
+            worker.write_text(
+                """\
+import importlib.util
+import pathlib
+import sys
+import time
+
+module_path = pathlib.Path(sys.argv[1])
+transaction_dir = pathlib.Path(sys.argv[2])
+role = sys.argv[3]
+ready = pathlib.Path(sys.argv[4])
+go = pathlib.Path(sys.argv[5])
+spec = importlib.util.spec_from_file_location("receipt_race_" + role, module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+receipt = module.load_transaction(transaction_dir)
+real_ensure = module.TransactionReceipt._ensure_writable
+
+def delayed_ensure(self, *args, **kwargs):
+    result = real_ensure(self, *args, **kwargs)
+    time.sleep(0.25 if role == "terminal" else 0.50)
+    return result
+
+module.TransactionReceipt._ensure_writable = delayed_ensure
+ready.write_text("ready\\n", encoding="utf-8")
+while not go.exists():
+    time.sleep(0.01)
+if role == "stale":
+    time.sleep(0.05)
+try:
+    if role == "terminal":
+        receipt.finish(
+            "succeeded",
+            phase="terminal-won",
+            switched=True,
+            rolled_back=False,
+            no_live_mutation=False,
+        )
+    else:
+        receipt.record_phase("stale-process-write", stale_writer=True)
+except RuntimeError:
+    pass
+""",
+                encoding="utf-8",
+            )
+            ready_paths = [root / "terminal.ready", root / "stale.ready"]
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(worker),
+                        str(MODULE_PATH),
+                        str(receipt.transaction_dir),
+                        role,
+                        str(ready),
+                        str(go),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for role, ready in zip(("terminal", "stale"), ready_paths)
+            ]
+            wait_for_paths(ready_paths)
+            go.write_text("go\n", encoding="utf-8")
+            completed = finish_processes(processes)
+
+            for returncode, _stdout, stderr in completed:
+                self.assertEqual(returncode, 0, stderr)
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "succeeded")
+            self.assertEqual(persisted.data["phase"], "terminal-won")
+            self.assertNotIn("stale_writer", persisted.data)
 
     def test_create_transaction_publishes_directory_relative_to_fsynced_root(self):
         atomic_macos = load_atomic_macos()
@@ -712,6 +938,40 @@ class AtomicExchangeTests(unittest.TestCase):
             self.assertFalse(persisted["switched"])
             self.assertTrue(persisted["no_live_mutation"])
 
+    def test_ambiguous_exchange_never_claims_no_live_mutation(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live = root / "live"
+            candidate = root / "candidate"
+            live.mkdir()
+            candidate.mkdir()
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-ambiguous-mutation-state",
+            )
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "forced uncertain exchange"),
+            ), mock.patch.object(
+                atomic_macos,
+                "_mapping_kind",
+                return_value="ambiguous",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "manual recovery"):
+                    atomic_macos.atomic_exchange(live, candidate, receipt=receipt)
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            self.assertEqual(persisted["status"], "manual_recovery_required")
+            self.assertEqual(
+                persisted["failure_code"],
+                "ambiguous_exchange_mapping",
+            )
+            self.assertFalse(persisted["no_live_mutation"])
+
     def test_later_resource_failure_keeps_shared_receipt_recoverable(self):
         atomic_macos = load_atomic_macos()
 
@@ -1049,6 +1309,230 @@ class ExchangeRecoveryTests(unittest.TestCase):
             self.assertFalse(recovered.data["no_live_mutation"])
             self.assertEqual(recovered.data["phase"], "recovery_verified_rollback")
 
+    def test_recovery_cannot_overtake_an_in_progress_atomic_exchange(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live, candidate = self._exchange_paths(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-initial-recovery-race",
+            )
+            initial_at_swap = root / "initial-at-swap"
+            recovery_mapped = root / "recovery-mapped"
+            initial_swapped = root / "initial-swapped"
+            initial_worker = root / "initial-exchange-worker.py"
+            initial_worker.write_text(
+                """\
+import importlib.util
+import pathlib
+import sys
+import time
+
+module_path = pathlib.Path(sys.argv[1])
+transaction_dir = pathlib.Path(sys.argv[2])
+live = pathlib.Path(sys.argv[3])
+candidate = pathlib.Path(sys.argv[4])
+initial_at_swap = pathlib.Path(sys.argv[5])
+recovery_mapped = pathlib.Path(sys.argv[6])
+initial_swapped = pathlib.Path(sys.argv[7])
+spec = importlib.util.spec_from_file_location("initial_exchange_race", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_swap = module._rename_swap_at
+
+def paused_swap(*arguments):
+    initial_at_swap.write_text("ready\\n", encoding="utf-8")
+    deadline = time.monotonic() + 1.0
+    while not recovery_mapped.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    real_swap(*arguments)
+    initial_swapped.write_text("swapped\\n", encoding="utf-8")
+
+module._rename_swap_at = paused_swap
+try:
+    result = module.atomic_exchange(
+        live,
+        candidate,
+        receipt=module.load_transaction(transaction_dir),
+    )
+    print(result.data["status"])
+except Exception as error:
+    print("error:" + type(error).__name__)
+""",
+                encoding="utf-8",
+            )
+            recovery_worker = root / "recovery-during-exchange-worker.py"
+            recovery_worker.write_text(
+                """\
+import importlib.util
+import pathlib
+import sys
+import time
+
+module_path = pathlib.Path(sys.argv[1])
+transaction_dir = pathlib.Path(sys.argv[2])
+recovery_mapped = pathlib.Path(sys.argv[3])
+initial_swapped = pathlib.Path(sys.argv[4])
+spec = importlib.util.spec_from_file_location("recovery_during_exchange", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_mapping = module._mapping_kind
+
+def coordinated_mapping(*arguments):
+    result = real_mapping(*arguments)
+    recovery_mapped.write_text("mapped\\n", encoding="utf-8")
+    deadline = time.monotonic() + 3.0
+    while not initial_swapped.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return result
+
+module._mapping_kind = coordinated_mapping
+result = module.recover_exchange(transaction_dir)
+print(result.data["status"])
+""",
+                encoding="utf-8",
+            )
+            initial = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(initial_worker),
+                    str(MODULE_PATH),
+                    str(receipt.transaction_dir),
+                    str(live),
+                    str(candidate),
+                    str(initial_at_swap),
+                    str(recovery_mapped),
+                    str(initial_swapped),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            wait_for_paths([initial_at_swap])
+            recovery = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(recovery_worker),
+                    str(MODULE_PATH),
+                    str(receipt.transaction_dir),
+                    str(recovery_mapped),
+                    str(initial_swapped),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            completed = finish_processes([initial, recovery])
+
+            for returncode, _stdout, stderr in completed:
+                self.assertEqual(returncode, 0, stderr)
+            self.assertEqual(completed[0][1].strip(), "succeeded")
+            self.assertEqual(completed[1][1].strip(), "succeeded")
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "succeeded")
+            self.assertEqual(persisted.data["phase"], "exchange_verified")
+            self.assertFalse(persisted.data["no_live_mutation"])
+            self.assertEqual((live / "version.txt").read_text(), "new")
+            self.assertEqual((candidate / "version.txt").read_text(), "old")
+
+    def test_concurrent_process_recovery_exchanges_transposed_mapping_only_once(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live, candidate = self._exchange_paths(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-process-recovery-race",
+            )
+            real_swap = atomic_macos._rename_swap_at
+
+            def swap_then_crash(*arguments):
+                real_swap(*arguments)
+                raise SystemExit("simulated crash after exchange")
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=swap_then_crash,
+            ):
+                with self.assertRaisesRegex(SystemExit, "after exchange"):
+                    atomic_macos.atomic_exchange(live, candidate, receipt=receipt)
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "forced first recovery failure"),
+            ):
+                failed = atomic_macos.recover_exchange(receipt.transaction_dir)
+
+            self.assertEqual(failed.data["status"], "manual_recovery_required")
+            self.assertEqual((live / "version.txt").read_text(), "new")
+            worker = root / "recovery-worker.py"
+            go = root / "go"
+            worker.write_text(
+                """\
+import importlib.util
+import pathlib
+import sys
+import time
+
+module_path = pathlib.Path(sys.argv[1])
+transaction_dir = pathlib.Path(sys.argv[2])
+ready = pathlib.Path(sys.argv[3])
+go = pathlib.Path(sys.argv[4])
+spec = importlib.util.spec_from_file_location("recovery_race_" + ready.name, module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_mapping = module._mapping_kind
+
+def delayed_mapping(*arguments):
+    result = real_mapping(*arguments)
+    if result == "transposed":
+        time.sleep(0.50)
+    return result
+
+module._mapping_kind = delayed_mapping
+ready.write_text("ready\\n", encoding="utf-8")
+while not go.exists():
+    time.sleep(0.01)
+recovered = module.recover_exchange(transaction_dir)
+print(recovered.data["status"])
+""",
+                encoding="utf-8",
+            )
+            ready_paths = [root / "first.ready", root / "second.ready"]
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(worker),
+                        str(MODULE_PATH),
+                        str(receipt.transaction_dir),
+                        str(ready),
+                        str(go),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for ready in ready_paths
+            ]
+            wait_for_paths(ready_paths)
+            go.write_text("go\n", encoding="utf-8")
+            completed = finish_processes(processes)
+
+            for returncode, stdout, stderr in completed:
+                self.assertEqual(returncode, 0, stderr)
+                self.assertEqual(stdout.strip(), "failed_rolled_back")
+            self.assertEqual((live / "version.txt").read_text(), "old")
+            self.assertEqual((candidate / "version.txt").read_text(), "new")
+
     def test_transient_recovery_error_can_retry_from_terminal_attempt(self):
         atomic_macos = load_atomic_macos()
 
@@ -1102,6 +1586,14 @@ class ExchangeRecoveryTests(unittest.TestCase):
             self.assertEqual(recovered_attempt.transaction_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(
                 recovered_attempt.data["recovery_of"]["transaction_id"],
+                receipt.data["transaction_id"],
+            )
+            self.assertEqual(
+                failed_attempt.data["lock_transaction_id"],
+                receipt.data["transaction_id"],
+            )
+            self.assertEqual(
+                recovered_attempt.data["lock_transaction_id"],
                 receipt.data["transaction_id"],
             )
 
@@ -1399,7 +1891,7 @@ class ExchangeRecoveryTests(unittest.TestCase):
 class KeeperPreparationTests(unittest.TestCase):
     def _make_upstream_and_live(self, root):
         upstream = root / "official-upstream"
-        live = root / "live"
+        live = root / "hermes-agent"
         run_git(None, "init", "-b", "main", str(upstream))
         run_git(upstream, "config", "user.name", "Hermes Test")
         run_git(upstream, "config", "user.email", "hermes-test@example.invalid")
@@ -1435,6 +1927,11 @@ class KeeperPreparationTests(unittest.TestCase):
             )
 
             self.assertTrue(candidate.is_dir())
+            self.assertEqual(candidate.parent, live.parent)
+            self.assertEqual(
+                len(os.fsencode(candidate.name)),
+                len(os.fsencode(live.name)),
+            )
             self.assertTrue((candidate / ".git").is_dir())
             self.assertFalse((candidate / ".git").is_file())
             self.assertEqual(
@@ -1491,6 +1988,7 @@ class KeeperPreparationTests(unittest.TestCase):
             self.assertEqual(persisted["keeper"]["original_commits"], [keeper_one, keeper_two])
             self.assertEqual(persisted["keeper"]["target_commit"], target)
             self.assertEqual(persisted["live_before"], persisted["live_after"])
+            self.assertEqual(persisted["source_candidate"]["path"], str(candidate))
 
     def test_success_receipt_redacts_credentials_from_official_upstream_url(self):
         atomic_macos = load_atomic_macos()
@@ -1833,6 +2331,8 @@ class KeeperPreparationTests(unittest.TestCase):
             )
             self.assertEqual(persisted["live_before"], persisted["live_after"])
             candidate = Path(persisted["candidate_path"])
+            self.assertEqual(candidate.parent, live.parent)
+            self.assertEqual(persisted["source_candidate"]["path"], str(candidate))
             self.assertTrue((candidate / ".git").is_dir())
             self.assertFalse((candidate / ".git" / "rebase-merge").exists())
             self.assertEqual(

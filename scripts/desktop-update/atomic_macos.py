@@ -36,6 +36,7 @@ def _load_sibling(module_name: str):
 
 
 _transaction = _load_sibling("_atomic_macos_transaction")
+_candidate = _load_sibling("_atomic_macos_candidate")
 _git = _load_sibling("_atomic_macos_git")
 
 PathLike = _transaction.PathLike
