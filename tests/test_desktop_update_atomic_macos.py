@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -117,6 +118,82 @@ def checkout_fingerprint(repository):
     }
 
 
+class FacadePackagingTests(unittest.TestCase):
+    _IMPORT_PROBE = (
+        "import importlib.util, pathlib, sys; "
+        "path = pathlib.Path(sys.argv[1]); "
+        "spec = importlib.util.spec_from_file_location('packaged_atomic_macos', path); "
+        "module = importlib.util.module_from_spec(spec); "
+        "sys.modules[spec.name] = module; "
+        "spec.loader.exec_module(module); "
+        "assert callable(module.atomic_exchange); "
+        "assert callable(module.recover_exchange); "
+        "assert callable(module.prepare_keeper_candidate); "
+        "print('facade-api-ok')"
+    )
+
+    def test_packaged_facade_imports_with_both_sibling_modules(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            runtime = Path(raw_tmp)
+            for name in (
+                "atomic_macos.py",
+                "_atomic_macos_transaction.py",
+                "_atomic_macos_git.py",
+            ):
+                shutil.copy2(MODULE_PATH.with_name(name), runtime / name)
+
+            result = subprocess.run(
+                [sys.executable, "-c", self._IMPORT_PROBE, str(runtime / "atomic_macos.py")],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "facade-api-ok")
+
+    def test_packaged_facade_fails_honestly_without_transaction_sibling(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            runtime = Path(raw_tmp)
+            shutil.copy2(MODULE_PATH, runtime / "atomic_macos.py")
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_git.py"),
+                runtime / "_atomic_macos_git.py",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", self._IMPORT_PROBE, str(runtime / "atomic_macos.py")],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("_atomic_macos_transaction.py", result.stderr)
+
+    def test_packaged_facade_fails_honestly_without_git_sibling(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            runtime = Path(raw_tmp)
+            shutil.copy2(MODULE_PATH, runtime / "atomic_macos.py")
+            shutil.copy2(
+                MODULE_PATH.with_name("_atomic_macos_transaction.py"),
+                runtime / "_atomic_macos_transaction.py",
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", self._IMPORT_PROBE, str(runtime / "atomic_macos.py")],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("_atomic_macos_git.py", result.stderr)
+
+
 class TransactionReceiptTests(unittest.TestCase):
     def test_generated_leaf_validation_rejects_unsafe_names(self):
         atomic_macos = load_atomic_macos()
@@ -191,6 +268,96 @@ class TransactionReceiptTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "terminal status"):
                 receipt.finish("almost_done", phase="invalid")
+
+    def test_stale_handle_cannot_overwrite_terminal_receipt(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(Path(raw_tmp), "txn-stale")
+            stale = atomic_macos.load_transaction(receipt.transaction_dir)
+            receipt.finish(
+                "manual_recovery_required",
+                phase="manual",
+                failure_code="forced",
+                failure_message="forced terminal state",
+            )
+            terminal_bytes = receipt.path.read_bytes()
+
+            with self.assertRaisesRegex(RuntimeError, "terminal"):
+                stale.record_phase("stale-write")
+
+            self.assertEqual(receipt.path.read_bytes(), terminal_bytes)
+
+    def test_create_transaction_publishes_directory_relative_to_fsynced_root(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            transactions_root = Path(raw_tmp) / "transactions"
+            transactions_root.mkdir()
+            root_identity = (
+                transactions_root.stat().st_dev,
+                transactions_root.stat().st_ino,
+            )
+            events = []
+            real_mkdir = atomic_macos.os.mkdir
+            real_fsync = atomic_macos.os.fsync
+            real_chmod = atomic_macos.os.chmod
+
+            def recording_mkdir(path, mode=0o777, *, dir_fd=None):
+                identity = None
+                if dir_fd is not None:
+                    opened = os.fstat(dir_fd)
+                    identity = (opened.st_dev, opened.st_ino)
+                events.append(("mkdir", os.fspath(path), dir_fd, identity))
+                return real_mkdir(path, mode, dir_fd=dir_fd)
+
+            def recording_fsync(descriptor):
+                opened = os.fstat(descriptor)
+                events.append(("fsync", (opened.st_dev, opened.st_ino)))
+                return real_fsync(descriptor)
+
+            def recording_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+                self.assertNotEqual(
+                    os.fspath(path),
+                    str(transactions_root / "txn-root-fsync"),
+                )
+                return real_chmod(
+                    path,
+                    mode,
+                    dir_fd=dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+
+            with mock.patch.object(
+                atomic_macos.os,
+                "mkdir",
+                side_effect=recording_mkdir,
+            ), mock.patch.object(
+                atomic_macos.os,
+                "fsync",
+                side_effect=recording_fsync,
+            ), mock.patch.object(
+                atomic_macos.os,
+                "chmod",
+                side_effect=recording_chmod,
+            ):
+                receipt = atomic_macos.create_transaction(
+                    transactions_root,
+                    "txn-root-fsync",
+                )
+
+            mkdir_event = next(
+                event
+                for event in events
+                if event[0] == "mkdir" and event[1] == "txn-root-fsync"
+            )
+            self.assertIsNotNone(mkdir_event[2])
+            self.assertEqual(mkdir_event[3], root_identity)
+            self.assertEqual(receipt.transaction_dir.stat().st_mode & 0o777, 0o700)
+            mkdir_index = events.index(mkdir_event)
+            root_fsync_index = events.index(("fsync", root_identity))
+            self.assertGreater(root_fsync_index, mkdir_index)
+            self.assertTrue(receipt.path.is_file())
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS renameatx_np contract")
@@ -638,12 +805,13 @@ class AtomicExchangeTests(unittest.TestCase):
             self.assertFalse(
                 persisted.data["exchanges"]["app"]["manual_recovery_required"]
             )
-            self._assert_source_can_still_recover(
+            recovered = self._assert_source_can_still_recover(
                 atomic_macos,
                 receipt,
                 source_live,
                 source_candidate,
             )
+            self.assertTrue(recovered.data["rolled_back"])
 
     def test_later_app_ambiguous_mapping_keeps_source_recoverable(self):
         atomic_macos = load_atomic_macos()
@@ -685,12 +853,13 @@ class AtomicExchangeTests(unittest.TestCase):
                 persisted.data["exchanges"]["app"]["failure_code"],
                 "ambiguous_exchange_mapping",
             )
-            self._assert_source_can_still_recover(
+            recovered = self._assert_source_can_still_recover(
                 atomic_macos,
                 receipt,
                 source_live,
                 source_candidate,
             )
+            self.assertFalse(recovered.data["rolled_back"])
 
     def test_later_app_rollback_syscall_failure_keeps_source_recoverable(self):
         atomic_macos = load_atomic_macos()
@@ -879,6 +1048,163 @@ class ExchangeRecoveryTests(unittest.TestCase):
             self.assertTrue(recovered.data["rolled_back"])
             self.assertFalse(recovered.data["no_live_mutation"])
             self.assertEqual(recovered.data["phase"], "recovery_verified_rollback")
+
+    def test_transient_recovery_error_can_retry_from_terminal_attempt(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live, candidate = self._exchange_paths(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-recovery-retry-terminal",
+            )
+            real_swap = atomic_macos._rename_swap_at
+
+            def swap_then_crash(*arguments):
+                real_swap(*arguments)
+                raise SystemExit("simulated crash after exchange")
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=swap_then_crash,
+            ):
+                with self.assertRaises(SystemExit):
+                    atomic_macos.atomic_exchange(live, candidate, receipt=receipt)
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "transient recovery failure"),
+            ):
+                failed_attempt = atomic_macos.recover_exchange(
+                    receipt.transaction_dir,
+                )
+
+            self.assertEqual(
+                failed_attempt.data["status"],
+                "manual_recovery_required",
+            )
+            original_bytes = receipt.path.read_bytes()
+            recovered_attempt = atomic_macos.recover_exchange(
+                failed_attempt.transaction_dir,
+            )
+
+            self.assertEqual((live / "version.txt").read_text(), "old")
+            self.assertEqual((candidate / "version.txt").read_text(), "new")
+            self.assertEqual(recovered_attempt.data["status"], "failed_rolled_back")
+            self.assertNotEqual(
+                recovered_attempt.transaction_dir,
+                failed_attempt.transaction_dir,
+            )
+            self.assertEqual(receipt.path.read_bytes(), original_bytes)
+            self.assertEqual(recovered_attempt.transaction_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                recovered_attempt.data["recovery_of"]["transaction_id"],
+                receipt.data["transaction_id"],
+            )
+
+    def test_recovery_attempt_rejects_changed_original_receipt_identity(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live, candidate = self._exchange_paths(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-recovery-origin-change",
+            )
+            real_swap = atomic_macos._rename_swap_at
+
+            def swap_then_crash(*arguments):
+                real_swap(*arguments)
+                raise SystemExit("simulated crash after exchange")
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=swap_then_crash,
+            ):
+                with self.assertRaises(SystemExit):
+                    atomic_macos.atomic_exchange(live, candidate, receipt=receipt)
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "transient recovery failure"),
+            ):
+                failed_attempt = atomic_macos.recover_exchange(
+                    receipt.transaction_dir,
+                )
+
+            failed_attempt_bytes = failed_attempt.path.read_bytes()
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "second transient recovery failure"),
+            ):
+                terminal_attempt = atomic_macos.recover_exchange(
+                    failed_attempt.transaction_dir,
+                )
+            terminal_attempt_bytes = terminal_attempt.path.read_bytes()
+
+            replacement = receipt.path.with_name("replacement.json")
+            replacement.mkdir()
+            (replacement / "sentinel").write_text("different identity", encoding="utf-8")
+            moved_original = receipt.path.with_name("original-receipt.json")
+            os.rename(receipt.path, moved_original)
+            os.rename(replacement, receipt.path)
+
+            with self.assertRaisesRegex((OSError, RuntimeError), "receipt"):
+                atomic_macos.recover_exchange(terminal_attempt.transaction_dir)
+
+            self.assertEqual(moved_original.read_bytes(), failed_attempt_bytes)
+            self.assertEqual(terminal_attempt.path.read_bytes(), terminal_attempt_bytes)
+            self.assertEqual((live / "version.txt").read_text(), "new")
+
+    def test_nonterminal_recovery_failure_remains_retryable_in_place(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live, candidate = self._exchange_paths(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-recovery-retry-in-place",
+            )
+            atomic_macos.atomic_exchange(
+                live,
+                candidate,
+                receipt=receipt,
+                resource="source",
+                finish_on_success=False,
+            )
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "transient recovery failure"),
+            ):
+                failed = atomic_macos.recover_exchange(
+                    receipt.transaction_dir,
+                    resource="source",
+                    finish=False,
+                )
+
+            self.assertEqual(failed.data["status"], "in_progress")
+            self.assertTrue(
+                failed.data["exchanges"]["source"]["manual_recovery_required"]
+            )
+            recovered = atomic_macos.recover_exchange(
+                receipt.transaction_dir,
+                resource="source",
+                finish=False,
+            )
+            self.assertEqual(recovered.transaction_dir, receipt.transaction_dir)
+            self.assertEqual((live / "version.txt").read_text(), "old")
+            self.assertTrue(recovered.data["exchanges"]["source"]["rolled_back"])
 
     def test_ambiguous_mapping_requires_manual_recovery_and_preserves_artifacts(self):
         atomic_macos = load_atomic_macos()
@@ -1184,6 +1510,7 @@ class KeeperPreparationTests(unittest.TestCase):
             def redirect_credential_fetch(arguments, **kwargs):
                 forwarded = list(arguments)
                 if forwarded and forwarded[0] == "fetch":
+                    self.assertIn("--no-write-fetch-head", forwarded)
                     self.assertEqual(forwarded[-2], credential_url)
                     forwarded[-2] = str(upstream)
                 return real_run_git(forwarded, **kwargs)
@@ -1207,6 +1534,157 @@ class KeeperPreparationTests(unittest.TestCase):
                 persisted["keeper"]["official_upstream"],
                 "https://updater:***@example.invalid/hermes-agent.git",
             )
+
+    def test_candidate_git_ignores_inherited_index_redirection(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            upstream, live = self._make_upstream_and_live(root)
+            target = commit_file(upstream, "target.txt", "target\n", "upstream target")
+            commit_file(live, "keeper.txt", "keeper\n", "keeper change")
+            outside_index = root / "outside" / "attacker-index"
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-git-environment",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_INDEX_FILE": str(outside_index),
+                    "GIT_DIR": str(root / "attacker-git-dir"),
+                    "GIT_WORK_TREE": str(root / "attacker-worktree"),
+                    "GIT_OBJECT_DIRECTORY": str(root / "attacker-objects"),
+                    "GIT_CONFIG_GLOBAL": str(root / "attacker-gitconfig"),
+                    "GIT_SSH_COMMAND": "false inherited-ssh-command",
+                },
+                clear=False,
+            ):
+                candidate = atomic_macos.prepare_keeper_candidate(
+                    live,
+                    upstream,
+                    target,
+                    receipt=receipt,
+                )
+
+            self.assertTrue((candidate / ".git").is_dir())
+            self.assertFalse(outside_index.exists())
+            self.assertFalse((root / "attacker-git-dir").exists())
+            self.assertFalse((root / "attacker-objects").exists())
+
+            environment = atomic_macos._git._git_environment()
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+            self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+            self.assertEqual(
+                {key for key in environment if key.startswith("GIT_")},
+                {
+                    "GIT_COMMITTER_EMAIL",
+                    "GIT_COMMITTER_NAME",
+                    "GIT_CONFIG_GLOBAL",
+                    "GIT_CONFIG_NOSYSTEM",
+                    "GIT_OPTIONAL_LOCKS",
+                    "GIT_TERMINAL_PROMPT",
+                },
+            )
+
+    def test_upstream_secret_forms_are_absent_from_failure_and_receipt(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            _upstream, live = self._make_upstream_and_live(root)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-redact-all-upstream-forms",
+            )
+            secrets = {
+                "password": "PASS_SENTINEL",
+                "oauth": "OAUTH_SENTINEL",
+                "auth": "AUTH_SENTINEL",
+                "fragment": "FRAGMENT_SENTINEL",
+                "bearer": "BEARER_SENTINEL",
+                "schemeless": "SCHEMELESS_SENTINEL",
+            }
+            official_upstream = (
+                "https://updater:{password}@example.invalid/repo.git"
+                "?oauth_token={oauth}&auth={auth}#token={fragment}"
+            ).format(**secrets)
+            target = "a" * 40
+            real_subprocess_run = atomic_macos.subprocess.run
+
+            def fail_fetch(command, **kwargs):
+                if "fetch" in command:
+                    raise subprocess.CalledProcessError(
+                        128,
+                        command,
+                        stderr=(
+                            "fatal for {} Authorization: Bearer {} mirror "
+                            "updater:{}@example.invalid:repo.git"
+                        ).format(
+                            official_upstream,
+                            secrets["bearer"],
+                            secrets["schemeless"],
+                        ),
+                    )
+                return real_subprocess_run(command, **kwargs)
+
+            with mock.patch.object(
+                atomic_macos.subprocess,
+                "run",
+                side_effect=fail_fetch,
+            ):
+                with self.assertRaises(Exception) as raised:
+                    atomic_macos.prepare_keeper_candidate(
+                        live,
+                        official_upstream,
+                        target,
+                        receipt=receipt,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            public = str(raised.exception) + json.dumps(persisted, sort_keys=True)
+            for label, secret in secrets.items():
+                with self.subTest(label=label):
+                    self.assertNotIn(secret, public)
+
+    def test_git_spawn_error_redacts_opaque_upstream_argument(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            upstream, live = self._make_upstream_and_live(root)
+            target = commit_file(upstream, "target.txt", "target\n", "upstream target")
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-redact-spawn-error",
+            )
+            sentinel = "OPAQUE_UPSTREAM_SENTINEL"
+            opaque_upstream = "mirror-alias-{}".format(sentinel)
+            real_subprocess_run = atomic_macos.subprocess.run
+
+            def fail_fetch_spawn(command, **kwargs):
+                if "fetch" in command:
+                    raise OSError("transport could not open {}".format(opaque_upstream))
+                return real_subprocess_run(command, **kwargs)
+
+            with mock.patch.object(
+                atomic_macos.subprocess,
+                "run",
+                side_effect=fail_fetch_spawn,
+            ):
+                with self.assertRaises(Exception) as raised:
+                    atomic_macos.prepare_keeper_candidate(
+                        live,
+                        opaque_upstream,
+                        target,
+                        receipt=receipt,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            self.assertNotIn(sentinel, str(raised.exception))
+            self.assertNotIn(sentinel, json.dumps(persisted, sort_keys=True))
 
     def test_fetch_failure_redacts_credentials_from_receipt_and_public_error(self):
         atomic_macos = load_atomic_macos()
