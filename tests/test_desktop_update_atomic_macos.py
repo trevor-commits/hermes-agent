@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
@@ -194,6 +195,52 @@ class TransactionReceiptTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS renameatx_np contract")
 class AtomicExchangeTests(unittest.TestCase):
+    def _source_switched_shared_transaction(self, atomic_macos, root, transaction_id):
+        source_live = root / "source-live"
+        source_candidate = root / "source-candidate"
+        app_live = root / "app-live"
+        app_candidate = root / "app-candidate"
+        for path, contents in (
+            (source_live, "source-old"),
+            (source_candidate, "source-new"),
+            (app_live, "app-old"),
+            (app_candidate, "app-new"),
+        ):
+            path.mkdir()
+            (path / "version.txt").write_text(contents, encoding="utf-8")
+        receipt = atomic_macos.create_transaction(
+            root / "transactions",
+            transaction_id,
+        )
+        atomic_macos.atomic_exchange(
+            source_live,
+            source_candidate,
+            receipt=receipt,
+            resource="source",
+            finish_on_success=False,
+        )
+        return source_live, source_candidate, app_live, app_candidate, receipt
+
+    def _assert_source_can_still_recover(
+        self,
+        atomic_macos,
+        receipt,
+        source_live,
+        source_candidate,
+    ):
+        recovered = atomic_macos.recover_exchange(
+            receipt.transaction_dir,
+            resource="source",
+            finish=False,
+        )
+        self.assertEqual((source_live / "version.txt").read_text(), "source-old")
+        self.assertEqual(
+            (source_candidate / "version.txt").read_text(),
+            "source-new",
+        )
+        self.assertTrue(recovered.data["exchanges"]["source"]["rolled_back"])
+        return recovered
+
     def test_exchange_swaps_two_directories_without_sequential_rename(self):
         atomic_macos = load_atomic_macos()
 
@@ -390,6 +437,50 @@ class AtomicExchangeTests(unittest.TestCase):
                     label="endpoint",
                 )
 
+    def test_root_owned_app_parent_and_user_owned_endpoint_validate_independently(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            endpoint = Path(raw_tmp) / "Hermes.app"
+            endpoint.mkdir()
+            observed = endpoint.lstat()
+            root_parent = altered_stat(observed, owner=0)
+            user_endpoint = altered_stat(observed, owner=os.geteuid())
+
+            atomic_macos._validated_directory_identity(
+                root_parent,
+                root_parent,
+                expected_uid=0,
+                label="/Applications parent",
+            )
+            atomic_macos._validated_endpoint_identity(
+                user_endpoint,
+                user_endpoint,
+                expected_uid=os.geteuid(),
+                label="/Applications/Hermes.app endpoint",
+            )
+
+    def test_exchange_accepts_separate_parent_and_endpoint_owner_expectations(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live = root / "live"
+            candidate = root / "candidate"
+            live.mkdir()
+            candidate.mkdir()
+            owner = os.geteuid()
+
+            atomic_macos.atomic_exchange(
+                live,
+                candidate,
+                expected_parent_uids=(owner, owner),
+                expected_endpoint_uids=(owner, owner),
+            )
+
+            self.assertTrue(live.is_dir())
+            self.assertTrue(candidate.is_dir())
+
     def test_exchange_endpoints_must_be_on_the_same_device(self):
         atomic_macos = load_atomic_macos()
 
@@ -512,6 +603,205 @@ class AtomicExchangeTests(unittest.TestCase):
             self.assertEqual((source_live / "version.txt").read_text(), "source-old")
             self.assertEqual((app_live / "version.txt").read_text(), "app-old")
             self.assertTrue(recovered.data["exchanges"]["source"]["rolled_back"])
+
+    def test_later_app_preflight_failure_keeps_source_recoverable(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            source_live, source_candidate, app_live, app_candidate, receipt = (
+                self._source_switched_shared_transaction(
+                    atomic_macos,
+                    root,
+                    "txn-app-preflight",
+                )
+            )
+            (app_candidate / "version.txt").unlink()
+            app_candidate.rmdir()
+            app_candidate.symlink_to(app_live, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                atomic_macos.atomic_exchange(
+                    app_live,
+                    app_candidate,
+                    receipt=receipt,
+                    resource="app",
+                    finish_on_success=False,
+                )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "in_progress")
+            self.assertEqual(
+                persisted.data["exchanges"]["app"]["failure_code"],
+                "exchange_precondition",
+            )
+            self.assertFalse(
+                persisted.data["exchanges"]["app"]["manual_recovery_required"]
+            )
+            self._assert_source_can_still_recover(
+                atomic_macos,
+                receipt,
+                source_live,
+                source_candidate,
+            )
+
+    def test_later_app_ambiguous_mapping_keeps_source_recoverable(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            source_live, source_candidate, app_live, app_candidate, receipt = (
+                self._source_switched_shared_transaction(
+                    atomic_macos,
+                    root,
+                    "txn-app-ambiguous",
+                )
+            )
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=OSError(errno.EIO, "forced app uncertainty"),
+            ), mock.patch.object(
+                atomic_macos,
+                "_mapping_kind",
+                return_value="ambiguous",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "manual recovery"):
+                    atomic_macos.atomic_exchange(
+                        app_live,
+                        app_candidate,
+                        receipt=receipt,
+                        resource="app",
+                        finish_on_success=False,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "in_progress")
+            self.assertTrue(
+                persisted.data["exchanges"]["app"]["manual_recovery_required"]
+            )
+            self.assertEqual(
+                persisted.data["exchanges"]["app"]["failure_code"],
+                "ambiguous_exchange_mapping",
+            )
+            self._assert_source_can_still_recover(
+                atomic_macos,
+                receipt,
+                source_live,
+                source_candidate,
+            )
+
+    def test_later_app_rollback_syscall_failure_keeps_source_recoverable(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            source_live, source_candidate, app_live, app_candidate, receipt = (
+                self._source_switched_shared_transaction(
+                    atomic_macos,
+                    root,
+                    "txn-app-rollback-syscall",
+                )
+            )
+            real_swap = atomic_macos._rename_swap_at
+            calls = 0
+
+            def swap_then_fail_rollback(*arguments):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    real_swap(*arguments)
+                    raise OSError(errno.EIO, "uncertain app exchange result")
+                raise OSError(errno.EIO, "forced app rollback failure")
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=swap_then_fail_rollback,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "manual recovery"):
+                    atomic_macos.atomic_exchange(
+                        app_live,
+                        app_candidate,
+                        receipt=receipt,
+                        resource="app",
+                        finish_on_success=False,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "in_progress")
+            self.assertTrue(
+                persisted.data["exchanges"]["app"]["manual_recovery_required"]
+            )
+            self.assertEqual(
+                persisted.data["exchanges"]["app"]["failure_code"],
+                "exchange_rollback_failed",
+            )
+            self.assertEqual((app_live / "version.txt").read_text(), "app-new")
+            self._assert_source_can_still_recover(
+                atomic_macos,
+                receipt,
+                source_live,
+                source_candidate,
+            )
+
+    def test_later_app_rollback_verification_failure_keeps_source_recoverable(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            source_live, source_candidate, app_live, app_candidate, receipt = (
+                self._source_switched_shared_transaction(
+                    atomic_macos,
+                    root,
+                    "txn-app-rollback-verify",
+                )
+            )
+            real_swap = atomic_macos._rename_swap_at
+            calls = 0
+
+            def uncertain_then_rollback(*arguments):
+                nonlocal calls
+                calls += 1
+                real_swap(*arguments)
+                if calls == 1:
+                    raise OSError(errno.EIO, "uncertain app exchange result")
+
+            with mock.patch.object(
+                atomic_macos,
+                "_rename_swap_at",
+                side_effect=uncertain_then_rollback,
+            ), mock.patch.object(
+                atomic_macos,
+                "_mapping_kind",
+                side_effect=("transposed", "ambiguous"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "could not be verified"):
+                    atomic_macos.atomic_exchange(
+                        app_live,
+                        app_candidate,
+                        receipt=receipt,
+                        resource="app",
+                        finish_on_success=False,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir)
+            self.assertEqual(persisted.data["status"], "in_progress")
+            self.assertTrue(
+                persisted.data["exchanges"]["app"]["manual_recovery_required"]
+            )
+            self.assertEqual(
+                persisted.data["exchanges"]["app"]["failure_code"],
+                "rollback_verification_failed",
+            )
+            self.assertEqual((app_live / "version.txt").read_text(), "app-old")
+            self._assert_source_can_still_recover(
+                atomic_macos,
+                receipt,
+                source_live,
+                source_candidate,
+            )
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS renameatx_np contract")
@@ -875,6 +1165,128 @@ class KeeperPreparationTests(unittest.TestCase):
             self.assertEqual(persisted["keeper"]["original_commits"], [keeper_one, keeper_two])
             self.assertEqual(persisted["keeper"]["target_commit"], target)
             self.assertEqual(persisted["live_before"], persisted["live_after"])
+
+    def test_success_receipt_redacts_credentials_from_official_upstream_url(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            upstream, live = self._make_upstream_and_live(root)
+            target = commit_file(upstream, "target.txt", "target\n", "upstream target")
+            commit_file(live, "keeper.txt", "keeper\n", "keeper change")
+            receipt = atomic_macos.create_transaction(root / "transactions", "txn-redacted")
+            sentinel = "SENTINEL_SECRET_TOKEN"
+            credential_url = (
+                "https://updater:{}@example.invalid/hermes-agent.git".format(sentinel)
+            )
+            real_run_git = atomic_macos._run_git
+
+            def redirect_credential_fetch(arguments, **kwargs):
+                forwarded = list(arguments)
+                if forwarded and forwarded[0] == "fetch":
+                    self.assertEqual(forwarded[-2], credential_url)
+                    forwarded[-2] = str(upstream)
+                return real_run_git(forwarded, **kwargs)
+
+            with mock.patch.object(
+                atomic_macos,
+                "_run_git",
+                side_effect=redirect_credential_fetch,
+            ):
+                atomic_macos.prepare_keeper_candidate(
+                    live,
+                    credential_url,
+                    target,
+                    receipt=receipt,
+                )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            serialized = json.dumps(persisted, sort_keys=True)
+            self.assertNotIn(sentinel, serialized)
+            self.assertEqual(
+                persisted["keeper"]["official_upstream"],
+                "https://updater:***@example.invalid/hermes-agent.git",
+            )
+
+    def test_fetch_failure_redacts_credentials_from_receipt_and_public_error(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            upstream, live = self._make_upstream_and_live(root)
+            target = commit_file(upstream, "target.txt", "target\n", "upstream target")
+            receipt = atomic_macos.create_transaction(root / "transactions", "txn-fetch-fail")
+            sentinel = "SENTINEL_FETCH_PASSWORD"
+            credential_url = (
+                "https://updater:{}@example.invalid/hermes-agent.git".format(sentinel)
+            )
+            real_subprocess_run = atomic_macos.subprocess.run
+
+            def fail_only_fetch(command, **kwargs):
+                if "fetch" in command:
+                    raise subprocess.CalledProcessError(
+                        128,
+                        command,
+                        stderr="fatal: authentication failed for {}".format(
+                            credential_url
+                        ),
+                    )
+                return real_subprocess_run(command, **kwargs)
+
+            with mock.patch.object(
+                atomic_macos.subprocess,
+                "run",
+                side_effect=fail_only_fetch,
+            ):
+                with self.assertRaises(Exception) as raised:
+                    atomic_macos.prepare_keeper_candidate(
+                        live,
+                        credential_url,
+                        target,
+                        receipt=receipt,
+                    )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            self.assertNotIn(sentinel, str(raised.exception))
+            self.assertNotIn(sentinel, json.dumps(persisted, sort_keys=True))
+            self.assertIn("***", str(raised.exception))
+
+    def test_live_snapshot_detects_index_change_with_same_status_and_worktree(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            _upstream, live = self._make_upstream_and_live(root)
+            tracked = live / "base.txt"
+            tracked.write_text("index-one\n", encoding="utf-8")
+            run_git(live, "add", "--", "base.txt")
+            tracked.write_text("same-worktree\n", encoding="utf-8")
+            before = atomic_macos._checkout_snapshot(live)
+
+            tracked.write_text("index-two\n", encoding="utf-8")
+            run_git(live, "add", "--", "base.txt")
+            tracked.write_text("same-worktree\n", encoding="utf-8")
+            after = atomic_macos._checkout_snapshot(live)
+
+            self.assertEqual(before["head"], after["head"])
+            self.assertEqual(before["status"], after["status"])
+            self.assertEqual(before["tree_digest"], after["tree_digest"])
+            self.assertEqual(before["worktree_digest"], after["worktree_digest"])
+            self.assertNotEqual(before["index_digest"], after["index_digest"])
+
+            receipt = atomic_macos.create_transaction(root / "transactions", "txn-index")
+            atomic_macos._record_candidate_failure(
+                receipt,
+                phase="candidate_preparation_failed",
+                code="candidate_preparation_failed",
+                message="forced candidate failure",
+                live_before=before,
+                live_after=after,
+                candidate_path=root / "candidate",
+            )
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            self.assertEqual(persisted["status"], "manual_recovery_required")
+            self.assertFalse(persisted["no_live_mutation"])
 
     def test_conflict_records_first_keeper_and_leaves_live_checkout_byte_identical(self):
         atomic_macos = load_atomic_macos()

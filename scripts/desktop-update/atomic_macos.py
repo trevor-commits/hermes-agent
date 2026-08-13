@@ -31,6 +31,12 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 _EXACT_COMMIT_RE = re.compile(r"\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+_URL_USERINFO_RE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@"
+)
+_URL_SECRET_QUERY_RE = re.compile(
+    r"(?i)(?P<prefix>[?&](?:access_token|api_key|password|secret|token)=)[^&#\s]+"
+)
 _GIT_TIMEOUT_SECONDS = 600
 
 
@@ -38,6 +44,35 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _redact_sensitive_text(value: str) -> str:
+    def redact_userinfo(match: re.Match) -> str:
+        userinfo = match.group("userinfo")
+        if ":" in userinfo:
+            username = userinfo.split(":", 1)[0]
+            redacted = "{}:***".format(username)
+        else:
+            redacted = "***"
+        return "{}{}@".format(match.group("scheme"), redacted)
+
+    redacted = _URL_USERINFO_RE.sub(redact_userinfo, value)
+    return _URL_SECRET_QUERY_RE.sub(r"\g<prefix>***", redacted)
+
+
+def _sanitize_receipt_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_receipt_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_receipt_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_receipt_value(item) for item in value)
+    return value
 
 
 def validate_generated_leaf(leaf: str) -> str:
@@ -69,6 +104,28 @@ def _identity_tuple(file_stat: os.stat_result) -> tuple:
     return (file_stat.st_dev, file_stat.st_ino)
 
 
+def _validated_directory_identity(
+    path_stat: os.stat_result,
+    opened_stat: os.stat_result,
+    *,
+    expected_uid: int,
+    label: str,
+) -> os.stat_result:
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError("{} must not be a symlink".format(label))
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise ValueError("{} must be a directory".format(label))
+    if path_stat.st_uid != expected_uid:
+        raise PermissionError("{} has unexpected owner".format(label))
+    if _identity_tuple(path_stat) != _identity_tuple(opened_stat):
+        raise RuntimeError("{} identity changed while opening".format(label))
+    if not stat.S_ISDIR(opened_stat.st_mode):
+        raise ValueError("opened {} must be a directory".format(label))
+    if opened_stat.st_uid != expected_uid:
+        raise PermissionError("opened {} has unexpected owner".format(label))
+    return path_stat
+
+
 def _open_verified_directory(
     path: Path,
     *,
@@ -76,21 +133,25 @@ def _open_verified_directory(
     expected_uid: Optional[int] = None,
 ) -> int:
     before = path.lstat()
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
-        raise ValueError(f"directory must not be a symlink: {path}")
     owner = os.geteuid() if expected_uid is None else expected_uid
-    if before.st_uid != owner:
-        raise PermissionError(f"directory has unexpected owner: {path}")
+    _validated_directory_identity(
+        before,
+        before,
+        expected_uid=owner,
+        label="directory {}".format(path),
+    )
     if owner_only and before.st_mode & 0o077:
         raise PermissionError(f"transaction directory is not owner-only: {path}")
 
     descriptor = os.open(str(path), _directory_open_flags())
     try:
         after = os.fstat(descriptor)
-        if _identity_tuple(before) != _identity_tuple(after):
-            raise RuntimeError(f"directory identity changed while opening: {path}")
-        if not stat.S_ISDIR(after.st_mode):
-            raise ValueError(f"opened path is not a directory: {path}")
+        _validated_directory_identity(
+            before,
+            after,
+            expected_uid=owner,
+            label="directory {}".format(path),
+        )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -160,9 +221,10 @@ class TransactionReceipt:
             raise RuntimeError("terminal transaction receipts are immutable")
         if not isinstance(phase, str) or not phase:
             raise ValueError("receipt phase must be a non-empty string")
-        self.data.update(updates)
+        self.data.update(_sanitize_receipt_value(updates))
         self.data["phase"] = phase
         self.data["updated_at"] = _utc_now()
+        self.data = _sanitize_receipt_value(self.data)
         _atomic_json_write(self.transaction_dir, self.data)
 
     def finish(
@@ -182,7 +244,7 @@ class TransactionReceipt:
             raise ValueError("receipt phase must be a non-empty string")
 
         now = _utc_now()
-        self.data.update(updates)
+        self.data.update(_sanitize_receipt_value(updates))
         self.data.update(
             {
                 "status": status,
@@ -194,6 +256,7 @@ class TransactionReceipt:
                 "completed_at": now,
             }
         )
+        self.data = _sanitize_receipt_value(self.data)
         _atomic_json_write(self.transaction_dir, self.data)
 
 
@@ -302,6 +365,10 @@ class KeeperConflictError(RuntimeError):
         )
 
 
+class GitCommandError(RuntimeError):
+    """A sanitized Git subprocess failure safe for receipts and callers."""
+
+
 def _git_environment() -> Dict[str, str]:
     environment = os.environ.copy()
     environment.pop("HERMES_HOME", None)
@@ -327,15 +394,40 @@ def _run_git(
     if repository is not None:
         command.extend(["-C", str(repository)])
     command.extend(arguments)
-    return subprocess.run(
-        command,
-        check=check,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        env=_git_environment(),
-        timeout=_GIT_TIMEOUT_SECONDS,
-    )
+    try:
+        return subprocess.run(
+            command,
+            check=check,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            env=_git_environment(),
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr or error.stdout or str(error)
+        safe_command = " ".join(
+            _redact_sensitive_text(os.fsdecode(argument))
+            for argument in error.cmd
+        )
+        raise GitCommandError(
+            "git command failed (exit {}): {}: {}".format(
+                error.returncode,
+                safe_command,
+                _redact_sensitive_text(os.fsdecode(detail)),
+            )
+        ) from None
+    except subprocess.TimeoutExpired as error:
+        safe_command = " ".join(
+            _redact_sensitive_text(os.fsdecode(argument))
+            for argument in error.cmd
+        )
+        raise GitCommandError(
+            "git command timed out after {} seconds: {}".format(
+                error.timeout,
+                safe_command,
+            )
+        ) from None
 
 
 def _git_output(repository: Path, *arguments: str) -> str:
@@ -385,6 +477,11 @@ def _checkout_snapshot(repository: Path) -> Dict[str, Any]:
         ["status", "--porcelain=v1", "--untracked-files=all"],
         repository=repository,
     ).stdout
+    index_bytes = _run_git(
+        ["ls-files", "--stage", "-z"],
+        repository=repository,
+        text=False,
+    ).stdout
     return {
         "path": str(repository),
         "st_dev": root_stat.st_dev,
@@ -393,6 +490,7 @@ def _checkout_snapshot(repository: Path) -> Dict[str, Any]:
         "head": head,
         "status": status_output,
         "status_digest": hashlib.sha256(status_output.encode("utf-8")).hexdigest(),
+        "index_digest": hashlib.sha256(index_bytes).hexdigest(),
         "tree_digest": tree,
         "worktree_digest": _worktree_digest(repository),
     }
@@ -847,6 +945,23 @@ def _default_receipt(left_parent: Path) -> TransactionReceipt:
     return create_transaction(root)
 
 
+def _expected_owner_pair(
+    owners: Optional[tuple],
+    *,
+    default_uid: int,
+    label: str,
+) -> tuple:
+    if owners is None:
+        return (default_uid, default_uid)
+    if (
+        not isinstance(owners, tuple)
+        or len(owners) != 2
+        or not all(isinstance(owner, int) and owner >= 0 for owner in owners)
+    ):
+        raise ValueError("{} must be a pair of non-negative user ids".format(label))
+    return owners
+
+
 def _finish_preflight_failure(
     receipt: Optional[TransactionReceipt],
     error: BaseException,
@@ -910,6 +1025,46 @@ def _aggregate_exchange_state(exchanges: Dict[str, Any]) -> Dict[str, bool]:
         "rolled_back": rolled_back,
         "no_live_mutation": not switched,
     }
+
+
+def _persist_exchange_failure(
+    receipt: TransactionReceipt,
+    *,
+    resource: str,
+    exchanges: Dict[str, Any],
+    phase: str,
+    failure_code: str,
+    failure_message: str,
+    manual_recovery_required: bool,
+    finish: bool,
+) -> None:
+    selected = dict(exchanges.get(resource, {}))
+    selected.update(
+        {
+            "failure_code": failure_code,
+            "failure_message": failure_message,
+            "manual_recovery_required": manual_recovery_required,
+        }
+    )
+    exchanges[resource] = selected
+    aggregate = _aggregate_exchange_state(exchanges)
+    if finish:
+        receipt.finish(
+            "manual_recovery_required",
+            phase=phase,
+            failure_code=failure_code,
+            failure_message=failure_message,
+            exchanges=exchanges,
+            **aggregate,
+        )
+    else:
+        receipt.record_phase(
+            phase,
+            failure_code=failure_code,
+            failure_message=failure_message,
+            exchanges=exchanges,
+            **aggregate,
+        )
 
 
 def _recovery_phase(resource: str, suffix: str, finish: bool) -> str:
@@ -995,9 +1150,10 @@ def recover_exchange(
         right_parent_path = Path(right_parent_record["path"])
         left_leaf = validate_generated_leaf(left_original_record["leaf"])
         right_leaf = validate_generated_leaf(right_original_record["leaf"])
-        owner = int(left_original_record["st_uid"])
-        if int(right_original_record["st_uid"]) != owner:
-            raise ValueError("receipt endpoint owners disagree")
+        left_parent_owner = int(left_parent_record["st_uid"])
+        right_parent_owner = int(right_parent_record["st_uid"])
+        left_endpoint_owner = int(left_original_record["st_uid"])
+        right_endpoint_owner = int(right_original_record["st_uid"])
         if Path(left_original_record["path"]) != left_parent_path / left_leaf:
             raise ValueError("left recovery role does not match its parent and leaf")
         if Path(right_original_record["path"]) != right_parent_path / right_leaf:
@@ -1016,12 +1172,12 @@ def recover_exchange(
     try:
         left_parent_fd = _open_verified_directory(
             left_parent_path,
-            expected_uid=owner,
+            expected_uid=left_parent_owner,
         )
         descriptors.append(left_parent_fd)
         right_parent_fd = _open_verified_directory(
             right_parent_path,
-            expected_uid=owner,
+            expected_uid=right_parent_owner,
         )
         descriptors.append(right_parent_fd)
         if _identity_tuple(os.fstat(left_parent_fd)) != _stored_identity(
@@ -1036,13 +1192,13 @@ def recover_exchange(
         left_current = _observe_endpoint(
             left_parent_fd,
             left_leaf,
-            expected_uid=owner,
+            expected_uid=left_endpoint_owner,
             label="left recovery endpoint",
         )
         right_current = _observe_endpoint(
             right_parent_fd,
             right_leaf,
-            expected_uid=owner,
+            expected_uid=right_endpoint_owner,
             label="right recovery endpoint",
         )
     except (OSError, RuntimeError, ValueError) as error:
@@ -1184,13 +1340,13 @@ def recover_exchange(
         left_restored = _observe_endpoint(
             left_parent_fd,
             left_leaf,
-            expected_uid=owner,
+            expected_uid=left_endpoint_owner,
             label="left recovery endpoint",
         )
         right_restored = _observe_endpoint(
             right_parent_fd,
             right_leaf,
-            expected_uid=owner,
+            expected_uid=right_endpoint_owner,
             label="right recovery endpoint",
         )
         identities["recovery_after"] = {
@@ -1257,6 +1413,8 @@ def atomic_exchange(
     *,
     receipt: Optional[TransactionReceipt] = None,
     expected_uid: Optional[int] = None,
+    expected_parent_uids: Optional[tuple] = None,
+    expected_endpoint_uids: Optional[tuple] = None,
     resource: str = "standalone",
     finish_on_success: bool = True,
 ) -> TransactionReceipt:
@@ -1265,6 +1423,16 @@ def atomic_exchange(
         raise OSError("atomic path exchange is supported only on macOS")
 
     owner = os.geteuid() if expected_uid is None else expected_uid
+    parent_owners = _expected_owner_pair(
+        expected_parent_uids,
+        default_uid=owner,
+        label="expected_parent_uids",
+    )
+    endpoint_owners = _expected_owner_pair(
+        expected_endpoint_uids,
+        default_uid=owner,
+        label="expected_endpoint_uids",
+    )
     left_path = Path(os.path.abspath(os.fspath(left)))
     right_path = Path(os.path.abspath(os.fspath(right)))
     left_leaf = validate_generated_leaf(left_path.name)
@@ -1277,25 +1445,25 @@ def atomic_exchange(
     try:
         left_parent_fd = _open_verified_directory(
             left_path.parent,
-            expected_uid=owner,
+            expected_uid=parent_owners[0],
         )
         descriptors.append(left_parent_fd)
         right_parent_fd = _open_verified_directory(
             right_path.parent,
-            expected_uid=owner,
+            expected_uid=parent_owners[1],
         )
         descriptors.append(right_parent_fd)
         left_endpoint_fd, left_original = _open_endpoint(
             left_parent_fd,
             left_leaf,
-            expected_uid=owner,
+            expected_uid=endpoint_owners[0],
             label="left exchange endpoint",
         )
         descriptors.append(left_endpoint_fd)
         right_endpoint_fd, right_original = _open_endpoint(
             right_parent_fd,
             right_leaf,
-            expected_uid=owner,
+            expected_uid=endpoint_owners[1],
             label="right exchange endpoint",
         )
         descriptors.append(right_endpoint_fd)
@@ -1305,13 +1473,27 @@ def atomic_exchange(
     except BaseException as error:
         if receipt is not None and not finish_on_success:
             exchanges = dict(receipt.data.get("exchanges", {}))
-            aggregate = _aggregate_exchange_state(exchanges)
-            receipt.record_phase(
-                "{}_exchange_preflight_failed".format(resource),
+            exchanges[resource] = {
+                "verified": False,
+                "switched": False,
+                "rolled_back": False,
+                "parents": {},
+                "before": {},
+                "after": {},
+                "roles": {
+                    "left": str(left_path),
+                    "right": str(right_path),
+                },
+            }
+            _persist_exchange_failure(
+                receipt,
+                resource=resource,
+                exchanges=exchanges,
+                phase="{}_exchange_preflight_failed".format(resource),
                 failure_code="exchange_precondition",
                 failure_message=str(error),
-                exchanges=exchanges,
-                **aggregate,
+                manual_recovery_required=False,
+                finish=False,
             )
         else:
             _finish_preflight_failure(receipt, error)
@@ -1370,13 +1552,13 @@ def atomic_exchange(
             left_current = _observe_endpoint(
                 left_parent_fd,
                 left_leaf,
-                expected_uid=owner,
+                expected_uid=endpoint_owners[0],
                 label="left exchange endpoint",
             )
             right_current = _observe_endpoint(
                 right_parent_fd,
                 right_leaf,
-                expected_uid=owner,
+                expected_uid=endpoint_owners[1],
                 label="right exchange endpoint",
             )
             mapping = _mapping_kind(
@@ -1439,17 +1621,23 @@ def atomic_exchange(
                         right_leaf,
                     )
                 except Exception as rollback_error:
-                    resource_exchange["rollback_error"] = str(rollback_error)
+                    resource_exchange.update(
+                        {
+                            "switched": True,
+                            "rolled_back": False,
+                            "rollback_error": str(rollback_error),
+                        }
+                    )
                     exchanges[resource] = resource_exchange
-                    receipt.finish(
-                        "manual_recovery_required",
+                    _persist_exchange_failure(
+                        receipt,
+                        resource=resource,
+                        exchanges=exchanges,
                         phase="{}_exchange_rollback_failed".format(resource),
-                        switched=True,
-                        rolled_back=False,
-                        no_live_mutation=False,
                         failure_code="exchange_rollback_failed",
                         failure_message=str(rollback_error),
-                        exchanges=exchanges,
+                        manual_recovery_required=True,
+                        finish=finish_on_success,
                     )
                     raise RuntimeError(
                         "atomic exchange rollback failed; manual recovery required"
@@ -1457,13 +1645,13 @@ def atomic_exchange(
                 left_restored = _observe_endpoint(
                     left_parent_fd,
                     left_leaf,
-                    expected_uid=owner,
+                    expected_uid=endpoint_owners[0],
                     label="left exchange endpoint",
                 )
                 right_restored = _observe_endpoint(
                     right_parent_fd,
                     right_leaf,
-                    expected_uid=owner,
+                    expected_uid=endpoint_owners[1],
                     label="right exchange endpoint",
                 )
                 if (
@@ -1475,17 +1663,23 @@ def atomic_exchange(
                     )
                     != "original"
                 ):
-                    resource_exchange["rollback_verified"] = False
+                    resource_exchange.update(
+                        {
+                            "switched": True,
+                            "rolled_back": False,
+                            "rollback_verified": False,
+                        }
+                    )
                     exchanges[resource] = resource_exchange
-                    receipt.finish(
-                        "manual_recovery_required",
+                    _persist_exchange_failure(
+                        receipt,
+                        resource=resource,
+                        exchanges=exchanges,
                         phase="{}_exchange_rollback_unverified".format(resource),
-                        switched=True,
-                        rolled_back=False,
-                        no_live_mutation=False,
                         failure_code="rollback_verification_failed",
                         failure_message=str(error),
-                        exchanges=exchanges,
+                        manual_recovery_required=True,
+                        finish=finish_on_success,
                     )
                     raise RuntimeError("atomic exchange rollback could not be verified")
                 _fsync_parents(left_parent_fd, right_parent_fd)
@@ -1527,28 +1721,28 @@ def atomic_exchange(
                 }
             )
             exchanges[resource] = resource_exchange
-            receipt.finish(
-                "manual_recovery_required",
+            _persist_exchange_failure(
+                receipt,
+                resource=resource,
+                exchanges=exchanges,
                 phase="{}_exchange_mapping_ambiguous".format(resource),
-                switched=_aggregate_exchange_state(exchanges)["switched"],
-                rolled_back=False,
-                no_live_mutation=False,
                 failure_code="ambiguous_exchange_mapping",
                 failure_message=str(error),
-                exchanges=exchanges,
+                manual_recovery_required=True,
+                finish=finish_on_success,
             )
             raise RuntimeError("exchange mapping is ambiguous; manual recovery required")
 
         left_current = _observe_endpoint(
             left_parent_fd,
             left_leaf,
-            expected_uid=owner,
+            expected_uid=endpoint_owners[0],
             label="left exchange endpoint",
         )
         right_current = _observe_endpoint(
             right_parent_fd,
             right_leaf,
-            expected_uid=owner,
+            expected_uid=endpoint_owners[1],
             label="right exchange endpoint",
         )
         if (
@@ -1569,15 +1763,15 @@ def atomic_exchange(
                 }
             )
             exchanges[resource] = resource_exchange
-            receipt.finish(
-                "manual_recovery_required",
+            _persist_exchange_failure(
+                receipt,
+                resource=resource,
+                exchanges=exchanges,
                 phase="{}_exchange_transposition_unverified".format(resource),
-                switched=True,
-                rolled_back=False,
-                no_live_mutation=False,
                 failure_code="transposition_verification_failed",
                 failure_message="endpoint identities are not an exact transposition",
-                exchanges=exchanges,
+                manual_recovery_required=True,
+                finish=finish_on_success,
             )
             raise RuntimeError("atomic exchange did not produce an exact transposition")
 
