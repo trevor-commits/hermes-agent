@@ -1382,6 +1382,43 @@ class KeeperPreparationTests(unittest.TestCase):
             self.assertEqual(persisted["status"], "failed_unchanged")
             self.assertEqual(persisted["failure_code"], "invalid_target_commit")
 
+    def test_invalid_target_with_non_git_live_checkout_terminalizes_fail_closed(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            live = root / "not-a-git-checkout"
+            live.mkdir()
+            (live / "sentinel.txt").write_text("unchanged\n", encoding="utf-8")
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-invalid-non-git",
+            )
+
+            with self.assertRaisesRegex(ValueError, "exact commit"):
+                atomic_macos.prepare_keeper_candidate(
+                    live,
+                    "https://updater:SECRET@example.invalid/hermes-agent.git",
+                    "main",
+                    receipt=receipt,
+                )
+
+            persisted = atomic_macos.load_transaction(receipt.transaction_dir).data
+            self.assertEqual(persisted["status"], "manual_recovery_required")
+            self.assertEqual(persisted["phase"], "candidate_target_invalid")
+            self.assertEqual(persisted["failure_code"], "invalid_target_commit")
+            self.assertEqual(
+                persisted["failure_message"],
+                "target must be an exact 40- or 64-hex commit id",
+            )
+            self.assertNotIn("SECRET", json.dumps(persisted, sort_keys=True))
+            self.assertIsNotNone(persisted["completed_at"])
+            self.assertFalse(persisted["no_live_mutation"])
+            self.assertEqual(
+                (live / "sentinel.txt").read_text(encoding="utf-8"),
+                "unchanged\n",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

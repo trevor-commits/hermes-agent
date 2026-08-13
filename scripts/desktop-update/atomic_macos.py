@@ -546,7 +546,7 @@ def prepare_keeper_candidate(
         try:
             live_before = _checkout_snapshot(live)
             live_after = _checkout_snapshot(live)
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError, GitCommandError):
             pass
         _record_candidate_failure(
             receipt,
@@ -759,7 +759,7 @@ def prepare_keeper_candidate(
         if not receipt.is_terminal:
             try:
                 live_after = _checkout_snapshot(live)
-            except (OSError, ValueError, subprocess.SubprocessError):
+            except (OSError, ValueError, subprocess.SubprocessError, GitCommandError):
                 live_after = None
             _record_candidate_failure(
                 receipt,
