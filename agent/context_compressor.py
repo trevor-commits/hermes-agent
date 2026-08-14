@@ -7447,13 +7447,20 @@ def truncate_oversized_tool_results(
         candidates.append(row)
     candidates.sort(key=lambda r: len(r.get("content") or ""), reverse=True)
     reclaimed = 0
+    marker_suffix = "\n" + LAST_MILE_TRIM_MARKER
     for row in candidates:
         if reclaimed >= reclaim_chars:
             break
         original = row["content"]
-        truncated = original[:keep_head_chars] + "\n" + LAST_MILE_TRIM_MARKER
+        remaining = reclaim_chars - reclaimed
+        removable = len(original) - keep_head_chars - len(marker_suffix)
+        remove_now = min(remaining, max(0, removable))
+        if remove_now <= 0:
+            continue
+        retained_head = len(original) - remove_now - len(marker_suffix)
+        truncated = original[:retained_head] + marker_suffix
         row["content"] = truncated
-        reclaimed += len(original) - len(truncated)
+        reclaimed += remove_now
         if mirror:
             for twin in mirror:
                 if (
