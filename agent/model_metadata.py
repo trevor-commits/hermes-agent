@@ -507,6 +507,16 @@ DEFAULT_CONTEXT_LENGTHS = {
     # (5, 5.1, 5-turbo) are ~202K.  Longest-key-first substring matching
     # ensures "glm-5.2" resolves to 1M while older variants still hit the
     # generic 202K fallback.
+    #
+    # SCOPE HONESTY (2026-08-13): only the /coding/paas/v4 route above was
+    # probed at that depth; the plain api.z.ai/api/paas/v4 route (the zai
+    # provider default, and the currently configured live route) inherits
+    # this 1M figure unverified. That is harmless while
+    # compression.threshold_tokens caps requests at 30K — note the
+    # ambiguous-disconnect heuristic in error_classifier.py:958-998 is
+    # unreachable under that cap at ANY plausible window. If a glm-5.2
+    # route is ever run WITHOUT the cap, probe its real window and scope
+    # it per-endpoint via _endpoint_scoped_context_length.
     "glm-5.2": 1_048_576,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
