@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -64,6 +65,22 @@ export interface PublishedRuntimeBinding {
   directoryInode: string
   manifestSha256: string
   transactionId: string
+}
+
+export interface LaunchPublishedAtomicMacosOptions {
+  binding: PublishedRuntimeBinding
+  command: 'capabilities' | 'recover'
+  directory: string
+  environment?: NodeJS.ProcessEnv
+  timeoutMs?: number
+  transactionId?: string
+  transactionsRoot: string
+}
+
+export interface PublishedAtomicMacosLaunchResult {
+  status: 0 | 64 | 75
+  stdout: string
+  stderr: string
 }
 
 function expectedUid(): number | null {
@@ -157,7 +174,19 @@ function fsyncDirectory(directory: string): void {
   }
 }
 
-function readVerifiedRegularFile(file: string, mode?: number): Buffer {
+function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  )
+}
+
+function readVerifiedRegularFile(file: string, mode?: number, maximumSize = 16 * 1024 * 1024): Buffer {
   const before = fs.lstatSync(file, { bigint: true })
   const uid = expectedUid()
 
@@ -169,6 +198,9 @@ function readVerifiedRegularFile(file: string, mode?: number): Buffer {
   }
   if (mode === undefined ? Boolean(before.mode & 0o022n) : (before.mode & 0o777n) !== BigInt(mode)) {
     throw new Error(`updater runtime member has unsafe mode: ${file}`)
+  }
+  if (before.size < 0n || before.size > BigInt(maximumSize)) {
+    throw new Error(`updater runtime member exceeds its size limit: ${file}`)
   }
 
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
@@ -186,7 +218,14 @@ function readVerifiedRegularFile(file: string, mode?: number): Buffer {
       throw new Error(`updater runtime member changed while opening: ${file}`)
     }
 
-    return fs.readFileSync(descriptor)
+    const bytes = fs.readFileSync(descriptor)
+    const after = fs.fstatSync(descriptor, { bigint: true })
+
+    if (!sameFileIdentity(opened, after) || BigInt(bytes.byteLength) !== opened.size) {
+      throw new Error(`updater runtime member changed while reading: ${file}`)
+    }
+
+    return bytes
   } finally {
     fs.closeSync(descriptor)
   }
@@ -287,11 +326,15 @@ export function publishPosixUpdaterRuntime(options: PublishPosixUpdaterRuntimeOp
   }
 }
 
-export function validatePublishedUpdaterRuntime(directory: string, binding: PublishedRuntimeBinding): RuntimeManifest {
+function readValidatedPublishedUpdaterRuntime(
+  directory: string,
+  binding: PublishedRuntimeBinding
+): { files: Readonly<Record<string, Buffer>>; manifest: RuntimeManifest } {
   const root = path.resolve(directory)
   const assets = canonicalAssets()
 
   assertNoSymlinkAncestors(root)
+  const parentIdentity = assertOwnedRealDirectory(path.dirname(root), 0o700)
   const rootIdentity = assertOwnedRealDirectory(root, 0o700)
 
   if (
@@ -311,7 +354,7 @@ export function validatePublishedUpdaterRuntime(directory: string, binding: Publ
     throw new Error('published updater runtime contains an unexpected file set')
   }
 
-  const rawManifest = readVerifiedRegularFile(path.join(root, 'manifest.json'), 0o400)
+  const rawManifest = readVerifiedRegularFile(path.join(root, 'manifest.json'), 0o400, 256 * 1024)
 
   if (!/^[0-9a-f]{64}$/.test(binding.manifestSha256) || sha256(rawManifest) !== binding.manifestSha256) {
     throw new Error('published updater runtime manifest does not match its trusted digest')
@@ -337,6 +380,9 @@ export function validatePublishedUpdaterRuntime(directory: string, binding: Publ
   ) {
     throw new Error('published updater runtime manifest identity is invalid')
   }
+  if (!rawManifest.equals(manifestBytes(manifest))) {
+    throw new Error('published updater runtime manifest encoding is not canonical')
+  }
 
   const expectedFiles = [...assets].sort((left, right) =>
     left.target < right.target ? -1 : left.target > right.target ? 1 : 0
@@ -345,6 +391,8 @@ export function validatePublishedUpdaterRuntime(directory: string, binding: Publ
   if (manifest.files.length !== expectedFiles.length) {
     throw new Error('published updater runtime manifest file count is invalid')
   }
+
+  const verifiedFiles: Record<string, Buffer> = {}
 
   for (let index = 0; index < expectedFiles.length; index += 1) {
     const asset = expectedFiles[index]
@@ -362,7 +410,144 @@ export function validatePublishedUpdaterRuntime(directory: string, binding: Publ
     ) {
       throw new Error(`published updater runtime manifest mismatch: ${asset.target}`)
     }
+    verifiedFiles[asset.target] = bytes
   }
 
-  return manifest
+  const rootAfter = fs.lstatSync(root, { bigint: true })
+  const parentAfter = fs.lstatSync(path.dirname(root), { bigint: true })
+  if (!sameFileIdentity(rootIdentity, rootAfter) || !sameFileIdentity(parentIdentity, parentAfter)) {
+    throw new Error('published updater runtime directory changed during validation')
+  }
+
+  return { files: Object.freeze(verifiedFiles), manifest }
+}
+
+export function validatePublishedUpdaterRuntime(directory: string, binding: PublishedRuntimeBinding): RuntimeManifest {
+  return readValidatedPublishedUpdaterRuntime(directory, binding).manifest
+}
+
+const TRUSTED_PYTHON_BOOTSTRAP = `
+import base64
+import json
+import pathlib
+import sys
+import types
+
+payload = json.load(sys.stdin)
+runtime_directory = pathlib.Path(sys.argv[1])
+verified = {
+    leaf: base64.b64decode(encoded, validate=True)
+    for leaf, encoded in payload["files"].items()
+}
+module = types.ModuleType("__main__")
+namespace = module.__dict__
+namespace.update({
+    "__file__": str(runtime_directory / "atomic_macos.py"),
+    "__name__": "__main__",
+    "_HERMES_TRUSTED_RUNTIME_BOOTSTRAP": True,
+    "_HERMES_VERIFIED_RUNTIME_BYTES": verified,
+    "_HERMES_VERIFIED_RUNTIME_MODES": payload["modes"],
+    "_HERMES_VERIFIED_RUNTIME_TRANSACTION_ID": payload["runtime_transaction_id"],
+})
+sys.modules["__main__"] = module
+sys.argv = [namespace["__file__"], *payload["arguments"]]
+exec(compile(verified["atomic_macos.py"], namespace["__file__"], "exec"), namespace, namespace)
+`.trim()
+
+function launchFailure(
+  failureCode: 'runtime_validation_failed' | 'recovery_launcher_failed'
+): PublishedAtomicMacosLaunchResult {
+  const status = failureCode === 'runtime_validation_failed' ? 64 : 75
+  const payload = {
+    failure_code: failureCode,
+    manual_recovery_required: false,
+    ok: false,
+    schema_version: 1,
+    status: status === 64 ? 'unsafe' : 'unrecovered'
+  }
+  return { status, stderr: '', stdout: `${JSON.stringify(payload)}\n` }
+}
+
+export function launchPublishedAtomicMacos(
+  options: LaunchPublishedAtomicMacosOptions
+): PublishedAtomicMacosLaunchResult {
+  let validated: ReturnType<typeof readValidatedPublishedUpdaterRuntime>
+
+  try {
+    validated = readValidatedPublishedUpdaterRuntime(options.directory, options.binding)
+  } catch {
+    return launchFailure('runtime_validation_failed')
+  }
+
+  let argumentsList: string[]
+  try {
+    if (
+      !path.isAbsolute(options.transactionsRoot) ||
+      path.normalize(options.transactionsRoot) !== options.transactionsRoot
+    ) {
+      throw new Error('transactions root must be canonical and absolute')
+    }
+    if (options.command === 'recover' && options.transactionId !== options.binding.transactionId) {
+      throw new Error('recovery transaction does not match its runtime binding')
+    }
+    argumentsList = [
+      ...(options.command === 'capabilities'
+        ? ['--capabilities']
+        : [
+            'recover',
+            '--transaction',
+            validateTransactionId(options.transactionId ?? ''),
+            '--transactions-root',
+            options.transactionsRoot
+          ]),
+      '--runtime-device',
+      options.binding.directoryDevice,
+      '--runtime-inode',
+      options.binding.directoryInode,
+      '--manifest-sha256',
+      options.binding.manifestSha256
+    ]
+  } catch {
+    return launchFailure('runtime_validation_failed')
+  }
+
+  const files = Object.fromEntries(
+    Object.entries(validated.files).map(([leaf, bytes]) => [leaf, bytes.toString('base64')])
+  )
+  const modes = Object.fromEntries(
+    POSIX_UPDATER_RUNTIME_ASSETS.map(asset => [asset.target, asset.executable ? 0o500 : 0o400])
+  )
+  const launched = spawnSync('/usr/bin/python3', ['-c', TRUSTED_PYTHON_BOOTSTRAP, path.resolve(options.directory)], {
+    encoding: 'utf8',
+    env: options.environment,
+    input: JSON.stringify({
+      arguments: argumentsList,
+      files,
+      modes,
+      runtime_transaction_id: options.binding.transactionId
+    }),
+    maxBuffer: 8192,
+    timeout: options.timeoutMs ?? 5000
+  })
+
+  const stdout = typeof launched.stdout === 'string' ? launched.stdout : ''
+  const stderr = typeof launched.stderr === 'string' ? launched.stderr : ''
+  if (
+    launched.error ||
+    (launched.status !== 0 && launched.status !== 64 && launched.status !== 75) ||
+    stderr !== '' ||
+    Buffer.byteLength(stdout, 'utf8') > 4096
+  ) {
+    return launchFailure('recovery_launcher_failed')
+  }
+  try {
+    const payload = JSON.parse(stdout)
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      return launchFailure('recovery_launcher_failed')
+    }
+  } catch {
+    return launchFailure('recovery_launcher_failed')
+  }
+
+  return { status: launched.status, stderr: '', stdout }
 }

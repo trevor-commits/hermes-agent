@@ -26,6 +26,7 @@ PathLike = Union[str, os.PathLike]
 _RENAME_SWAP = 0x00000002
 _RECEIPT_NAME = "receipt.json"
 _TRANSACTION_LOCK_NAME = ".transaction.lock"
+_MAX_RECEIPT_BYTES = 1024 * 1024
 _TERMINAL_STATUSES = frozenset(
     {
         "succeeded",
@@ -54,6 +55,10 @@ _SCP_USERINFO_RE = re.compile(
 
 class TransactionLockUnavailableError(RuntimeError):
     """The root transaction lock stayed busy for the caller's bounded wait."""
+
+
+class _RecoveryPlanStaleError(RuntimeError):
+    """A planned recovery identity changed before its exchange could run."""
 
 
 def _utc_now() -> str:
@@ -543,13 +548,13 @@ def create_transaction(
 ) -> TransactionReceipt:
     """Create an owner-only transaction directory and initial receipt."""
     root = _canonical_transactions_root(transactions_root)
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     leaf = validate_generated_leaf(
         transaction_id or "txn-{}".format(uuid.uuid4().hex)
     )
     lock_leaf = validate_generated_leaf(lock_transaction_id or leaf)
     transaction_dir = root / leaf
-    root_fd = _open_verified_directory(root)
+    root_fd = _open_verified_directory(root, owner_only=True)
     try:
         os.mkdir(leaf, 0o700, dir_fd=root_fd)
         os.fsync(root_fd)
@@ -599,14 +604,38 @@ def load_transaction(transaction_dir: PathLike) -> TransactionReceipt:
             raise PermissionError("transaction receipt must be an owner-owned regular file")
         if before.st_mode & 0o077:
             raise PermissionError("transaction receipt must be owner-only")
+        if before.st_size < 0 or before.st_size > _MAX_RECEIPT_BYTES:
+            raise ValueError("transaction receipt exceeds the receipt size limit")
         receipt_fd = os.open(_RECEIPT_NAME, flags, dir_fd=directory_fd)
-        after = os.fstat(receipt_fd)
-        if _identity_tuple(before) != _identity_tuple(after):
+        opened = os.fstat(receipt_fd)
+        if (
+            _identity_tuple(before) != _identity_tuple(opened)
+            or before.st_size != opened.st_size
+        ):
             raise RuntimeError("transaction receipt identity changed while opening")
-        with os.fdopen(receipt_fd, "rb") as handle:
-            receipt_fd = None
-            encoded = handle.read()
-            data = json.loads(encoded.decode("utf-8"))
+        chunks = []
+        remaining = _MAX_RECEIPT_BYTES + 1
+        while remaining:
+            chunk = os.read(receipt_fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        after = os.fstat(receipt_fd)
+        if len(encoded) > _MAX_RECEIPT_BYTES:
+            raise ValueError("transaction receipt exceeds the receipt size limit")
+        if (
+            _identity_tuple(opened) != _identity_tuple(after)
+            or opened.st_size != after.st_size
+            or len(encoded) != opened.st_size
+        ):
+            raise RuntimeError("transaction receipt changed while reading")
+        try:
+            decoded = encoded.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("transaction receipt is not valid UTF-8") from error
+        data = json.loads(decoded)
     finally:
         if receipt_fd is not None:
             os.close(receipt_fd)
@@ -1055,6 +1084,240 @@ def _validated_recorded_exchanges(
     return exchanges
 
 
+def _validated_recovery_identity_record(
+    record: Any,
+    *,
+    label: str,
+    require_leaf: bool,
+) -> Dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError("{} identity is not an object".format(label))
+    required = {"path", "st_dev", "st_ino", "st_mode", "st_uid", "type"}
+    if require_leaf:
+        required.add("leaf")
+    if not required.issubset(record):
+        raise ValueError("{} identity is incomplete".format(label))
+    if record.get("type") != "directory" or not isinstance(record.get("path"), str):
+        raise ValueError("{} identity has an invalid type or path".format(label))
+    path_value = record["path"]
+    if not os.path.isabs(path_value) or os.path.abspath(path_value) != path_value:
+        raise ValueError("{} identity path is not canonical".format(label))
+    for field in ("st_dev", "st_ino", "st_mode", "st_uid"):
+        value = record.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError("{} identity field {} is invalid".format(label, field))
+    if record["st_ino"] == 0 or record["st_mode"] > 0o7777:
+        raise ValueError("{} identity contains an invalid inode or mode".format(label))
+    if require_leaf:
+        leaf = record.get("leaf")
+        if not isinstance(leaf, str):
+            raise ValueError("{} identity leaf is invalid".format(label))
+        validate_generated_leaf(leaf)
+    return record
+
+
+def _recovery_stat_from_record(record: Dict[str, Any]) -> os.stat_result:
+    return os.stat_result(
+        (
+            stat.S_IFDIR | record["st_mode"],
+            record["st_ino"],
+            record["st_dev"],
+            1,
+            record["st_uid"],
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    )
+
+
+def _recovery_stat_signature(observed: os.stat_result) -> tuple:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_uid,
+        stat.S_IMODE(observed.st_mode),
+        stat.S_IFMT(observed.st_mode),
+    )
+
+
+def _build_recovery_plan(
+    receipt: TransactionReceipt,
+    resource: str,
+    mapping_kind,
+) -> Dict[str, Any]:
+    """Classify one recovery without mutating the receipt or either endpoint."""
+    try:
+        recorded_root_reference = receipt.data.get("recovery_of")
+        if recorded_root_reference is not None:
+            if not isinstance(recorded_root_reference, dict):
+                raise ValueError("original recovery receipt reference is invalid")
+            _validate_original_receipt_reference(receipt, recorded_root_reference)
+        if receipt.is_terminal and receipt.data.get("status") == "manual_recovery_required":
+            _receipt_reference(receipt)
+
+        exchanges = _validated_recorded_exchanges(receipt, resource)
+        selected = exchanges[resource]
+        parents = selected.get("parents")
+        before = selected.get("before")
+        after = selected.get("after")
+        if not isinstance(parents, dict) or not isinstance(before, dict) or not isinstance(after, dict):
+            raise ValueError("receipt identity map is incomplete")
+
+        left_parent = _validated_recovery_identity_record(
+            parents.get("left"),
+            label="left parent",
+            require_leaf=False,
+        )
+        right_parent = _validated_recovery_identity_record(
+            parents.get("right"),
+            label="right parent",
+            require_leaf=False,
+        )
+        left_original = _validated_recovery_identity_record(
+            before.get("left"),
+            label="left original endpoint",
+            require_leaf=True,
+        )
+        right_original = _validated_recovery_identity_record(
+            before.get("right"),
+            label="right original endpoint",
+            require_leaf=True,
+        )
+        left_after = _validated_recovery_identity_record(
+            after.get("left"),
+            label="left exchanged endpoint",
+            require_leaf=True,
+        )
+        right_after = _validated_recovery_identity_record(
+            after.get("right"),
+            label="right exchanged endpoint",
+            require_leaf=True,
+        )
+
+        left_parent_path = Path(left_parent["path"])
+        right_parent_path = Path(right_parent["path"])
+        left_leaf = left_original["leaf"]
+        right_leaf = right_original["leaf"]
+        if Path(left_original["path"]) != left_parent_path / left_leaf:
+            raise ValueError("left recovery role does not match its parent and leaf")
+        if Path(right_original["path"]) != right_parent_path / right_leaf:
+            raise ValueError("right recovery role does not match its parent and leaf")
+        if (
+            Path(left_after["path"]) != left_parent_path / left_leaf
+            or left_after["leaf"] != left_leaf
+            or Path(right_after["path"]) != right_parent_path / right_leaf
+            or right_after["leaf"] != right_leaf
+        ):
+            raise ValueError("exchanged recovery roles do not match their endpoints")
+        if (
+            _stored_identity(left_after) != _stored_identity(right_original)
+            or _stored_identity(right_after) != _stored_identity(left_original)
+            or left_after["st_uid"] != right_original["st_uid"]
+            or right_after["st_uid"] != left_original["st_uid"]
+            or left_after["st_mode"] != right_original["st_mode"]
+            or right_after["st_mode"] != left_original["st_mode"]
+        ):
+            raise ValueError("exchanged recovery identities are not an exact transposition")
+
+        left_original_stat = _recovery_stat_from_record(left_original)
+        right_original_stat = _recovery_stat_from_record(right_original)
+        _require_same_device(left_original_stat, right_original_stat)
+        descriptors = []
+        try:
+            left_parent_fd = _open_verified_directory(
+                left_parent_path,
+                expected_uid=left_parent["st_uid"],
+            )
+            descriptors.append(left_parent_fd)
+            right_parent_fd = _open_verified_directory(
+                right_parent_path,
+                expected_uid=right_parent["st_uid"],
+            )
+            descriptors.append(right_parent_fd)
+            left_parent_current = os.fstat(left_parent_fd)
+            right_parent_current = os.fstat(right_parent_fd)
+            if _identity_tuple(left_parent_current) != _stored_identity(left_parent):
+                raise RuntimeError("left parent identity changed since exchange intent")
+            if _identity_tuple(right_parent_current) != _stored_identity(right_parent):
+                raise RuntimeError("right parent identity changed since exchange intent")
+            left_current = _observe_endpoint(
+                left_parent_fd,
+                left_leaf,
+                expected_uid=left_original["st_uid"],
+                label="left recovery endpoint",
+            )
+            right_current = _observe_endpoint(
+                right_parent_fd,
+                right_leaf,
+                expected_uid=right_original["st_uid"],
+                label="right recovery endpoint",
+            )
+            _require_same_device(left_current, right_current)
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+        mapping = mapping_kind(
+            left_current,
+            right_current,
+            left_original_stat,
+            right_original_stat,
+        )
+        if mapping not in ("original", "transposed", "ambiguous"):
+            raise ValueError("recovery mapping classifier returned an invalid result")
+        return {
+            "resource": resource,
+            "selected": copy.deepcopy(selected),
+            "left_parent_path": left_parent_path,
+            "right_parent_path": right_parent_path,
+            "left_parent_owner": left_parent["st_uid"],
+            "right_parent_owner": right_parent["st_uid"],
+            "left_parent_signature": _recovery_stat_signature(left_parent_current),
+            "right_parent_signature": _recovery_stat_signature(right_parent_current),
+            "left_leaf": left_leaf,
+            "right_leaf": right_leaf,
+            "left_endpoint_owner": left_original["st_uid"],
+            "right_endpoint_owner": right_original["st_uid"],
+            "left_endpoint_signature": _recovery_stat_signature(left_current),
+            "right_endpoint_signature": _recovery_stat_signature(right_current),
+            "mapping": mapping,
+        }
+    except (KeyError, OSError, PermissionError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "recovery plan for {!r} is invalid".format(resource)
+        ) from error
+
+
+def _require_recovery_plan_current(
+    receipt: TransactionReceipt,
+    selected: Dict[str, Any],
+    plan: Dict[str, Any],
+    left_parent_stat: os.stat_result,
+    right_parent_stat: os.stat_result,
+    left_current: os.stat_result,
+    right_current: os.stat_result,
+) -> None:
+    if selected != plan["selected"]:
+        raise _RecoveryPlanStaleError("recorded exchange changed after recovery planning")
+    observed = (
+        _recovery_stat_signature(left_parent_stat),
+        _recovery_stat_signature(right_parent_stat),
+        _recovery_stat_signature(left_current),
+        _recovery_stat_signature(right_current),
+    )
+    expected = (
+        plan["left_parent_signature"],
+        plan["right_parent_signature"],
+        plan["left_endpoint_signature"],
+        plan["right_endpoint_signature"],
+    )
+    if observed != expected:
+        raise _RecoveryPlanStaleError("endpoint identity changed after recovery planning")
+
+
 def recover_recorded_exchanges(
     transaction_dir: PathLike,
     resources,
@@ -1088,7 +1351,31 @@ def recover_recorded_exchanges(
         _validate_complete_recovery_sequence(receipt, ordered_resources)
         if receipt.is_terminal and receipt.data.get("status") != "manual_recovery_required":
             return receipt, processed
-        for index, resource in enumerate(ordered_resources):
+        mapping_kind = (
+            _mapping_kind if _mapping_kind_command is None else _mapping_kind_command
+        )
+        plans = [
+            _build_recovery_plan(receipt, resource, mapping_kind)
+            for resource in ordered_resources
+        ]
+        ambiguous_plan = next(
+            (plan for plan in plans if plan["mapping"] == "ambiguous"),
+            None,
+        )
+        if ambiguous_plan is not None:
+            resource = ambiguous_plan["resource"]
+            receipt = _recover_exchange_locked(
+                current_dir,
+                resource=resource,
+                finish=True,
+                _rename_swap_command=_rename_swap_command,
+                _mapping_kind_command=_mapping_kind_command,
+                _guard=guard,
+                _validated_plan=ambiguous_plan,
+            )
+            processed.append(resource)
+            return receipt, processed
+        for index, (resource, plan) in enumerate(zip(ordered_resources, plans)):
             receipt = _recover_exchange_locked(
                 current_dir,
                 resource=resource,
@@ -1096,6 +1383,7 @@ def recover_recorded_exchanges(
                 _rename_swap_command=_rename_swap_command,
                 _mapping_kind_command=_mapping_kind_command,
                 _guard=guard,
+                _validated_plan=plan,
             )
             current_dir = receipt.transaction_dir
             processed.append(resource)
@@ -1155,6 +1443,7 @@ def _recover_exchange_locked(
     _rename_swap_command,
     _mapping_kind_command,
     _guard: _TransactionGuard,
+    _validated_plan: Optional[Dict[str, Any]] = None,
 ) -> TransactionReceipt:
     rename_swap = (
         _rename_swap_at if _rename_swap_command is None else _rename_swap_command
@@ -1276,6 +1565,9 @@ def _recover_exchange_locked(
         ):
             raise RuntimeError("right parent identity changed since exchange intent")
 
+        left_parent_current = os.fstat(left_parent_fd)
+        right_parent_current = os.fstat(right_parent_fd)
+
         left_current = _observe_endpoint(
             left_parent_fd,
             left_leaf,
@@ -1288,6 +1580,23 @@ def _recover_exchange_locked(
             expected_uid=right_endpoint_owner,
             label="right recovery endpoint",
         )
+        if _validated_plan is not None:
+            _require_recovery_plan_current(
+                receipt,
+                selected,
+                _validated_plan,
+                left_parent_current,
+                right_parent_current,
+                left_current,
+                right_current,
+            )
+    except _RecoveryPlanStaleError:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
     except (OSError, RuntimeError, ValueError) as error:
         for descriptor in reversed(descriptors):
             try:
@@ -1425,6 +1734,25 @@ def _recover_exchange_locked(
             exchanges=exchanges,
             _guard=_guard,
         )
+        left_before_exchange = _observe_endpoint(
+            left_parent_fd,
+            left_leaf,
+            expected_uid=left_endpoint_owner,
+            label="left recovery endpoint",
+        )
+        right_before_exchange = _observe_endpoint(
+            right_parent_fd,
+            right_leaf,
+            expected_uid=right_endpoint_owner,
+            label="right recovery endpoint",
+        )
+        if (
+            _recovery_stat_signature(left_before_exchange)
+            != _recovery_stat_signature(left_current)
+            or _recovery_stat_signature(right_before_exchange)
+            != _recovery_stat_signature(right_current)
+        ):
+            raise RuntimeError("endpoint identity changed immediately before recovery exchange")
         try:
             rename_swap(
                 left_parent_fd,

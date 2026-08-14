@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { test, vi } from 'vitest'
 
 import {
+  launchPublishedAtomicMacos,
   POSIX_UPDATER_RUNTIME_ASSETS,
   publishPosixUpdaterRuntime,
   validatePublishedUpdaterRuntime
@@ -268,4 +269,133 @@ test('published canonical production modules import from the external directory'
   )
 
   assert.equal(probe.status, 0, probe.stderr || probe.stdout)
+})
+
+test('trusted launcher executes verified runtime bytes for capabilities and recovery', () => {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'hermes-trusted-launch-'))
+  const runtimeRoot = path.join(root, 'runtime')
+  const transactionsRoot = path.join(root, 'transactions')
+  const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../scripts/desktop-update')
+  const transactionId = 'tx-trusted-launch'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  const binding = {
+    directoryDevice: result.directoryDevice,
+    directoryInode: result.directoryInode,
+    manifestSha256: result.manifestSha256,
+    transactionId
+  }
+  const capabilities = launchPublishedAtomicMacos({
+    binding,
+    command: 'capabilities',
+    directory: result.directory,
+    transactionsRoot
+  })
+
+  assert.equal(capabilities.status, 0, capabilities.stderr || capabilities.stdout)
+  assert.deepEqual(JSON.parse(capabilities.stdout), { commands: ['recover'], schema_version: 1 })
+  assert.equal(capabilities.stderr, '')
+
+  const live = path.join(root, 'source-live')
+  const candidate = path.join(root, 'source-candidate')
+  fs.mkdirSync(live)
+  fs.mkdirSync(candidate)
+  fs.writeFileSync(path.join(live, 'version.txt'), 'old')
+  fs.writeFileSync(path.join(candidate, 'version.txt'), 'new')
+  const fixtureResult = spawnSync(
+    '/usr/bin/python3',
+    [
+      '-c',
+      [
+        'import importlib.util, pathlib, sys',
+        'p=pathlib.Path(sys.argv[1])',
+        's=importlib.util.spec_from_file_location("trusted_launch_fixture", p)',
+        'm=importlib.util.module_from_spec(s)',
+        'sys.modules[s.name]=m',
+        's.loader.exec_module(m)',
+        'r=m.create_transaction(pathlib.Path(sys.argv[2]), sys.argv[3])',
+        'm.atomic_exchange(pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[5]), receipt=r, resource="source", finish_on_success=False)'
+      ].join(';'),
+      path.join(sourceRoot, 'atomic_macos.py'),
+      transactionsRoot,
+      transactionId,
+      live,
+      candidate
+    ],
+    { encoding: 'utf8' }
+  )
+  assert.equal(fixtureResult.status, 0, fixtureResult.stderr || fixtureResult.stdout)
+
+  const recovered = launchPublishedAtomicMacos({
+    binding,
+    command: 'recover',
+    directory: result.directory,
+    transactionId,
+    transactionsRoot
+  })
+
+  assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout)
+  assert.equal(JSON.parse(recovered.stdout).status, 'failed_rolled_back')
+  assert.equal(fs.readFileSync(path.join(live, 'version.txt'), 'utf8'), 'old')
+  assert.equal(fs.readFileSync(path.join(candidate, 'version.txt'), 'utf8'), 'new')
+})
+
+test('trusted launcher rejects a replaced Python entrypoint before it can execute', () => {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'hermes-tampered-launch-'))
+  const runtimeRoot = path.join(root, 'runtime')
+  const transactionsRoot = path.join(root, 'transactions')
+  const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../scripts/desktop-update')
+  const transactionId = 'tx-tampered-launch'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  const marker = path.join(root, 'tampered-entrypoint-executed')
+  const entrypoint = path.join(result.directory, 'atomic_macos.py')
+  const forged = [
+    'import pathlib',
+    `pathlib.Path(${JSON.stringify(marker)}).write_text("executed")`,
+    'print("{\\"ok\\":true,\\"schema_version\\":1,\\"status\\":\\"failed_rolled_back\\"}")'
+  ].join('\n')
+  fs.chmodSync(entrypoint, 0o700)
+  fs.writeFileSync(entrypoint, forged)
+  fs.chmodSync(entrypoint, 0o500)
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: result.manifestSha256,
+      transactionId
+    },
+    command: 'recover',
+    directory: result.directory,
+    transactionId,
+    transactionsRoot
+  })
+
+  assert.equal(launched.status, 64)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'runtime_validation_failed')
+  assert.equal(launched.stderr, '')
+  assert.equal(fs.existsSync(marker), false)
+})
+
+test('trusted launcher maps unsafe caller input to a bounded failure', () => {
+  const { runtimeRoot, sourceRoot } = fixture()
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId: 'tx-launch-input' })
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: result.manifestSha256,
+      transactionId: 'tx-launch-input'
+    },
+    command: 'recover',
+    directory: result.directory,
+    transactionId: '../unsafe',
+    transactionsRoot: path.dirname(runtimeRoot)
+  })
+
+  assert.equal(launched.status, 64)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'runtime_validation_failed')
+  assert.equal(Buffer.byteLength(launched.stdout) <= 4096, true)
+  assert.equal(launched.stdout.includes(path.dirname(runtimeRoot)), false)
+  assert.equal(launched.stderr, '')
 })

@@ -29,8 +29,14 @@ _RUNTIME_ASSET_MODES = {
 _DECIMAL_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _MAX_RUNTIME_MEMBER_BYTES = 16 * 1024 * 1024
-_VERIFIED_RUNTIME_BYTES = None
-_VERIFIED_RUNTIME_TRANSACTION_ID = None
+# Executing this file by pathname is self-attestation, not an authenticated launch.
+# Production callers must use the trusted publisher-side launcher, which injects
+# bytes read from already-validated file descriptors.
+DIRECT_RUNTIME_ENTRYPOINT_AUTHENTICATED = False
+_TRUSTED_RUNTIME_BOOTSTRAP = globals().get("_HERMES_TRUSTED_RUNTIME_BOOTSTRAP") is True
+_VERIFIED_RUNTIME_BYTES = globals().get("_HERMES_VERIFIED_RUNTIME_BYTES")
+_VERIFIED_RUNTIME_TRANSACTION_ID = globals().get("_HERMES_VERIFIED_RUNTIME_TRANSACTION_ID")
+_VERIFIED_RUNTIME_MODES = globals().get("_HERMES_VERIFIED_RUNTIME_MODES")
 
 
 class _RuntimeValidationError(RuntimeError):
@@ -262,9 +268,26 @@ def _emit_bootstrap_failure():
 
 if __name__ == "__main__":
     try:
-        _VERIFIED_RUNTIME_BYTES, _VERIFIED_RUNTIME_TRANSACTION_ID = _validate_external_runtime(
-            sys.argv[1:]
-        )
+        if _TRUSTED_RUNTIME_BOOTSTRAP:
+            if (
+                not isinstance(_VERIFIED_RUNTIME_BYTES, dict)
+                or not isinstance(_VERIFIED_RUNTIME_TRANSACTION_ID, str)
+                or not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+                    _VERIFIED_RUNTIME_TRANSACTION_ID,
+                )
+                or _VERIFIED_RUNTIME_MODES != _RUNTIME_ASSET_MODES
+                or set(_VERIFIED_RUNTIME_BYTES) != set(_RUNTIME_ASSET_MODES)
+                or any(
+                    not isinstance(payload, bytes)
+                    for payload in _VERIFIED_RUNTIME_BYTES.values()
+                )
+            ):
+                raise _RuntimeValidationError("trusted runtime bootstrap is invalid")
+        else:
+            _VERIFIED_RUNTIME_BYTES, _VERIFIED_RUNTIME_TRANSACTION_ID = _validate_external_runtime(
+                sys.argv[1:]
+            )
     except Exception:
         _emit_bootstrap_failure()
         raise SystemExit(64)

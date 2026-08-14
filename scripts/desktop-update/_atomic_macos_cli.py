@@ -9,7 +9,6 @@ import re
 import stat
 
 
-DEFAULT_TRANSACTIONS_ROOT = "/Users/gillettes/.local/share/.hermes-update-transactions"
 _SAFE_TRANSACTION_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _VALUE_OPTIONS = frozenset(
     {
@@ -20,7 +19,7 @@ _VALUE_OPTIONS = frozenset(
         "--transactions-root",
     }
 )
-_FLAG_OPTIONS = frozenset({"--allow-test-root", "--capabilities"})
+_FLAG_OPTIONS = frozenset({"--capabilities"})
 _TERMINAL_RECOVERED = frozenset(
     {"succeeded", "failed_unchanged", "failed_rolled_back"}
 )
@@ -155,6 +154,52 @@ def _validate_transaction_directory(transaction_dir):
             os.close(descriptor)
 
 
+def _validate_transactions_root(requested_root):
+    if not isinstance(requested_root, str) or not requested_root:
+        raise _UsageError("invalid_arguments")
+    canonical = os.path.abspath(requested_root)
+    if not os.path.isabs(requested_root) or os.path.normpath(requested_root) != requested_root:
+        raise _RecoveryError("unsafe_transactions_root")
+
+    current = Path(canonical).anchor
+    try:
+        for component in Path(canonical).parts[1:]:
+            current = os.path.join(current, component)
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                raise _RecoveryError("unsafe_transactions_root")
+        before = os.lstat(canonical)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o700
+        ):
+            raise _RecoveryError("unsafe_transactions_root")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(canonical, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
+                != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid)
+                or not stat.S_ISDIR(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or opened.st_uid != os.geteuid()
+            ):
+                raise _RecoveryError("unsafe_transactions_root")
+        finally:
+            os.close(descriptor)
+    except _RecoveryError:
+        raise
+    except (OSError, ValueError):
+        raise _RecoveryError("unsafe_transactions_root") from None
+    return Path(canonical)
+
+
 def _recover(engine, transaction_dir, resources):
     return engine.recover_recorded_exchanges(
         transaction_dir,
@@ -167,7 +212,7 @@ def main(engine, arguments, *, runtime_transaction_id):
     try:
         values, flags, positionals = _parse(arguments)
         if "--capabilities" in flags:
-            if positionals or "--transaction" in values or "--transactions-root" in values or "--allow-test-root" in flags:
+            if positionals or "--transaction" in values or "--transactions-root" in values:
                 raise _UsageError("invalid_arguments")
             _capabilities()
             return 0
@@ -182,15 +227,9 @@ def main(engine, arguments, *, runtime_transaction_id):
         ):
             raise _UsageError("invalid_transaction")
 
-        requested_root = values.get("--transactions-root", DEFAULT_TRANSACTIONS_ROOT)
-        transactions_root = os.path.abspath(requested_root)
-        if transactions_root != DEFAULT_TRANSACTIONS_ROOT and (
-            "--allow-test-root" not in flags
-            or os.environ.get("HERMES_ATOMIC_TEST_ROOT") != "1"
-        ):
-            raise _UsageError("unsafe_transactions_root")
+        transactions_root = _validate_transactions_root(values.get("--transactions-root"))
 
-        transaction_dir = Path(transactions_root) / transaction_id
+        transaction_dir = transactions_root / transaction_id
         _validate_transaction_directory(transaction_dir)
         receipt = engine.load_transaction(transaction_dir)
         if receipt.data.get("transaction_id") != transaction_id:

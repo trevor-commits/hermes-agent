@@ -533,7 +533,7 @@ except RuntimeError:
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             transactions_root = Path(raw_tmp) / "transactions"
-            transactions_root.mkdir()
+            transactions_root.mkdir(mode=0o700)
             root_identity = (
                 transactions_root.stat().st_dev,
                 transactions_root.stat().st_ino,
@@ -1946,6 +1946,205 @@ print(recovered.data["status"])
                 for live, candidate in endpoints:
                     self.assertEqual((live / "version.txt").read_text(), "new")
                     self.assertEqual((candidate / "version.txt").read_text(), "old")
+
+    def test_multi_resource_recovery_validates_every_plan_before_mutation(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-invalid-later-plan",
+            )
+            endpoints = {}
+            for resource in ("source", "app"):
+                live = root / "{}-live".format(resource)
+                candidate = root / "{}-candidate".format(resource)
+                live.mkdir()
+                candidate.mkdir()
+                (live / "version.txt").write_text("old", encoding="utf-8")
+                (candidate / "version.txt").write_text("new", encoding="utf-8")
+                atomic_macos.atomic_exchange(
+                    live,
+                    candidate,
+                    receipt=receipt,
+                    resource=resource,
+                    finish_on_success=False,
+                )
+                endpoints[resource] = (live, candidate)
+
+            exchanges = json.loads(json.dumps(receipt.data["exchanges"]))
+            exchanges["source"]["parents"] = {"corrupt": True}
+            receipt.record_phase("corrupt_later_recovery_plan", exchanges=exchanges)
+            receipt_before = receipt.path.read_bytes()
+            endpoint_before = {
+                path: (path.stat().st_dev, path.stat().st_ino, (path / "version.txt").read_bytes())
+                for pair in endpoints.values()
+                for path in pair
+            }
+
+            with self.assertRaisesRegex(ValueError, "recovery plan"):
+                atomic_macos.recover_recorded_exchanges(
+                    receipt.transaction_dir,
+                    ("app", "source"),
+                    lock_timeout_seconds=1.0,
+                )
+
+            self.assertEqual(receipt.path.read_bytes(), receipt_before)
+            for path, expected in endpoint_before.items():
+                observed = path.stat()
+                self.assertEqual(
+                    (observed.st_dev, observed.st_ino, (path / "version.txt").read_bytes()),
+                    expected,
+                )
+
+    def test_multi_resource_recovery_rejects_a_stale_later_plan_without_guessing(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-stale-later-plan",
+            )
+            endpoints = {}
+            for resource in ("source", "app"):
+                live = root / "{}-live".format(resource)
+                candidate = root / "{}-candidate".format(resource)
+                live.mkdir()
+                candidate.mkdir()
+                (live / "version.txt").write_text("old", encoding="utf-8")
+                (candidate / "version.txt").write_text("new", encoding="utf-8")
+                atomic_macos.atomic_exchange(
+                    live,
+                    candidate,
+                    receipt=receipt,
+                    resource=resource,
+                    finish_on_success=False,
+                )
+                endpoints[resource] = (live, candidate)
+
+            transaction_module = atomic_macos._transaction
+            real_recover_locked = transaction_module._recover_exchange_locked
+            source_live, source_candidate = endpoints["source"]
+            preserved_source_live = root / "preserved-source-live"
+
+            def recover_then_replace_later_endpoint(*args, **kwargs):
+                recovered = real_recover_locked(*args, **kwargs)
+                if kwargs["resource"] == "app":
+                    # This replacement occurs only after every resource passed planning.
+                    # The earlier app rollback may therefore be retained, but source must
+                    # not be exchanged from a stale plan.
+                    os.rename(source_live, preserved_source_live)
+                    source_live.mkdir()
+                    (source_live / "version.txt").write_text("unexpected", encoding="utf-8")
+                return recovered
+
+            with mock.patch.object(
+                transaction_module,
+                "_recover_exchange_locked",
+                side_effect=recover_then_replace_later_endpoint,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed after recovery planning"):
+                    atomic_macos.recover_recorded_exchanges(
+                        receipt.transaction_dir,
+                        ("app", "source"),
+                        lock_timeout_seconds=1.0,
+                    )
+
+            app_live, app_candidate = endpoints["app"]
+            self.assertEqual((app_live / "version.txt").read_text(), "old")
+            self.assertEqual((app_candidate / "version.txt").read_text(), "new")
+            self.assertEqual((source_live / "version.txt").read_text(), "unexpected")
+            self.assertEqual((preserved_source_live / "version.txt").read_text(), "new")
+            self.assertEqual((source_candidate / "version.txt").read_text(), "old")
+
+    def test_multi_resource_recovery_classifies_later_ambiguity_before_mutation(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-later-ambiguous-plan",
+            )
+            endpoints = {}
+            for resource in ("source", "app"):
+                live = root / "{}-live".format(resource)
+                candidate = root / "{}-candidate".format(resource)
+                live.mkdir()
+                candidate.mkdir()
+                (live / "version.txt").write_text("old", encoding="utf-8")
+                (candidate / "version.txt").write_text("new", encoding="utf-8")
+                atomic_macos.atomic_exchange(
+                    live,
+                    candidate,
+                    receipt=receipt,
+                    resource=resource,
+                    finish_on_success=False,
+                )
+                endpoints[resource] = (live, candidate)
+
+            source_live, source_candidate = endpoints["source"]
+            preserved_source_candidate = root / "preserved-source-candidate"
+            os.rename(source_candidate, preserved_source_candidate)
+            source_candidate.mkdir()
+            (source_candidate / "version.txt").write_text("unexpected", encoding="utf-8")
+
+            recovered, processed = atomic_macos.recover_recorded_exchanges(
+                receipt.transaction_dir,
+                ("app", "source"),
+                lock_timeout_seconds=1.0,
+            )
+
+            app_live, app_candidate = endpoints["app"]
+            self.assertEqual(recovered.data["status"], "manual_recovery_required")
+            self.assertEqual(recovered.data["failure_code"], "ambiguous_exchange_mapping")
+            self.assertEqual(processed, ["source"])
+            self.assertEqual((app_live / "version.txt").read_text(), "new")
+            self.assertEqual((app_candidate / "version.txt").read_text(), "old")
+            self.assertEqual((source_live / "version.txt").read_text(), "new")
+            self.assertEqual((source_candidate / "version.txt").read_text(), "unexpected")
+            self.assertEqual((preserved_source_candidate / "version.txt").read_text(), "old")
+
+    def test_transaction_receipt_read_is_bounded(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(
+                Path(raw_tmp) / "transactions",
+                "txn-oversized-receipt",
+            )
+            with receipt.path.open("ab") as handle:
+                handle.write(b"x" * (1024 * 1024 + 1))
+
+            with self.assertRaisesRegex(ValueError, "receipt size limit"):
+                atomic_macos.load_transaction(receipt.transaction_dir)
+
+    def test_transaction_receipt_detects_change_while_reading(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(
+                Path(raw_tmp) / "transactions",
+                "txn-changing-receipt",
+            )
+            transaction_module = atomic_macos._transaction
+            real_read = transaction_module.os.read
+            changed = False
+
+            def read_then_change(descriptor, size):
+                nonlocal changed
+                payload = real_read(descriptor, size)
+                if payload and not changed:
+                    changed = True
+                    with receipt.path.open("ab") as handle:
+                        handle.write(b" ")
+                return payload
+
+            with mock.patch.object(transaction_module.os, "read", side_effect=read_then_change):
+                with self.assertRaisesRegex(RuntimeError, "changed while reading"):
+                    atomic_macos.load_transaction(receipt.transaction_dir)
 
     def test_ambiguous_resource_recovery_preserves_other_exchange_records(self):
         atomic_macos = load_atomic_macos()

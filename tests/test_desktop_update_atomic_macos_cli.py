@@ -203,11 +203,9 @@ def run_cli(
         binding["manifest_sha256"],
         "--transactions-root",
         str(transactions_root),
-        "--allow-test-root",
         *extra,
     ]
     process_environment = os.environ.copy()
-    process_environment["HERMES_ATOMIC_TEST_ROOT"] = "1"
     if environment:
         process_environment.update(environment)
     return subprocess.run(
@@ -260,7 +258,7 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             self.assertNotIn("/Users/", result.stdout)
             self.assertNotIn("gillettes", result.stdout)
 
-    def test_test_root_override_requires_both_flag_and_environment_sentinel(self):
+    def test_recovery_requires_an_explicit_caller_selected_transactions_root(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(os.path.realpath(raw_tmp))
             runtime, binding = publish_real_runtime(root, "tx-test-root-gate")
@@ -280,19 +278,48 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 str(root / "transactions"),
             ]
 
-            missing_flag = subprocess.run(command, check=False, capture_output=True, text=True)
-            with_flag = subprocess.run(
-                command + ["--allow-test-root"],
+            selected_root = subprocess.run(command, check=False, capture_output=True, text=True)
+            missing_root = subprocess.run(
+                command[:-2],
                 check=False,
                 capture_output=True,
                 text=True,
-                env={key: value for key, value in os.environ.items() if key != "HERMES_ATOMIC_TEST_ROOT"},
             )
 
-            self.assertEqual(missing_flag.returncode, 64)
-            self.assertEqual(with_flag.returncode, 64)
-            self.assertEqual(json.loads(missing_flag.stdout)["failure_code"], "unsafe_transactions_root")
-            self.assertEqual(json.loads(with_flag.stdout)["failure_code"], "unsafe_transactions_root")
+            self.assertEqual(selected_root.returncode, 75)
+            self.assertEqual(json.loads(selected_root.stdout)["failure_code"], "unsafe_transactions_root")
+            self.assertEqual(missing_root.returncode, 64)
+            self.assertEqual(json.loads(missing_root.stdout)["failure_code"], "invalid_arguments")
+
+    def test_selected_transactions_root_must_be_canonical_owner_only_and_real(self):
+        for mutation in ("mode", "symlink", "noncanonical"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(os.path.realpath(raw_tmp))
+                runtime, binding = publish_real_runtime(root / "published", "tx-root-trust")
+                real_root = root / "transactions"
+                real_root.mkdir(mode=0o700)
+                requested_root = real_root
+                if mutation == "mode":
+                    real_root.chmod(0o750)
+                elif mutation == "symlink":
+                    requested_root = root / "transactions-link"
+                    requested_root.symlink_to(real_root, target_is_directory=True)
+                else:
+                    requested_root = real_root / ".." / "transactions"
+
+                result = run_cli(
+                    runtime,
+                    binding,
+                    "tx-root-trust",
+                    requested_root,
+                )
+
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["failure_code"],
+                    "unsafe_transactions_root",
+                )
+                self.assertEqual(result.stderr, "")
 
     def test_runtime_validation_happens_before_any_receipt_read(self):
         mutations = ("missing", "corrupt", "symlink", "digest", "inode")
@@ -445,7 +472,8 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 runtime, binding = publish_real_runtime(root / "runtime", transaction_id)
                 transactions_root = root / "transactions"
                 transaction_dir = transactions_root / transaction_id
-                transaction_dir.mkdir(parents=True, mode=0o700)
+                transactions_root.mkdir(mode=0o700)
+                transaction_dir.mkdir(mode=0o700)
                 receipt_path = transaction_dir / "receipt.json"
                 receipt_path.write_text("not valid JSON and must not be read\n", encoding="utf-8")
                 os.chmod(receipt_path, 0o600)
@@ -587,10 +615,8 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 binding["manifest_sha256"],
                 "--transactions-root",
                 str(transactions_root),
-                "--allow-test-root",
             ]
             environment = os.environ.copy()
-            environment["HERMES_ATOMIC_TEST_ROOT"] = "1"
             queued = [
                 subprocess.Popen(
                     command,
