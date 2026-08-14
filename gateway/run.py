@@ -19618,8 +19618,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to avoid false positives on transient errors like "rate limit
             # exceeded" or "invalid auth token". Matches run_agent.py's
             # own context-length classifier.
+            #
+            # A hard-ceiling block whose current user turn is VERIFIED durable
+            # (agent_persisted) has nothing left to save — treat it as context
+            # overflow even when continuity_preserved=False kept
+            # compression_exhausted unset (e.g. input_too_large, or a later
+            # explanation-persist failure). An UNVERIFIED ceiling block must
+            # still fall through to the transient branch so a genuinely
+            # unsaved user message is fallback-persisted (never lost); the
+            # duplicate-write guard below keeps that branch from re-writing a
+            # row the agent already flushed.
             is_context_overflow_failure = agent_failed_early and (
-                bool(agent_result.get("compression_exhausted"))
+                (
+                    bool(agent_result.get("hard_context_ceiling_blocked"))
+                    and bool(agent_result.get("agent_persisted"))
+                )
+                or bool(agent_result.get("compression_exhausted"))
                 or any(p in _err_str_for_classify for p in (
                     "context length", "context size", "context window",
                     "maximum context", "token limit", "too many tokens",
@@ -19632,8 +19646,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if is_context_overflow_failure:
                 logger.info(
                     "Skipping transcript persistence for context-overflow "
-                    "failure in session %s to prevent session growth loop.",
+                    "failure in session %s (reason=%s estimated=%s) to "
+                    "prevent session growth loop.",
                     session_entry.session_id,
+                    agent_result.get("compression_block_reason")
+                    or agent_result.get("error"),
+                    agent_result.get("estimated_context_tokens"),
                 )
             elif agent_failed_early:
                 logger.info(
@@ -19774,13 +19792,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Dedupe: skip if this platform message_id is already in the
                 # transcript (prevents duplicate user turns on Telegram retries
                 # after transient failures). #47237
-                _skip_persist = (
+                #
+                # Second guard: the agent's own SQLite flush stamps rows with
+                # "_db_persisted" (run_agent._DB_PERSISTED_MARKER) but never
+                # writes platform_message_id, so the #47237 lookup cannot see
+                # them. When THIS turn's rows (past history_offset) already
+                # carry a durably-flushed copy of this user message, a second
+                # gateway write is the duplicate-row shape that permanently
+                # fails _current_turn_user_is_durable and blocks auto-rollover.
+                # Compaction can prefix-merge the current turn, so match exact
+                # content or a merged row ending with it; marked compaction
+                # summaries ("_compressed_summary") never count.
+                _turn_start = agent_result.get("history_offset", len(history))
+                _turn_rows = (
+                    agent_messages[_turn_start:]
+                    if isinstance(agent_messages, list)
+                    and isinstance(_turn_start, int)
+                    and 0 <= _turn_start <= len(agent_messages)
+                    else []
+                )
+                _entry_content = _user_entry.get("content")
+                _agent_already_flushed = isinstance(_entry_content, str) and any(
+                    isinstance(row, dict)
+                    and row.get("role") == "user"
+                    and row.get("_db_persisted") is True
+                    and not row.get("_compressed_summary")
+                    and isinstance(row.get("content"), str)
+                    and (
+                        row["content"] == _entry_content
+                        or row["content"].endswith(_entry_content)
+                    )
+                    for row in _turn_rows
+                )
+                _skip_persist = _agent_already_flushed or (
                     event.message_id
                     and await self.async_session_store.has_platform_message_id(
                         session_entry.session_id, str(event.message_id)
                     )
                 )
-                if _skip_persist:
+                if _agent_already_flushed:
+                    logger.info(
+                        "Skipping gateway fallback persist in session %s — the "
+                        "agent already durably flushed this user turn "
+                        "(message_id=%s).",
+                        session_entry.session_id, event.message_id,
+                    )
+                elif _skip_persist:
                     logger.info(
                         "Skipping duplicate user turn "
                         "(message_id=%s) in session %s",
