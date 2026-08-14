@@ -41,10 +41,12 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
     CURRENT_TURN_IDENTITY_KEY,
+    CurrentTurnDurabilityReceipt,
     _compression_warrants_another_preflight_pass,
     build_turn_context,
     compose_user_api_content,
     rebind_turn_after_compression,
+    stable_message_content_digest,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
@@ -1521,39 +1523,64 @@ def _hard_context_ceiling_result(
         )
 
     if not current_user_durable and durable_fail_reason == "not_db_persisted":
-        # Verify-then-repair: compaction and sequence-repair can strip the
-        # in-memory "_db_persisted" marker from a user row whose durable copy
-        # IS in the session DB (sequence repair deliberately never inherits
-        # durability). Re-prove against authoritative storage with a strict
-        # content match; success restores the marker (preventing a duplicate
-        # re-flush) and durability. Every other failing predicate — including
-        # a genuine later user row — keeps the fail-closed refusal.
+        # Compaction can strip in-memory persistence metadata from a fresh copy
+        # of the current user row. Re-prove only the immutable row receipt that
+        # was captured when THIS turn's batch committed. A historical content
+        # match is never authority for the current turn.
         try:
             _idx = getattr(agent, "_persist_user_message_idx", None)
             _db = getattr(agent, "_session_db", None)
+            _receipt = getattr(
+                agent, "_current_turn_durability_receipt", None
+            )
+            _turn_identity = getattr(
+                agent, "_persist_user_turn_identity", None
+            )
             if (
                 _db is not None
                 and agent.session_id
                 and isinstance(_idx, int)
                 and 0 <= _idx < len(messages)
+                and isinstance(_receipt, CurrentTurnDurabilityReceipt)
+                and _receipt.session_id == str(agent.session_id)
+                and isinstance(_receipt.row_id, int)
+                and _receipt.row_id > 0
+                and _receipt.role == "user"
+                and _receipt.turn_identity == _turn_identity
+                and messages[_idx].get("role") == "user"
+                and messages[_idx].get(CURRENT_TURN_IDENTITY_KEY)
+                == _turn_identity
+                and not any(
+                    isinstance(_later, dict)
+                    and _later.get("role") == "user"
+                    and not _later.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    for _later in messages[_idx + 1 :]
+                )
             ):
-                _row_content = messages[_idx].get("content")
-                if isinstance(_row_content, str) and _row_content:
-                    _db_rows = _db.get_messages(agent.session_id)
-                    if any(
-                        isinstance(_r, dict)
-                        and _r.get("role") == "user"
-                        and _r.get("content") == _row_content
-                        for _r in _db_rows
+                _db_rows = _db.get_messages(
+                    _receipt.session_id,
+                    after_id=_receipt.row_id - 1,
+                    limit=1,
+                )
+                if len(_db_rows) == 1:
+                    _row = _db_rows[0]
+                    if (
+                        _row.get("id") == _receipt.row_id
+                        and _row.get("session_id") == _receipt.session_id
+                        and _row.get("role") == _receipt.role
+                        and stable_message_content_digest(_row.get("content"))
+                        == _receipt.content_digest
                     ):
+                        messages[_idx]["_row_id"] = _receipt.row_id
                         messages[_idx]["_db_persisted"] = True
                         current_user_durable = True
                         durable_fail_reason = "repaired_from_db"
                         logger.info(
-                            "Durable-continuity repair: current user turn found "
-                            "in the session DB for session=%s; restored the "
-                            "lost _db_persisted marker.",
+                            "Durable-continuity repair: exact current-turn row "
+                            "receipt verified for session=%s row=%d; restored "
+                            "lost persistence metadata.",
                             agent.session_id or "none",
+                            _receipt.row_id,
                         )
         except Exception:
             logger.debug(
@@ -3486,7 +3513,7 @@ def run_conversation(
 
                         _reclaimed = truncate_oversized_tool_results(
                             api_messages,
-                            reclaim_chars=_trim_deficit * 4 + 2048,
+                            reclaim_chars=_trim_deficit * 4 + 128,
                             mirror=messages,
                         )
                         if _reclaimed > 0:

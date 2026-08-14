@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import asdict, replace
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,7 +195,7 @@ def test_pre_api_compression_rebinds_before_next_iteration_hard_ceiling(
 def test_execution_middleware_cannot_expand_stalled_turn_over_ceiling(
     monkeypatch, tmp_path
 ):
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
     history = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -309,7 +310,7 @@ def test_boolean_success_without_current_user_durability_is_not_authoritative(
 def test_failed_terminal_explanation_persist_disables_rollover_without_user_duplication(
     monkeypatch, tmp_path
 ):
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     turn_identity = "hard-ceiling-e2e:current-turn"
     messages = [
         {
@@ -321,6 +322,12 @@ def test_failed_terminal_explanation_persist_disables_rollover_without_user_dupl
     ]
     agent._persist_user_message_idx = 0
     agent._persist_user_turn_identity = turn_identity
+    agent._ensure_db_session()
+    row_id = db.append_message(agent.session_id, "user", content="durable user")
+    messages[0]["_row_id"] = row_id
+    agent._current_turn_durability_receipt = _durability_receipt(
+        agent, row_id, "durable user", turn_identity
+    )
 
     from agent.conversation_loop import _hard_context_ceiling_result
 
@@ -378,7 +385,7 @@ def test_single_oversized_current_input_never_calls_provider_or_rolls_session(
 def test_execution_middleware_cannot_shrink_oversized_input_past_terminal_guard(
     monkeypatch, tmp_path
 ):
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
     oversized_input = "x" * 8_000
 
@@ -483,7 +490,7 @@ def test_committed_compression_rebinds_current_turn_before_hard_ceiling(
         rebind_turn_after_compression,
     )
 
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     turn_identity = "hard-ceiling-e2e:compressed-current-turn"
     original_messages = [
         {
@@ -509,6 +516,13 @@ def test_committed_compression_rebinds_current_turn_before_hard_ceiling(
 
     agent._persist_user_message_idx = 8
     agent._persist_user_turn_identity = turn_identity
+    agent._ensure_db_session()
+    row_id = db.append_message(agent.session_id, "user", content="active ask")
+    original_messages[8]["_row_id"] = row_id
+    compressed_messages[6]["_row_id"] = row_id
+    agent._current_turn_durability_receipt = _durability_receipt(
+        agent, row_id, "active ask", turn_identity
+    )
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = True
 
@@ -543,7 +557,7 @@ def test_compression_rebind_missing_identity_remains_fail_closed(
     from agent.conversation_loop import _hard_context_ceiling_result
     from agent.turn_context import rebind_turn_after_compression
 
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     messages = [
         {
             "role": "user",
@@ -671,7 +685,7 @@ def test_later_compaction_summary_does_not_revoke_current_turn_durability(
     from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
     from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
 
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     turn_identity = "hard-ceiling:active-turn-before-summary"
     messages = [
         {
@@ -689,6 +703,12 @@ def test_later_compaction_summary_does_not_revoke_current_turn_durability(
     ]
     agent._persist_user_message_idx = 0
     agent._persist_user_turn_identity = turn_identity
+    agent._ensure_db_session()
+    row_id = db.append_message(agent.session_id, "user", content="active ask")
+    messages[0]["_row_id"] = row_id
+    agent._current_turn_durability_receipt = _durability_receipt(
+        agent, row_id, "active ask", turn_identity
+    )
 
     assert agent._current_turn_user_is_durable(messages) is True
 
@@ -749,21 +769,28 @@ def test_current_turn_durability_names_its_failing_predicate(
 ):
     """The durability check must say WHY it refused rollover authority so a
     live hard-ceiling block line is diagnosable (durable_fail=<reason>)."""
-    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent, db = _make_agent(monkeypatch, tmp_path)
     idx, identity, messages, expected_bool, expected_reason = _durability_case(kind)
     agent._persist_user_message_idx = idx
     agent._persist_user_turn_identity = identity
+    if kind == "ok":
+        agent._ensure_db_session()
+        row_id = db.append_message(
+            agent.session_id, "user", content=messages[idx]["content"]
+        )
+        messages[idx]["_row_id"] = row_id
+        agent._current_turn_durability_receipt = _durability_receipt(
+            agent, row_id, messages[idx]["content"], identity
+        )
 
     assert agent._current_turn_user_is_durable(messages) is expected_bool
     assert agent._current_turn_durability_fail_reason == expected_reason
 
 
-def test_lost_marker_with_db_row_is_repaired_and_authorizes_rollover(
+def test_historical_identical_content_cannot_authorize_current_turn(
     monkeypatch, tmp_path
 ):
-    """Compaction can strip the in-memory _db_persisted marker from a user row
-    whose durable copy IS in the session DB. The verify-then-repair step must
-    re-prove against the DB, restore the marker, and re-authorize rollover."""
+    """An older same-content row is not proof that this turn was committed."""
     from agent.conversation_loop import _hard_context_ceiling_result
     from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
 
@@ -792,11 +819,152 @@ def test_lost_marker_with_db_row_is_repaired_and_authorizes_rollover(
             block_reason="compression_stalled",
         )
 
+    assert messages[0].get("_db_persisted") is not True
+    assert result["continuity_preserved"] is False
+    assert result["compression_exhausted"] is False
+    assert result["rollover_safe"] is False
+    assert result["agent_persisted"] is False
+
+
+def _durability_receipt(agent, row_id, content, turn_identity):
+    from agent.turn_context import (
+        CurrentTurnDurabilityReceipt,
+        stable_message_content_digest,
+    )
+
+    return CurrentTurnDurabilityReceipt(
+        session_id=agent.session_id,
+        row_id=row_id,
+        role="user",
+        content_digest=stable_message_content_digest(content),
+        turn_identity=turn_identity,
+    )
+
+
+def test_exact_current_row_receipt_repairs_lost_marker(monkeypatch, tmp_path):
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    db.append_message(agent.session_id, "user", content="active ask")
+    current_row_id = db.append_message(
+        agent.session_id, "user", content="active ask"
+    )
+    turn_identity = "hard-ceiling-e2e:exact-repair-turn"
+    messages = [
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+    agent._current_turn_durability_receipt = _durability_receipt(
+        agent, current_row_id, "active ask", turn_identity
+    )
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
     assert messages[0]["_db_persisted"] is True
+    assert messages[0]["_row_id"] == current_row_id
     assert result["continuity_preserved"] is True
     assert result["compression_exhausted"] is True
     assert result["rollover_safe"] is True
     assert result["agent_persisted"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("session_id", "different-session"),
+        ("row_id", -1),
+        ("role", "assistant"),
+        ("content_digest", "0" * 64),
+        ("turn_identity", "different-turn"),
+    ],
+)
+def test_inconsistent_current_turn_receipt_fails_closed(
+    monkeypatch, tmp_path, field, bad_value
+):
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    row_id = db.append_message(agent.session_id, "user", content="active ask")
+    turn_identity = "hard-ceiling-e2e:receipt-validation"
+    messages = [
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+    receipt = _durability_receipt(agent, row_id, "active ask", turn_identity)
+    agent._current_turn_durability_receipt = replace(
+        receipt, **{field: bad_value}
+    )
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
+    assert result["continuity_preserved"] is False
+    assert result["agent_persisted"] is False
+
+
+def test_batch_persist_captures_exact_current_turn_receipt(monkeypatch, tmp_path):
+    from agent.turn_context import (
+        CURRENT_TURN_IDENTITY_KEY,
+        stable_message_content_digest,
+    )
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    turn_identity = "hard-ceiling-e2e:captured-receipt"
+    messages = [
+        {
+            "role": "user",
+            "content": "persist me",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+    agent._current_turn_durability_receipt = None
+
+    assert agent._persist_session(messages, []) is True
+
+    receipt = agent._current_turn_durability_receipt
+    row = db.get_messages(agent.session_id)[-1]
+    assert asdict(receipt) == {
+        "session_id": agent.session_id,
+        "row_id": row["id"],
+        "role": "user",
+        "content_digest": stable_message_content_digest("persist me"),
+        "turn_identity": turn_identity,
+    }
+    assert messages[0]["_row_id"] == row["id"]
 
 
 def test_lost_marker_without_db_row_stays_fail_closed(monkeypatch, tmp_path):
@@ -999,7 +1167,7 @@ def test_truncate_helper_skips_summaries_and_mirrors_twins():
         keep_head_chars=100,
     )
 
-    assert reclaimed > 0
+    assert reclaimed == 1_000
     assert LAST_MILE_TRIM_MARKER in api_row["content"]
     assert api_row["content"] == mirror_twin["content"]
     assert summary["content"] == "z" * 5_000
@@ -1010,3 +1178,35 @@ def test_truncate_helper_skips_summaries_and_mirrors_twins():
         )
         == 0
     )
+
+
+def test_one_token_trim_deficit_is_proportional():
+    from agent.context_compressor import (
+        LAST_MILE_TRIM_MARKER,
+        truncate_oversized_tool_results,
+    )
+
+    original = "x" * 8_000
+    row = {"role": "tool", "content": original}
+    reclaimed = truncate_oversized_tool_results([row], reclaim_chars=132)
+
+    assert reclaimed == 132
+    assert len(original) - len(row["content"]) == 132
+    assert row["content"].endswith(LAST_MILE_TRIM_MARKER)
+    assert len(row["content"].split("\n", 1)[0]) >= 1_500
+
+
+def test_multiple_trim_candidates_stop_at_cumulative_target():
+    from agent.context_compressor import truncate_oversized_tool_results
+
+    rows = [
+        {"role": "tool", "content": "a" * 2_000},
+        {"role": "tool", "content": "b" * 2_000},
+    ]
+
+    reclaimed = truncate_oversized_tool_results(
+        rows, reclaim_chars=600, keep_head_chars=1_500
+    )
+
+    assert reclaimed == 600
+    assert sum(2_000 - len(row["content"]) for row in rows) == 600

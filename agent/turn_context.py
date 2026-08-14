@@ -25,6 +25,8 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import threading
 import time
 import uuid
@@ -52,6 +54,29 @@ logger = logging.getLogger(__name__)
 
 
 CURRENT_TURN_IDENTITY_KEY = "_current_turn_identity"
+
+
+@dataclass(frozen=True)
+class CurrentTurnDurabilityReceipt:
+    """Immutable proof binding one logical turn to one committed DB row."""
+
+    session_id: str
+    row_id: int
+    role: str
+    content_digest: str
+    turn_identity: str
+
+
+def stable_message_content_digest(content: Any) -> str:
+    """Return a type-preserving stable digest for persisted message content."""
+    payload = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def carry_current_turn_identity(
@@ -633,6 +658,7 @@ def build_turn_context(
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
+    agent._current_turn_durability_receipt = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     # Generate unique task_id if not provided to isolate VMs between tasks.
