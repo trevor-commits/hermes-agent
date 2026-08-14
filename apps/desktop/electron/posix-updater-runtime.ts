@@ -14,6 +14,7 @@ export interface RuntimeAsset {
 export const POSIX_UPDATER_RUNTIME_ASSETS: readonly RuntimeAsset[] = Object.freeze([
   Object.freeze({ source: 'posix.sh', target: 'posix.sh', executable: true }),
   Object.freeze({ source: 'atomic_macos.py', target: 'atomic_macos.py', executable: true }),
+  Object.freeze({ source: '_atomic_macos_cli.py', target: '_atomic_macos_cli.py', executable: false }),
   Object.freeze({
     source: '_atomic_macos_transaction.py',
     target: '_atomic_macos_transaction.py',

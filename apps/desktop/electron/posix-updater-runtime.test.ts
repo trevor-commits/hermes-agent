@@ -51,6 +51,11 @@ test('publishes the canonical runtime with an inode and manifest trust anchor', 
   assert.equal(fs.statSync(runtimeRoot).mode & 0o777, 0o700)
   assert.equal(Number(directoryStat.mode & 0o777n), 0o700)
   assert.equal(fs.statSync(result.entrypoint).mode & 0o777, 0o500)
+  assert.equal(fs.statSync(path.join(result.directory, '_atomic_macos_cli.py')).mode & 0o777, 0o400)
+  assert.equal(
+    POSIX_UPDATER_RUNTIME_ASSETS.some(asset => asset.target === '_atomic_macos_cli.py' && asset.executable === false),
+    true
+  )
   assert.deepEqual(
     result.manifest.files.map(item => item.path),
     expectedPaths
