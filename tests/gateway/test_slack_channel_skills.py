@@ -53,6 +53,20 @@ class TestSlackResolveChannelSkills:
         })
         assert _resolve(adapter, "D0ABC") is None
 
+    def test_exact_channel_beats_parent_regardless_of_config_order(self):
+        for bindings in (
+            [
+                {"id": "PARENT", "skill": "parent-skill"},
+                {"id": "THREAD", "skill": "exact-skill"},
+            ],
+            [
+                {"id": "THREAD", "skill": "exact-skill"},
+                {"id": "PARENT", "skill": "parent-skill"},
+            ],
+        ):
+            adapter = _make_adapter({"channel_skill_bindings": bindings})
+            assert _resolve(adapter, "THREAD", "PARENT") == ["exact-skill"]
+
 
 class TestSlackMessageEventAutoSkill:
     """Integration-style test: verify auto_skill propagates to MessageEvent."""
