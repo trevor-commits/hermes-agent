@@ -4168,6 +4168,53 @@ def _gateway_rollover_is_authorized(agent_result: dict) -> bool:
     )
 
 
+def _build_proactive_rollover_carryover(
+    agent_messages: Any,
+    *,
+    old_session_id: str,
+    max_chars: int = 3500,
+) -> str:
+    """Build the deterministic carryover digest for a proactive rollover.
+
+    Free (no LLM call): reuses the newest compacted summary when the session
+    already produced one, then appends the last few real user asks and the
+    final assistant reply, all truncated. Full history stays saved in the old
+    session — this digest only primes the fresh one.
+    """
+    parts = [
+        f"[CONTEXT CARRYOVER — continued from session {old_session_id}]",
+    ]
+    rows = [r for r in (agent_messages or []) if isinstance(r, dict)]
+    for row in reversed(rows):
+        if (
+            row.get("_compressed_summary")
+            and isinstance(row.get("content"), str)
+            and row["content"].strip()
+        ):
+            parts.append(row["content"][:2500])
+            break
+    real_users = [
+        r
+        for r in rows
+        if r.get("role") == "user"
+        and not r.get("_compressed_summary")
+        and isinstance(r.get("content"), str)
+        and r["content"].strip()
+    ]
+    for row in real_users[-3:]:
+        parts.append("User asked: " + row["content"][:300])
+    assistants = [
+        r
+        for r in rows
+        if r.get("role") == "assistant"
+        and isinstance(r.get("content"), str)
+        and r["content"].strip()
+    ]
+    if assistants:
+        parts.append("Last reply: " + assistants[-1]["content"][:400])
+    return "\n".join(parts)[:max_chars]
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -20617,6 +20664,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+
+            # Proactive rollover (opt-in, gateway.proactive_rollover_enabled):
+            # at this point the turn SUCCEEDED, every transcript write for it
+            # landed in the current session, and nothing has been delivered
+            # yet — a safe boundary. When real provider-reported usage has
+            # reached the soft threshold and nothing is queued for this
+            # session, roll to a fresh session now instead of letting the
+            # chat coast into the 30K hard ceiling mid-task. Carries a free
+            # deterministic digest; full history stays saved in the old
+            # session (never deleted).
+            try:
+                if (
+                    getattr(self.config, "proactive_rollover_enabled", False)
+                    and not agent_failed_early
+                    and not hidden_reasoning_incomplete
+                    and not is_context_overflow_failure
+                    and session_entry
+                    and session_key
+                    and not self._pending_messages.get(session_key)
+                ):
+                    _pr_threshold = int(
+                        getattr(
+                            self.config,
+                            "proactive_rollover_threshold_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                    _pr_used = int(agent_result.get("last_prompt_tokens") or 0)
+                    if _pr_threshold > 0 and _pr_used >= _pr_threshold:
+                        _pr_old_id = session_entry.session_id
+                        _pr_digest = _build_proactive_rollover_carryover(
+                            agent_messages, old_session_id=_pr_old_id
+                        )
+                        new_entry = await self.async_session_store.reset_session(
+                            session_key
+                        )
+                        self._evict_cached_agent(session_key)
+                        self._clear_conversation_scope(
+                            session_key, reason="proactive_rollover"
+                        )
+                        if new_entry is not None:
+                            session_entry = new_entry
+                            await asyncio.to_thread(
+                                self._sync_telegram_topic_binding,
+                                source,
+                                session_entry,
+                                reason="proactive-rollover",
+                            )
+                            await self.async_session_store.append_to_transcript(
+                                session_entry.session_id,
+                                {
+                                    "role": "user",
+                                    "content": _pr_digest,
+                                    "_compressed_summary": True,
+                                    "display_kind": "hidden",
+                                    "timestamp": time.time(),
+                                },
+                            )
+                        logger.info(
+                            "Proactive rollover: session %s reached %d prompt "
+                            "tokens (threshold %d); rolled to fresh session %s "
+                            "with a carryover digest.",
+                            _pr_old_id,
+                            _pr_used,
+                            _pr_threshold,
+                            session_entry.session_id,
+                        )
+                        response = (response or "") + (
+                            f"\n\n🔄 Rolled to a fresh session — this chat "
+                            f"reached ~{_pr_used:,} prompt tokens (soft "
+                            f"threshold {_pr_threshold:,}). A compact summary "
+                            "was carried over; full history stays saved in "
+                            "the previous session."
+                        )
+            except Exception:
+                logger.exception(
+                    "Proactive rollover failed for session %s — continuing "
+                    "with the current session.",
+                    getattr(session_entry, "session_id", "?"),
+                )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
