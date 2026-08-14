@@ -1240,6 +1240,7 @@ def _hard_context_ceiling_result(
 ) -> Dict[str, Any]:
     """Return a truthful terminal result without sacrificing saved history."""
     current_user_durable = False
+    durable_fail_reason = "unverified"
     try:
         persisted = agent._persist_session(messages, conversation_history)
         verify_current_user = getattr(
@@ -1248,7 +1249,14 @@ def _hard_context_ceiling_result(
         current_user_durable = (
             persisted is True and verify_current_user(messages) is True
         )
+        if persisted is not True:
+            durable_fail_reason = "session_persist_failed"
+        else:
+            durable_fail_reason = getattr(
+                agent, "_current_turn_durability_fail_reason", "unverified"
+            )
     except Exception:
+        durable_fail_reason = "persist_exception"
         logger.exception(
             "Hard context ceiling blocked provider send, but session persistence "
             "could not be verified (session=%s)",
@@ -1324,15 +1332,36 @@ def _hard_context_ceiling_result(
         agent._flush_status_buffer()
     except Exception:
         pass
+    if continuity_preserved:
+        durable_fail_reason = "ok"
+    elif durable_fail_reason == "ok":
+        durable_fail_reason = "explanation_persist_failed"
     logger.error(
         "Provider send blocked by hard context ceiling: estimated=%d ceiling=%d "
-        "reason=%s session=%s continuity_preserved=%s",
+        "reason=%s session=%s continuity_preserved=%s durable_fail=%s",
         estimated_tokens,
         ceiling_tokens,
         block_reason,
         agent.session_id or "none",
         continuity_preserved,
+        durable_fail_reason,
     )
+    try:
+        _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+        _sys_est = estimate_tokens_rough(_sys_prompt)
+        _hist_est = estimate_messages_tokens_rough(messages)
+        logger.info(
+            "Hard-ceiling composition: estimated=%d system=%d history=%d "
+            "msgs=%d other=%d session=%s",
+            estimated_tokens,
+            _sys_est,
+            _hist_est,
+            len(messages),
+            max(0, estimated_tokens - _sys_est - _hist_est),
+            agent.session_id or "none",
+        )
+    except Exception:
+        pass
     return {
         "final_response": final,
         "messages": messages,

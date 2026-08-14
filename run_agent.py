@@ -1952,28 +1952,42 @@ class AIAgent:
             return _persist_and_drain()
 
     def _current_turn_user_is_durable(self, messages: List[Dict]) -> bool:
-        """Verify the exact current user row reached the canonical session DB."""
-        idx = getattr(self, "_persist_user_message_idx", None)
-        turn_identity = getattr(self, "_persist_user_turn_identity", None)
-        if not isinstance(idx, int) or not (0 <= idx < len(messages)):
-            return False
-        if not isinstance(turn_identity, str) or not turn_identity:
-            return False
+        """Verify the exact current user row reached the canonical session DB.
+
+        Also records which predicate refused (or "ok") on
+        ``_current_turn_durability_fail_reason`` so hard-ceiling block logs can
+        name why rollover authority was withheld. Pure observability — the
+        fail-closed boolean behavior is unchanged.
+        """
         from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
 
-        message = messages[idx]
-        return bool(
-            isinstance(message, dict)
-            and message.get("role") == "user"
-            and message.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
-            and message.get(_DB_PERSISTED_MARKER) is True
-            and not any(
+        idx = getattr(self, "_persist_user_message_idx", None)
+        turn_identity = getattr(self, "_persist_user_turn_identity", None)
+        reason = "ok"
+        durable = False
+        if not isinstance(idx, int) or not (0 <= idx < len(messages)):
+            reason = "idx_out_of_range"
+        elif not isinstance(turn_identity, str) or not turn_identity:
+            reason = "identity_missing"
+        else:
+            message = messages[idx]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                reason = "wrong_role"
+            elif message.get(CURRENT_TURN_IDENTITY_KEY) != turn_identity:
+                reason = "identity_mismatch"
+            elif message.get(_DB_PERSISTED_MARKER) is not True:
+                reason = "not_db_persisted"
+            elif any(
                 isinstance(later, dict)
                 and later.get("role") == "user"
                 and not later.get(COMPRESSED_SUMMARY_METADATA_KEY)
                 for later in messages[idx + 1 :]
-            )
-        )
+            ):
+                reason = "later_unmarked_user_row"
+            else:
+                durable = True
+        self._current_turn_durability_fail_reason = reason
+        return durable
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
