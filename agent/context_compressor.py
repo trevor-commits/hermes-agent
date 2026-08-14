@@ -2589,6 +2589,14 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        # Last-mile deterministic trim (hard-ceiling terminal guard in
+        # conversation_loop): when a blocked request is only a small deficit
+        # over the ceiling, one free truncation pass over the largest tool
+        # results retries the send instead of failing the turn. Separate from
+        # max_attempts — a no-LLM pass must never consume the model-backed
+        # compression budget. Overridden from config by agent_init.
+        self.max_deterministic_attempts: int = 1
+        self.deterministic_trim_max_deficit_tokens: int = 4000
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -7388,3 +7396,67 @@ def is_user_originated_turn(message: Any) -> bool:
     if ContextCompressor._is_synthetic_compression_user_turn(message):
         return False
     return ContextCompressor._is_actionable_user_turn(message)
+
+
+LAST_MILE_TRIM_MARKER = (
+    "[…truncated by last-mile context trim; the full output is retained in "
+    "session storage]"
+)
+
+
+def truncate_oversized_tool_results(
+    messages: List[Dict[str, Any]],
+    *,
+    reclaim_chars: int,
+    mirror: Optional[List[Dict[str, Any]]] = None,
+    keep_head_chars: int = 1500,
+) -> int:
+    """Deterministically truncate the largest tool-result contents in place.
+
+    Free (no LLM call) and durably lossless: the session DB keeps every full
+    tool output — only the in-flight prompt copies shrink. Structure is
+    preserved (no message dropped or reordered, so role alternation and
+    tool_call pairing stay intact). Skips marked compaction summaries,
+    non-string contents, and rows already carrying the trim marker. When
+    ``mirror`` is given, rows there whose content byte-matches a truncated
+    row are truncated identically — ``api_messages`` and the live transcript
+    list can hold separate dict copies of the same tool result.
+
+    Returns the number of characters removed across ``messages`` (mirror
+    reclaim is not double-counted).
+    """
+    if reclaim_chars <= 0:
+        return 0
+    candidates = []
+    for row in messages:
+        if not isinstance(row, dict) or row.get("role") != "tool":
+            continue
+        if row.get(COMPRESSED_SUMMARY_METADATA_KEY):
+            continue
+        content = row.get("content")
+        if not isinstance(content, str):
+            continue
+        if LAST_MILE_TRIM_MARKER in content:
+            continue
+        if len(content) <= keep_head_chars + len(LAST_MILE_TRIM_MARKER):
+            continue
+        candidates.append(row)
+    candidates.sort(key=lambda r: len(r.get("content") or ""), reverse=True)
+    reclaimed = 0
+    for row in candidates:
+        if reclaimed >= reclaim_chars:
+            break
+        original = row["content"]
+        truncated = original[:keep_head_chars] + "\n" + LAST_MILE_TRIM_MARKER
+        row["content"] = truncated
+        reclaimed += len(original) - len(truncated)
+        if mirror:
+            for twin in mirror:
+                if (
+                    isinstance(twin, dict)
+                    and twin is not row
+                    and twin.get("role") == "tool"
+                    and twin.get("content") == original
+                ):
+                    twin["content"] = truncated
+    return reclaimed

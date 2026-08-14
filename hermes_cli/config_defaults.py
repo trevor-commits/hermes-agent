@@ -667,6 +667,18 @@ DEFAULT_CONFIG = {
                                       # for a full trigger-sized token runway to
                                       # regrow before rearming. Keeps prompt-cache
                                       # breaks episodic. 0 = no minimum-savings gate.
+        "max_deterministic_attempts": 1,  # last-mile trim passes allowed per provider
+                                      # send when a hard-ceiling block lands only a
+                                      # small deficit over the ceiling: one free,
+                                      # no-LLM truncation of the largest tool results
+                                      # retries the send instead of failing the turn.
+                                      # Never consumes the model-backed max_attempts
+                                      # budget above. 0 = disabled.
+        "deterministic_trim_max_deficit_tokens": 4000,  # the last-mile trim only
+                                      # fires when the blocked estimate exceeds the
+                                      # ceiling by at most this many tokens; larger
+                                      # overshoots fail closed as before (a trim big
+                                      # enough to close them would gut the prompt).
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead

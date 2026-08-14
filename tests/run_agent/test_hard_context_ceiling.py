@@ -756,3 +756,257 @@ def test_current_turn_durability_names_its_failing_predicate(
 
     assert agent._current_turn_user_is_durable(messages) is expected_bool
     assert agent._current_turn_durability_fail_reason == expected_reason
+
+
+def test_lost_marker_with_db_row_is_repaired_and_authorizes_rollover(
+    monkeypatch, tmp_path
+):
+    """Compaction can strip the in-memory _db_persisted marker from a user row
+    whose durable copy IS in the session DB. The verify-then-repair step must
+    re-prove against the DB, restore the marker, and re-authorize rollover."""
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    db.append_message(agent.session_id, "user", content="active ask")
+    turn_identity = "hard-ceiling-e2e:repair-turn"
+    messages = [
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
+    assert messages[0]["_db_persisted"] is True
+    assert result["continuity_preserved"] is True
+    assert result["compression_exhausted"] is True
+    assert result["rollover_safe"] is True
+    assert result["agent_persisted"] is True
+
+
+def test_lost_marker_without_db_row_stays_fail_closed(monkeypatch, tmp_path):
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    turn_identity = "hard-ceiling-e2e:no-db-row"
+    messages = [
+        {
+            "role": "user",
+            "content": "never reached storage",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
+    assert messages[0].get("_db_persisted") is not True
+    assert result["continuity_preserved"] is False
+    assert result["compression_exhausted"] is False
+    assert result["rollover_safe"] is False
+
+
+def test_later_real_user_row_is_never_repaired(monkeypatch, tmp_path):
+    """A genuine later user row means unprocessed input — the DB re-proof must
+    not run for that predicate and rollover stays refused."""
+    from agent.conversation_loop import _hard_context_ceiling_result
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    db.append_message(agent.session_id, "user", content="active ask")
+    db.append_message(agent.session_id, "user", content="a second real ask")
+    turn_identity = "hard-ceiling-e2e:later-row"
+    messages = [
+        {
+            "role": "user",
+            "content": "active ask",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+            "_db_persisted": True,
+        },
+        {"role": "user", "content": "a second real ask"},
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+
+    with patch.object(agent, "_persist_session", return_value=True):
+        result = _hard_context_ceiling_result(
+            agent,
+            messages,
+            [],
+            0,
+            estimated_tokens=2_000,
+            ceiling_tokens=1_000,
+            block_reason="compression_stalled",
+        )
+
+    assert result["continuity_preserved"] is False
+    assert result["compression_exhausted"] is False
+    assert result["rollover_safe"] is False
+
+
+def _tool_loop_history(tool_chars: int) -> list[dict]:
+    return [
+        {"role": "user", "content": "please run the tool"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "t1",
+                    "type": "function",
+                    "function": {"name": "web_extract", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": "x" * tool_chars},
+        {"role": "assistant", "content": "tool digested"},
+    ]
+
+
+def _kwargs_content_estimate(request):
+    msgs = request.get("messages", []) if isinstance(request, dict) else []
+    return sum(len(str(m.get("content") or "")) for m in msgs) // 4
+
+
+def test_last_mile_trim_converges_small_overshoot(monkeypatch, tmp_path):
+    """A block within the deficit window gets one free truncation pass and the
+    provider send then succeeds — no model-backed compression spent on it."""
+    from agent.context_compressor import LAST_MILE_TRIM_MARKER
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent.context_compressor.threshold_tokens = 1_000
+    history = _tool_loop_history(6_000)
+
+    def _no_progress(messages, system_message, **_kwargs):
+        return messages, agent._cached_system_prompt
+
+    with (
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            return_value=1_500,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=1_500,
+        ),
+        patch(
+            "agent.conversation_loop._provider_request_tokens_rough",
+            side_effect=_kwargs_content_estimate,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_no_progress),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("continue", conversation_history=history)
+
+    agent.client.chat.completions.create.assert_called_once()
+    assert result.get("hard_context_ceiling_blocked") is not True
+    assert result["completed"] is True
+    assert any(
+        m.get("role") == "tool" and LAST_MILE_TRIM_MARKER in str(m.get("content"))
+        for m in result["messages"]
+    )
+
+
+def test_last_mile_trim_skips_large_deficit(monkeypatch, tmp_path):
+    """Overshoots beyond the deficit window still fail closed untouched."""
+    from agent.context_compressor import LAST_MILE_TRIM_MARKER
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent.context_compressor.threshold_tokens = 1_000
+    history = _tool_loop_history(40_000)
+
+    def _no_progress(messages, system_message, **_kwargs):
+        return messages, agent._cached_system_prompt
+
+    with (
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            return_value=10_000,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=10_000,
+        ),
+        patch(
+            "agent.conversation_loop._provider_request_tokens_rough",
+            side_effect=_kwargs_content_estimate,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_no_progress),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("continue", conversation_history=history)
+
+    agent.client.chat.completions.create.assert_not_called()
+    assert result["hard_context_ceiling_blocked"] is True
+    assert not any(
+        LAST_MILE_TRIM_MARKER in str(m.get("content"))
+        for m in result["messages"]
+        if m.get("role") == "tool"
+    )
+
+
+def test_truncate_helper_skips_summaries_and_mirrors_twins():
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        LAST_MILE_TRIM_MARKER,
+        truncate_oversized_tool_results,
+    )
+
+    big = "y" * 5_000
+    api_row = {"role": "tool", "tool_call_id": "t", "content": big}
+    summary = {
+        "role": "tool",
+        "content": "z" * 5_000,
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+    }
+    small = {"role": "tool", "content": "tiny"}
+    mirror_twin = {"role": "tool", "tool_call_id": "t", "content": big}
+
+    reclaimed = truncate_oversized_tool_results(
+        [api_row, summary, small],
+        reclaim_chars=1_000,
+        mirror=[mirror_twin],
+        keep_head_chars=100,
+    )
+
+    assert reclaimed > 0
+    assert LAST_MILE_TRIM_MARKER in api_row["content"]
+    assert api_row["content"] == mirror_twin["content"]
+    assert summary["content"] == "z" * 5_000
+    assert small["content"] == "tiny"
+    assert (
+        truncate_oversized_tool_results(
+            [api_row], reclaim_chars=1_000, keep_head_chars=100
+        )
+        == 0
+    )
