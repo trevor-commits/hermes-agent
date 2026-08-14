@@ -807,6 +807,25 @@ class TestLoadGatewayConfig:
             "bridged into PlatformConfig.extra by the shared-key loop"
         )
 
+    def test_bridges_telegram_channel_skill_bindings(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    channel_skill_bindings:\n"
+            "      - id: '-5551733823'\n"
+            "        skill: source-card-intake\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["channel_skill_bindings"] == [
+            {"id": "-5551733823", "skill": "source-card-intake"}
+        ]
+
 
     def test_bridges_unauthorized_dm_behavior_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
