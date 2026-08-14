@@ -10,9 +10,13 @@ of the last turn on the next attempt.
 
 The gateway classifier must distinguish:
 
-* ``compression_exhausted=True`` OR context-keyword errors OR a generic
-  ``400`` on a long history  → context-overflow → skip transcript
-* everything else that fails → transient → persist the user message
+* verified hard-ceiling blocks (``hard_context_ceiling_blocked=True`` AND
+  ``agent_persisted=True``) OR ``compression_exhausted=True`` OR
+  context-keyword errors OR a generic ``400`` on a long history
+  → context-overflow → skip transcript
+* everything else that fails — including an UNVERIFIED hard-ceiling block,
+  whose user message may genuinely be unsaved → transient → persist the
+  user message (the duplicate-flush guard handles the already-saved case)
 """
 
 
@@ -24,7 +28,11 @@ def _classify(agent_result: dict, history_len: int) -> tuple[bool, bool]:
     agent_failed_early = bool(agent_result.get("failed"))
     err = str(agent_result.get("error", "")).lower()
     is_context_overflow_failure = agent_failed_early and (
-        bool(agent_result.get("compression_exhausted"))
+        (
+            bool(agent_result.get("hard_context_ceiling_blocked"))
+            and bool(agent_result.get("agent_persisted"))
+        )
+        or bool(agent_result.get("compression_exhausted"))
         or any(p in err for p in (
             "context length", "context size", "context window",
             "maximum context", "token limit", "too many tokens",
@@ -49,6 +57,35 @@ class TestContextOverflowStillSkipsTranscript:
         failed, ctx_overflow = _classify(agent_result, history_len=100)
         assert failed
         assert ctx_overflow
+
+    def test_verified_hard_ceiling_block_is_context_overflow(self):
+        """input_too_large keeps compression_exhausted False even when the
+        user turn is verified durable — the flag pair must classify."""
+        agent_result = {
+            "failed": True,
+            "hard_context_ceiling_blocked": True,
+            "agent_persisted": True,
+            "compression_exhausted": False,
+            "error": "hard_context_ceiling_blocked:input_too_large",
+        }
+        failed, ctx_overflow = _classify(agent_result, history_len=2)
+        assert failed
+        assert ctx_overflow
+
+    def test_unverified_hard_ceiling_block_stays_transient(self):
+        """An unverified block may sit on a genuinely unsaved user message —
+        it must reach the transient branch's fallback persist, where the
+        duplicate-flush guard decides."""
+        agent_result = {
+            "failed": True,
+            "hard_context_ceiling_blocked": True,
+            "agent_persisted": False,
+            "compression_exhausted": False,
+            "error": "hard_context_ceiling_blocked:compression_stalled",
+        }
+        failed, ctx_overflow = _classify(agent_result, history_len=30)
+        assert failed
+        assert not ctx_overflow
 
 
 class TestTransientFailureKeepsUserMessage:
