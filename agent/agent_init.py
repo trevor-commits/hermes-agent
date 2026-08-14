@@ -891,7 +891,18 @@ def init_agent(
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
     agent.tool_result_max_chars = tool_result_max_chars
-    
+    # Run-scoped cumulative tool-output budget. ``tool_result_max_chars``
+    # bounds ONE result; this bounds the SUM across a whole run, which a long
+    # tool loop otherwise defeats with many individually-legal results. None =
+    # unlimited (the historical behaviour). Callers that own a per-run policy
+    # set it after construction — cron does this per job — so the constructor
+    # signature stays unchanged.
+    agent.tool_result_total_max_chars = None
+    agent._tool_result_total_chars_used = 0
+    agent._tool_result_budget_lock = threading.Lock()
+    agent.tool_result_budget_withheld_count = 0
+
+
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
@@ -2073,6 +2084,20 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    # Last-mile deterministic trim at the hard-ceiling terminal guard: free
+    # (no-LLM) truncation passes that clear small overshoots without spending
+    # the model-backed max_attempts budget. 0 attempts = disabled.
+    compression_max_deterministic_attempts = max(
+        0,
+        _parse_prune_int(_compression_cfg.get("max_deterministic_attempts", 1), 1),
+    )
+    compression_deterministic_trim_max_deficit = max(
+        0,
+        _parse_prune_int(
+            _compression_cfg.get("deterministic_trim_max_deficit_tokens", 4000),
+            4000,
+        ),
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2634,6 +2659,15 @@ def init_agent(
     if _cc is not None and hasattr(_cc, "_micro_compact_defrag_threshold_tokens"):
         _cc._micro_compact_defrag_threshold_tokens = (
             compression_micro_compact_defrag_tokens
+        )
+    # Last-mile deterministic trim knobs (built-in compressor defines both;
+    # plugin engines without them simply never trim — the terminal guard
+    # reads them defensively via getattr).
+    if _cc is not None and hasattr(_cc, "max_deterministic_attempts"):
+        _cc.max_deterministic_attempts = compression_max_deterministic_attempts
+    if _cc is not None and hasattr(_cc, "deterministic_trim_max_deficit_tokens"):
+        _cc.deterministic_trim_max_deficit_tokens = (
+            compression_deterministic_trim_max_deficit
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction

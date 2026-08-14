@@ -1323,6 +1323,48 @@ def _hard_context_ceiling_result(
             agent.session_id or "none",
         )
 
+    if not current_user_durable and durable_fail_reason == "not_db_persisted":
+        # Verify-then-repair: compaction and sequence-repair can strip the
+        # in-memory "_db_persisted" marker from a user row whose durable copy
+        # IS in the session DB (sequence repair deliberately never inherits
+        # durability). Re-prove against authoritative storage with a strict
+        # content match; success restores the marker (preventing a duplicate
+        # re-flush) and durability. Every other failing predicate — including
+        # a genuine later user row — keeps the fail-closed refusal.
+        try:
+            _idx = getattr(agent, "_persist_user_message_idx", None)
+            _db = getattr(agent, "_session_db", None)
+            if (
+                _db is not None
+                and agent.session_id
+                and isinstance(_idx, int)
+                and 0 <= _idx < len(messages)
+            ):
+                _row_content = messages[_idx].get("content")
+                if isinstance(_row_content, str) and _row_content:
+                    _db_rows = _db.get_messages(agent.session_id)
+                    if any(
+                        isinstance(_r, dict)
+                        and _r.get("role") == "user"
+                        and _r.get("content") == _row_content
+                        for _r in _db_rows
+                    ):
+                        messages[_idx]["_db_persisted"] = True
+                        current_user_durable = True
+                        durable_fail_reason = "repaired_from_db"
+                        logger.info(
+                            "Durable-continuity repair: current user turn found "
+                            "in the session DB for session=%s; restored the "
+                            "lost _db_persisted marker.",
+                            agent.session_id or "none",
+                        )
+        except Exception:
+            logger.debug(
+                "Durable-continuity DB re-proof failed; keeping the "
+                "fail-closed refusal.",
+                exc_info=True,
+            )
+
     continuity_preserved = current_user_durable
     input_too_large = block_reason == "input_too_large"
     if input_too_large and continuity_preserved:
@@ -1344,15 +1386,16 @@ def _hard_context_ceiling_result(
             f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
             f"tokens, above the {ceiling_tokens:,}-token hard ceiling after "
             f"compression could not continue ({block_reason}). Your history is "
-            "saved. Start a fresh session, or repair/force compression and resume "
-            "this saved session."
+            "saved. Send /new to start a fresh session, or /compress to force "
+            "another compression pass and resume this saved session."
         )
     else:
         final = (
             f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
             f"tokens, above the {ceiling_tokens:,}-token hard ceiling after "
             f"compression could not continue ({block_reason}). Durable session "
-            "persistence could not be verified, so automatic rollover is disabled; "
+            "persistence could not be verified, so automatic rollover is disabled. "
+            "Send /new to start a fresh session (saved history is kept), or "
             "retry after session storage is healthy."
         )
 
@@ -1385,16 +1428,20 @@ def _hard_context_ceiling_result(
                 f"Request was not sent: its estimated context is ~{estimated_tokens:,} "
                 f"tokens, above the {ceiling_tokens:,}-token hard ceiling. The current "
                 "user message was saved, but the terminal explanation could not be "
-                "verified in durable storage, so automatic rollover is disabled."
+                "verified in durable storage, so automatic rollover is disabled. "
+                "Send /new to start a fresh session; saved history is kept."
             )
         messages[-1]["content"] = final
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    if continuity_preserved:
+    if continuity_preserved and durable_fail_reason != "repaired_from_db":
         durable_fail_reason = "ok"
-    elif durable_fail_reason == "ok":
+    elif not continuity_preserved and durable_fail_reason in (
+        "ok",
+        "repaired_from_db",
+    ):
         durable_fail_reason = "explanation_persist_failed"
     logger.error(
         "Provider send blocked by hard context ceiling: estimated=%d ceiling=%d "
@@ -2812,6 +2859,22 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        # Last-mile deterministic trim state (per provider-send cycle): free
+        # truncation passes allowed when a hard-ceiling block lands only a
+        # small deficit over the ceiling. Read defensively — plugin context
+        # engines may not define the knobs.
+        _deterministic_trim_attempts = 0
+        _max_deterministic_trim_attempts = int(
+            getattr(agent.context_compressor, "max_deterministic_attempts", 0) or 0
+        )
+        _deterministic_trim_max_deficit = int(
+            getattr(
+                agent.context_compressor,
+                "deterministic_trim_max_deficit_tokens",
+                0,
+            )
+            or 0
+        )
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -3184,6 +3247,43 @@ def run_conversation(
                     except Exception:
                         pass
                     _terminal_estimate, _terminal_reason = _hard_ceiling_trip
+                    # Last-mile deterministic squeeze: most live blocks land a
+                    # rounding error above the ceiling (12 of 30 observed were
+                    # ≤626 tokens over). One free, in-place truncation of the
+                    # largest tool results buys that margin and retries the
+                    # send — without spending the model-backed max_attempts
+                    # budget and without dropping any message. The deficit
+                    # window keeps big overshoots failing closed as before.
+                    _trim_deficit = _terminal_estimate - _preflight_threshold
+                    if (
+                        _terminal_reason != "compression_lock"
+                        and _terminal_reason != "input_too_large"
+                        and _deterministic_trim_attempts
+                        < _max_deterministic_trim_attempts
+                        and 0 <= _trim_deficit <= _deterministic_trim_max_deficit
+                    ):
+                        _deterministic_trim_attempts += 1
+                        from agent.context_compressor import (
+                            truncate_oversized_tool_results,
+                        )
+
+                        _reclaimed = truncate_oversized_tool_results(
+                            api_messages,
+                            reclaim_chars=_trim_deficit * 4 + 2048,
+                            mirror=messages,
+                        )
+                        if _reclaimed > 0:
+                            logger.info(
+                                "Last-mile deterministic trim reclaimed ~%d "
+                                "chars (deficit was %d tokens vs ceiling %d) — "
+                                "retrying provider send for session=%s",
+                                _reclaimed,
+                                _trim_deficit,
+                                _preflight_threshold,
+                                agent.session_id or "none",
+                            )
+                            _hard_ceiling_trip = None
+                            continue
                     if _terminal_reason == "compression_lock":
                         return _compression_deferred_result(
                             agent,
