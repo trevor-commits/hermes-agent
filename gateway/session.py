@@ -3335,6 +3335,160 @@ class SessionStore:
                 self._save()
         return count
 
+    def has_dirty_transcript(self, session_id: str) -> bool:
+        """Return whether ``session_id`` has an uncommitted transcript row."""
+        retry_lock = getattr(self, "_transcript_retry_lock", None)
+        if retry_lock is None:
+            retry_lock = threading.Lock()
+            self._transcript_retry_lock = retry_lock
+        with retry_lock:
+            return bool(
+                (getattr(self, "_dirty_transcripts", None) or {}).get(session_id)
+            )
+
+    def rollover_session_with_carryover(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        carryover_message: Dict[str, Any],
+    ) -> Optional[SessionEntry]:
+        """Atomically roll one route after a successful high-context turn.
+
+        The transcript-drain lock prevents an old-session append from crossing
+        the database transition. The in-memory route and legacy JSON mirror are
+        published only after the database commits; state.db remains
+        authoritative if the optional mirror write then fails.
+        """
+        db = getattr(self, "_db", None)
+        if not db or not session_key or not expected_session_id:
+            return None
+
+        drain_lock = getattr(self, "_transcript_drain_lock", None)
+        if drain_lock is None:
+            drain_lock = threading.RLock()
+            self._transcript_drain_lock = drain_lock
+        save_lock = getattr(self, "_save_lock", None)
+        if save_lock is None:
+            save_lock = threading.Lock()
+            self._save_lock = save_lock
+
+        with drain_lock:
+            if self.has_dirty_transcript(expected_session_id):
+                return None
+            with self._lock:
+                self._ensure_loaded_locked()
+                old_entry = self._entries.get(session_key)
+                if (
+                    old_entry is None
+                    or old_entry.session_id != expected_session_id
+                ):
+                    return None
+
+                now = _now()
+                new_session_id = (
+                    f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                )
+                new_entry = SessionEntry(
+                    session_key=session_key,
+                    session_id=new_session_id,
+                    created_at=now,
+                    updated_at=now,
+                    origin=old_entry.origin,
+                    display_name=old_entry.display_name,
+                    platform=old_entry.platform,
+                    chat_type=old_entry.chat_type,
+                    prev_session_id=expected_session_id,
+                    is_fresh_reset=True,
+                    model_override=(
+                        dict(old_entry.model_override)
+                        if old_entry.model_override
+                        else None
+                    ),
+                )
+                new_entry_json = json.dumps(new_entry.to_dict())
+                origin_json = None
+                if old_entry.origin is not None:
+                    origin_json = json.dumps(old_entry.origin.to_dict())
+                source_name = (
+                    old_entry.platform.value if old_entry.platform else "unknown"
+                )
+                session_kwargs = {
+                    "session_id": new_session_id,
+                    "user_id": (
+                        old_entry.origin.user_id if old_entry.origin else None
+                    ),
+                    "session_key": session_key,
+                    "chat_id": (
+                        old_entry.origin.chat_id if old_entry.origin else None
+                    ),
+                    "chat_type": (
+                        old_entry.origin.chat_type if old_entry.origin else None
+                    ),
+                    "thread_id": (
+                        old_entry.origin.thread_id if old_entry.origin else None
+                    ),
+                    "profile_name": (
+                        old_entry.origin.profile if old_entry.origin else None
+                    ),
+                    "origin_json": origin_json,
+                    "display_name": old_entry.display_name,
+                    "parent_session_id": expected_session_id,
+                    "model_config": {
+                        "_reset_from": expected_session_id,
+                        "_proactive_rollover": True,
+                    },
+                }
+
+                with save_lock:
+                    committed = db.atomic_gateway_rollover(
+                        scope=self._routing_scope(),
+                        session_key=session_key,
+                        expected_session_id=expected_session_id,
+                        new_entry_json=new_entry_json,
+                        source=source_name,
+                        session_kwargs=session_kwargs,
+                        carryover_message=carryover_message,
+                    )
+                    if not committed:
+                        return None
+
+                    # Publish process-local state only after the commit.
+                    self._entries[session_key] = new_entry
+                    reroutes = getattr(self, "_transcript_reroutes", None)
+                    if reroutes is None:
+                        reroutes = {}
+                        self._transcript_reroutes = reroutes
+                    reroutes[expected_session_id] = new_session_id
+
+                    revision = self._next_routing_generation_locked()
+                    self._persisted_routing_generation = max(
+                        getattr(self, "_persisted_routing_generation", 0),
+                        revision,
+                    )
+                    fast_entries = getattr(
+                        self, "_fast_persisted_entries", None
+                    )
+                    if fast_entries is None:
+                        fast_entries = {}
+                        self._fast_persisted_entries = fast_entries
+                    fast_entries[session_key] = (revision, new_entry_json)
+                    mirror_data = {
+                        key: entry.to_dict()
+                        for key, entry in self._entries.items()
+                    }
+
+                    if getattr(self, "_write_sessions_json", True):
+                        try:
+                            self._save_sessions_json(mirror_data)
+                        except Exception as exc:
+                            logger.warning(
+                                "gateway.session: sessions.json mirror failed "
+                                "after proactive-rollover commit for %s: %s",
+                                session_key,
+                                exc,
+                            )
+                return new_entry
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None

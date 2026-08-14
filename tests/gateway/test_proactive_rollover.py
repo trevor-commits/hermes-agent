@@ -10,13 +10,16 @@ sessions, sub-threshold usage, and the default-off config must never roll.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from gateway import run as gateway_run
 from gateway.config import Platform
-from gateway.session import SessionEntry
+from gateway.session import SessionEntry, SessionSource, SessionStore
+from hermes_state import SessionDB
 from tests.gateway.test_42039_duplicate_user_message import (
     _bootstrap,
     _event,
@@ -52,7 +55,8 @@ def _rollover_runner(monkeypatch, tmp_path, *, enabled: bool):
         platform=Platform.TELEGRAM,
         chat_type="group",
     )
-    runner.session_store.reset_session.return_value = fresh_entry
+    runner.session_store.rollover_session_with_carryover.return_value = fresh_entry
+    runner.session_store.has_dirty_transcript.return_value = False
     runner._sync_telegram_topic_binding = MagicMock()
     return runner
 
@@ -74,18 +78,14 @@ async def test_enabled_over_threshold_rolls_with_carryover(monkeypatch, tmp_path
         _event(), _source(), _SESSION_KEY, 1
     )
 
-    runner.session_store.reset_session.assert_called_once_with(_SESSION_KEY)
-    by_session = _appends_by_session(runner)
-    carryover_rows = [
-        row
-        for row in by_session.get("sess-proactive-fresh", [])
-        if row.get("_compressed_summary") is True
-    ]
-    assert len(carryover_rows) == 1
-    assert "CONTEXT CARRYOVER" in carryover_rows[0]["content"]
-    assert "sess-dedup" in carryover_rows[0]["content"]
-    assert carryover_rows[0].get("display_kind") == "hidden"
+    rollover_call = runner.session_store.rollover_session_with_carryover.call_args
+    assert rollover_call.args[:2] == (_SESSION_KEY, "sess-dedup")
+    carryover = rollover_call.args[2]
+    assert "CONTEXT CARRYOVER" in carryover["content"]
+    assert "sess-dedup" in carryover["content"]
+    assert carryover.get("display_kind") == "hidden"
     # This turn's own rows went to the OLD session, before the roll.
+    by_session = _appends_by_session(runner)
     assert any(
         row.get("role") == "assistant"
         for row in by_session.get("sess-dedup", [])
@@ -101,7 +101,7 @@ async def test_disabled_config_never_rolls(monkeypatch, tmp_path):
 
     await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
 
-    runner.session_store.reset_session.assert_not_called()
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -111,7 +111,7 @@ async def test_under_threshold_never_rolls(monkeypatch, tmp_path):
 
     await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
 
-    runner.session_store.reset_session.assert_not_called()
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -123,18 +123,258 @@ async def test_failed_turn_never_rolls_proactively(monkeypatch, tmp_path):
 
     await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
 
-    runner.session_store.reset_session.assert_not_called()
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_queued_session_defers_roll(monkeypatch, tmp_path):
+async def test_adapter_pending_message_defers_roll(monkeypatch, tmp_path):
     runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
     runner._run_agent = AsyncMock(return_value=_success_result(25_000))
-    runner._pending_messages[_SESSION_KEY] = [object()]
+    adapter = MagicMock()
+    adapter._pending_messages = {_SESSION_KEY: object()}
+    adapter.send = AsyncMock()
+    adapter.send_private_notice = AsyncMock()
+    runner._adapter_for_source = MagicMock(return_value=adapter)
 
     await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
 
-    runner.session_store.reset_session.assert_not_called()
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_runner_queued_event_defers_roll(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    runner._queued_events[_SESSION_KEY] = [object()]
+
+    await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
+
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_background_worker_defers_roll(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    monkeypatch.setattr(
+        "tools.async_delegation.has_live_for_session",
+        lambda **_kwargs: True,
+    )
+
+    await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
+
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dirty_transcript_defers_roll(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    runner.session_store.has_dirty_transcript.return_value = True
+
+    await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
+
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_work_probe_exception_defers_roll(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    runner.session_store.has_dirty_transcript.side_effect = RuntimeError("probe failed")
+
+    await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
+
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_topic_sync_failure_keeps_committed_rollover(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    runner._sync_telegram_topic_binding.side_effect = OSError("topic sync failed")
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), _SESSION_KEY, 1
+    )
+
+    runner.session_store.rollover_session_with_carryover.assert_called_once()
+    assert isinstance(response, str) and "🔄" in response
+
+
+def _real_store(tmp_path: Path) -> tuple[SessionStore, SessionEntry]:
+    store = SessionStore(tmp_path / "sessions", gateway_run.GatewayConfig())
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="12345",
+    )
+    entry = store.get_or_create_session(source)
+    return store, entry
+
+
+def _carryover() -> dict:
+    return {
+        "role": "user",
+        "content": "[CONTEXT CARRYOVER] exact durable summary",
+        "_compressed_summary": True,
+        "display_kind": "hidden",
+        "timestamp": 1234.5,
+    }
+
+
+@pytest.mark.parametrize(
+    "step_method",
+    [
+        "_insert_session_row_tx",
+        "_insert_gateway_rollover_carryover_tx",
+        "_end_gateway_rollover_parent_tx",
+        "_update_gateway_rollover_route_tx",
+    ],
+)
+def test_atomic_db_rollover_failure_at_each_step_rolls_back(
+    monkeypatch, tmp_path, step_method
+):
+    store, old_entry = _real_store(tmp_path)
+    db: SessionDB = store._db
+    original = getattr(db, step_method)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"injected {step_method}")
+
+    monkeypatch.setattr(db, step_method, fail)
+    new_entry = SessionEntry(
+        session_key=old_entry.session_key,
+        session_id="sess-proactive-fresh",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=old_entry.origin,
+        platform=old_entry.platform,
+        chat_type=old_entry.chat_type,
+    )
+
+    with pytest.raises(RuntimeError, match="injected"):
+        db.atomic_gateway_rollover(
+            scope=store._routing_scope(),
+            session_key=old_entry.session_key,
+            expected_session_id=old_entry.session_id,
+            new_entry_json=json.dumps(new_entry.to_dict()),
+            source="telegram",
+            session_kwargs={
+                "session_id": new_entry.session_id,
+                "parent_session_id": old_entry.session_id,
+                "session_key": old_entry.session_key,
+            },
+            carryover_message=_carryover(),
+        )
+
+    monkeypatch.setattr(db, step_method, original)
+    assert db.get_session(new_entry.session_id) is None
+    assert db.get_session(old_entry.session_id)["end_reason"] is None
+    route = db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(route[old_entry.session_key])["session_id"] == old_entry.session_id
+
+
+def test_atomic_db_rollover_route_race_is_safe_noop(tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    db: SessionDB = store._db
+    route = db.load_gateway_routing_entries(scope=store._routing_scope())
+    moved = json.loads(route[old_entry.session_key])
+    moved["session_id"] = "another-session"
+    db.save_gateway_routing_entry(
+        old_entry.session_key,
+        json.dumps(moved),
+        scope=store._routing_scope(),
+    )
+
+    result = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+
+    assert result is None
+    assert db.get_session(old_entry.session_id)["end_reason"] is None
+    assert json.loads(
+        db.load_gateway_routing_entries(scope=store._routing_scope())[
+            old_entry.session_key
+        ]
+    )["session_id"] == "another-session"
+
+
+def test_dirty_store_transcript_refuses_atomic_rollover(tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    store._dirty_transcripts[old_entry.session_id] = [
+        {"role": "assistant", "content": "not committed"}
+    ]
+
+    result = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+
+    assert result is None
+    assert store._db.get_session(old_entry.session_id)["end_reason"] is None
+    route = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(route[old_entry.session_key])["session_id"] == old_entry.session_id
+
+
+def test_successful_rollover_commits_lineage_carryover_end_and_route(tmp_path):
+    store, old_entry = _real_store(tmp_path)
+
+    new_entry = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+
+    assert new_entry is not None
+    old_row = store._db.get_session(old_entry.session_id)
+    child_row = store._db.get_session(new_entry.session_id)
+    assert old_row["end_reason"] == "proactive_rollover"
+    assert child_row["parent_session_id"] == old_entry.session_id
+    messages = store._db.get_messages(new_entry.session_id)
+    assert len(messages) == 1
+    assert messages[0]["display_kind"] == "hidden"
+    assert "exact durable summary" in messages[0]["content"]
+    route = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(route[old_entry.session_key])["session_id"] == new_entry.session_id
+
+
+def test_post_commit_mirror_failure_keeps_database_route(monkeypatch, tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    monkeypatch.setattr(
+        store,
+        "_save_sessions_json",
+        MagicMock(side_effect=OSError("mirror unavailable")),
+    )
+
+    new_entry = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+
+    assert new_entry is not None
+    route = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(route[old_entry.session_key])["session_id"] == new_entry.session_id
+
+
+def test_restart_reconstructs_committed_rollover_route(tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    new_entry = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert new_entry is not None
+
+    restarted = SessionStore(tmp_path / "sessions", gateway_run.GatewayConfig())
+    restarted_entry = restarted.get_or_create_session(old_entry.origin)
+
+    assert restarted_entry.session_id == new_entry.session_id
 
 
 def test_carryover_digest_prefers_compacted_summary():
