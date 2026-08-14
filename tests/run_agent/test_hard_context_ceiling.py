@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -689,3 +691,68 @@ def test_later_compaction_summary_does_not_revoke_current_turn_durability(
     agent._persist_user_turn_identity = turn_identity
 
     assert agent._current_turn_user_is_durable(messages) is True
+
+
+def _durability_case(kind: str):
+    """Build (idx, identity, messages, expected_bool, expected_reason)."""
+    turn_identity = "hard-ceiling-e2e:reason-case"
+    durable_row = {
+        "role": "user",
+        "content": "active ask",
+        "_current_turn_identity": turn_identity,
+        "_db_persisted": True,
+    }
+    if kind == "ok":
+        return 0, turn_identity, [dict(durable_row)], True, "ok"
+    if kind == "idx_out_of_range":
+        return 5, turn_identity, [dict(durable_row)], False, "idx_out_of_range"
+    if kind == "identity_missing":
+        return 0, None, [dict(durable_row)], False, "identity_missing"
+    if kind == "wrong_role":
+        row = dict(durable_row)
+        row["role"] = "assistant"
+        return 0, turn_identity, [row], False, "wrong_role"
+    if kind == "identity_mismatch":
+        row = dict(durable_row)
+        row["_current_turn_identity"] = "some-other-turn"
+        return 0, turn_identity, [row], False, "identity_mismatch"
+    if kind == "not_db_persisted":
+        row = dict(durable_row)
+        row.pop("_db_persisted")
+        return 0, turn_identity, [row], False, "not_db_persisted"
+    if kind == "later_unmarked_user_row":
+        later = {"role": "user", "content": "duplicate copy"}
+        return (
+            0,
+            turn_identity,
+            [dict(durable_row), later],
+            False,
+            "later_unmarked_user_row",
+        )
+    raise AssertionError(f"unknown case {kind}")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "ok",
+        "idx_out_of_range",
+        "identity_missing",
+        "wrong_role",
+        "identity_mismatch",
+        "not_db_persisted",
+        "later_unmarked_user_row",
+    ],
+)
+def test_current_turn_durability_names_its_failing_predicate(
+    monkeypatch, tmp_path, kind
+):
+    """The durability check must say WHY it refused rollover authority so a
+    live hard-ceiling block line is diagnosable (durable_fail=<reason>)."""
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    idx, identity, messages, expected_bool, expected_reason = _durability_case(kind)
+    agent._persist_user_message_idx = idx
+    agent._persist_user_turn_identity = identity
+
+    assert agent._current_turn_user_is_durable(messages) is expected_bool
+    assert agent._current_turn_durability_fail_reason == expected_reason
