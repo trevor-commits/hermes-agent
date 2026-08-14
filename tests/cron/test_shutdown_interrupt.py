@@ -531,7 +531,7 @@ class TestCallerLossAfterClaimAcquisition:
             assert jobs.heartbeat_fire_claim(job["id"], expected_owner=owner) is True
             assert jobs.mark_job_run(
                 job["id"], True, expected_fire_owner=owner,
-            ) is True
+            ) is None
             refreshed = jobs.get_job(job["id"])
             assert refreshed["fire_claim"] is None
             assert refreshed["last_status"] == "ok"

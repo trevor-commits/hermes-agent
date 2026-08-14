@@ -280,6 +280,7 @@ class TestUnifiedCronjobTool:
                 schedule="every 1h",
                 enabled_toolsets=["web", "terminal", "file", "no_mcp"],
                 tool_result_max_chars=4_000,
+                tool_result_total_max_chars=40_000,
             )
         )
         assert created["success"] is True
@@ -290,6 +291,7 @@ class TestUnifiedCronjobTool:
             "no_mcp",
         ]
         assert created["job"]["tool_result_max_chars"] == 4_000
+        assert created["job"]["tool_result_total_max_chars"] == 40_000
 
         updated = json.loads(
             cronjob(
@@ -297,6 +299,7 @@ class TestUnifiedCronjobTool:
                 job_id=created["job_id"],
                 enabled_toolsets=["terminal", "file", "no_mcp"],
                 tool_result_max_chars=3_000,
+                tool_result_total_max_chars=20_000,
             )
         )
         assert updated["success"] is True
@@ -306,6 +309,7 @@ class TestUnifiedCronjobTool:
             "no_mcp",
         ]
         assert updated["job"]["tool_result_max_chars"] == 3_000
+        assert updated["job"]["tool_result_total_max_chars"] == 20_000
 
     def test_pause_and_resume(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
