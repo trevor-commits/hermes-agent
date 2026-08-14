@@ -944,6 +944,16 @@ class GatewayConfig:
     # tooling and downgrade safety; set gateway.write_sessions_json: false in
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
+
+    # Proactive rollover: at a safe boundary (successful turn, nothing queued
+    # for the session), a chat whose real provider-reported prompt usage
+    # reaches the threshold rolls to a fresh session carrying a compact
+    # deterministic digest, with a visible 🔄 notice. Sessions otherwise only
+    # reset in crisis (hard-ceiling exhaustion) or via /new. Default OFF;
+    # enable with gateway.proactive_rollover_enabled: true. The threshold
+    # default is 80% of the deliberate 30K compression ceiling.
+    proactive_rollover_enabled: bool = False
+    proactive_rollover_threshold_tokens: int = 24000
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
@@ -1113,6 +1123,10 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             "write_sessions_json": self.write_sessions_json,
+            "proactive_rollover_enabled": self.proactive_rollover_enabled,
+            "proactive_rollover_threshold_tokens": (
+                self.proactive_rollover_threshold_tokens
+            ),
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
@@ -1257,6 +1271,12 @@ class GatewayConfig:
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
             write_sessions_json=_coerce_bool(data.get("write_sessions_json"), True),
+            proactive_rollover_enabled=_coerce_bool(
+                data.get("proactive_rollover_enabled"), False
+            ),
+            proactive_rollover_threshold_tokens=_coerce_int(
+                data.get("proactive_rollover_threshold_tokens"), 24000
+            ),
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             filter_silence_narration=_coerce_bool(
                 data.get("filter_silence_narration"), True
@@ -1469,6 +1489,20 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["write_sessions_json"] = yaml_cfg["write_sessions_json"]
             elif isinstance(gateway_section, dict) and "write_sessions_json" in gateway_section:
                 gw_data["write_sessions_json"] = gateway_section["write_sessions_json"]
+
+            # proactive_rollover_*: top-level wins; nested gateway.* fallback
+            # (same precedence contract as write_sessions_json above).
+            for _pr_key in (
+                "proactive_rollover_enabled",
+                "proactive_rollover_threshold_tokens",
+            ):
+                if _pr_key in yaml_cfg:
+                    gw_data[_pr_key] = yaml_cfg[_pr_key]
+                elif (
+                    isinstance(gateway_section, dict)
+                    and _pr_key in gateway_section
+                ):
+                    gw_data[_pr_key] = gateway_section[_pr_key]
 
             if "filter_silence_narration" in yaml_cfg:
                 gw_data["filter_silence_narration"] = yaml_cfg[
