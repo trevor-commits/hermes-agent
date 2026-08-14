@@ -129,6 +129,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         type=int,
         help="Cap each text tool result added to this job's model context.",
     )
+    cron_create.add_argument(
+        "--tool-result-total-max-chars",
+        type=int,
+        help=(
+            "Cap the TOTAL tool-result characters this job may add to model "
+            "context within one run; later results are withheld."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -257,6 +265,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--tool-result-max-chars",
         type=int,
         help="Set the per-result model-context cap for this job.",
+    )
+    cron_edit.add_argument(
+        "--tool-result-total-max-chars",
+        type=int,
+        help="Set the per-run cumulative tool-output budget for this job.",
     )
 
     # lifecycle actions

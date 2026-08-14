@@ -64,7 +64,7 @@ class TestNoteFireForwardFailure:
         note_fire_forward_failure(job["id"], "gateway unreachable")
         assert get_job(job["id"])["last_fire_error"] is not None
 
-        assert mark_job_run(job["id"], success=True) is True
+        assert mark_job_run(job["id"], success=True) is None
         assert get_job(job["id"]).get("last_fire_error") is None
 
     def test_failed_run_keeps_stamp(self, tmp_cron_dir):
@@ -73,7 +73,7 @@ class TestNoteFireForwardFailure:
         job = create_job(prompt="Daily invoice triage", schedule="every 1h")
         note_fire_forward_failure(job["id"], "gateway unreachable")
 
-        assert mark_job_run(job["id"], success=False, error="boom") is True
+        assert mark_job_run(job["id"], success=False, error="boom") is None
         err = get_job(job["id"]).get("last_fire_error")
         assert isinstance(err, dict)
         assert err["detail"] == "gateway unreachable"

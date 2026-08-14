@@ -100,6 +100,53 @@ def _budget_for_agent(agent) -> BudgetConfig:
         preview_size=min(budget.preview_size, max(1, job_cap // 2)),
     )
 
+
+TOOL_OUTPUT_BUDGET_NOTICE_TEMPLATE = (
+    "[tool result withheld: run tool-output budget {budget:,} chars exhausted]"
+)
+# Fallback for agents built before the per-agent lock existed (and for the
+# SimpleNamespace doubles used in tests). Shared, so it is slightly more
+# contended than the per-agent lock and never wrong.
+_TOOL_OUTPUT_BUDGET_FALLBACK_LOCK = threading.Lock()
+
+
+def _apply_run_tool_output_budget(agent, content: str) -> str:
+    """Bound the SUM of tool-result chars across one whole run.
+
+    ``tool_result_max_chars`` caps each result on its own, which a long run
+    defeats by simply making more calls — twenty legal 40K results still blow
+    past a 30K-token ceiling. When a run-scoped budget is set, results are
+    admitted until the cumulative total reaches it; every result after that is
+    replaced with a short notice rather than failing the run, so the model can
+    still finish and report.
+
+    No-op when no budget is configured, so the default path is byte-identical.
+    """
+    budget = getattr(agent, "tool_result_total_max_chars", None)
+    if type(budget) is not int or budget <= 0:
+        return content
+
+    lock = getattr(agent, "_tool_result_budget_lock", None)
+    if lock is None:
+        lock = _TOOL_OUTPUT_BUDGET_FALLBACK_LOCK
+    with lock:
+        used = getattr(agent, "_tool_result_total_chars_used", 0)
+        used = used if type(used) is int else 0
+        if used >= budget:
+            withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
+            agent.tool_result_budget_withheld_count = (
+                withheld if type(withheld) is int else 0
+            ) + 1
+            logger.info(
+                "Run tool-output budget exhausted (%d chars) — withholding result",
+                budget,
+            )
+            return TOOL_OUTPUT_BUDGET_NOTICE_TEMPLATE.format(budget=budget)
+        # The result that crosses the line is kept whole; only later ones are
+        # withheld. Truncating it here would waste the call that produced it.
+        agent._tool_result_total_chars_used = used + len(content)
+    return content
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -1766,13 +1813,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tc.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+            )
+            function_result = _apply_run_tool_output_budget(agent, function_result)
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
@@ -2581,13 +2630,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=function_name,
-            tool_use_id=tool_call.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        if not _is_multimodal_tool_result(function_result):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+            )
+            function_result = _apply_run_tool_output_budget(agent, function_result)
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
