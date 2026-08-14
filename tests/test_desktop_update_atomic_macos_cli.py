@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Optional
 import unittest
 
@@ -186,6 +187,7 @@ def run_cli(
     transactions_root: Path,
     *extra: str,
     environment: Optional[dict] = None,
+    timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
     command = [
         PYTHON,
@@ -215,6 +217,7 @@ def run_cli(
         stderr=subprocess.PIPE,
         text=True,
         env=process_environment,
+        timeout=timeout,
     )
 
 
@@ -250,9 +253,12 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["schema_version"], 1)
-            self.assertEqual(payload["commands"], ["recover"])
-            self.assertEqual(payload["default_transactions_root"], "/Users/gillettes/.local/share/.hermes-update-transactions")
+            self.assertEqual(
+                payload,
+                {"commands": ["recover"], "schema_version": 1},
+            )
+            self.assertNotIn("/Users/", result.stdout)
+            self.assertNotIn("gillettes", result.stdout)
 
     def test_test_root_override_requires_both_flag_and_environment_sentinel(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -397,6 +403,7 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["status"], "failed_rolled_back")
+            self.assertNotIn("failure_code", payload)
             self.assertEqual(payload["resources"], ["source"])
             self.assertFalse(payload["manual_recovery_required"])
             self.assertEqual((live / "version.txt").read_text(), "old")
@@ -407,8 +414,124 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             repeated = run_cli(runtime, binding, transaction_id, transactions_root)
 
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
-            self.assertEqual(json.loads(repeated.stdout)["status"], "failed_rolled_back")
+            repeated_payload = json.loads(repeated.stdout)
+            self.assertEqual(repeated_payload["status"], "failed_rolled_back")
+            self.assertNotIn("failure_code", repeated_payload)
             self.assertEqual(terminal_receipt.read_bytes(), before_repeat)
+
+            os.chmod(terminal_receipt.parent, 0o500)
+            try:
+                unsafe_repeat = run_cli(
+                    runtime,
+                    binding,
+                    transaction_id,
+                    transactions_root,
+                )
+            finally:
+                os.chmod(terminal_receipt.parent, 0o700)
+
+            self.assertEqual(unsafe_repeat.returncode, 75, unsafe_repeat.stderr)
+            self.assertEqual(
+                json.loads(unsafe_repeat.stdout)["failure_code"],
+                "unsafe_transaction_directory",
+            )
+            self.assertEqual(terminal_receipt.read_bytes(), before_repeat)
+
+    def test_rejects_transaction_directories_without_exact_mode_before_receipt_access(self):
+        for mode in (0o710, 0o750, 0o701):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(os.path.realpath(raw_tmp))
+                transaction_id = "tx-dir-mode-{:o}".format(mode)
+                runtime, binding = publish_real_runtime(root / "runtime", transaction_id)
+                transactions_root = root / "transactions"
+                transaction_dir = transactions_root / transaction_id
+                transaction_dir.mkdir(parents=True, mode=0o700)
+                receipt_path = transaction_dir / "receipt.json"
+                receipt_path.write_text("not valid JSON and must not be read\n", encoding="utf-8")
+                os.chmod(receipt_path, 0o600)
+                os.chmod(transaction_dir, mode)
+
+                try:
+                    result = run_cli(runtime, binding, transaction_id, transactions_root)
+                finally:
+                    os.chmod(transaction_dir, 0o700)
+
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["failure_code"],
+                    "unsafe_transaction_directory",
+                )
+                self.assertEqual(result.stderr, "")
+
+    def test_held_transaction_lock_returns_retryable_bounded_failure(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(os.path.realpath(raw_tmp))
+            transaction_id = "tx-cli-lock-held"
+            runtime, binding = publish_real_runtime(root / "runtime", transaction_id)
+            transactions_root = root / "transactions"
+            live = root / "live"
+            candidate = root / "candidate"
+            live.mkdir()
+            candidate.mkdir()
+            create_original_receipt(
+                runtime,
+                transactions_root,
+                transaction_id,
+                live,
+                candidate,
+            )
+            receipt_path = transactions_root / transaction_id / "receipt.json"
+            receipt_before = receipt_path.read_bytes()
+            lock_path = transactions_root / transaction_id / ".transaction.lock"
+            locker = subprocess.Popen(
+                [
+                    PYTHON,
+                    "-c",
+                    "import fcntl, os, sys; fd=os.open(sys.argv[1], os.O_RDWR); "
+                    "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); "
+                    "sys.stdin.readline()",
+                    str(lock_path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(locker.stdout.readline().strip(), "locked")
+            started = time.monotonic()
+            try:
+                try:
+                    result = run_cli(
+                        runtime,
+                        binding,
+                        transaction_id,
+                        transactions_root,
+                        timeout=3.0,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail("published recovery CLI blocked on the transaction lock")
+            finally:
+                locker.stdin.write("release\n")
+                locker.stdin.flush()
+                locker.wait(timeout=2)
+                locker.stdin.close()
+                locker.stdout.close()
+                locker.stderr.close()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 2.5)
+            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertLessEqual(len(result.stdout.encode("utf-8")), 4096)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["failure_code"], "transaction_lock_unavailable")
+            self.assertEqual(payload["status"], "unrecovered")
+            self.assertFalse(payload["manual_recovery_required"])
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
+
+            retried = run_cli(runtime, binding, transaction_id, transactions_root)
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            self.assertEqual(json.loads(retried.stdout)["status"], "failed_rolled_back")
 
     def test_recovery_processes_recorded_exchanges_app_then_source(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -435,6 +558,7 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["resources"], ["app", "source"])
             self.assertEqual(payload["status"], "failed_rolled_back")
+            self.assertNotIn("failure_code", payload)
             for resource, (live, candidate) in resources.items():
                 self.assertEqual((live / "version.txt").read_text(), "{}-old".format(resource))
                 self.assertEqual((candidate / "version.txt").read_text(), "{}-new".format(resource))

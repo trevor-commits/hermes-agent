@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 
 DEFAULT_TRANSACTIONS_ROOT = "/Users/gillettes/.local/share/.hermes-update-transactions"
@@ -23,9 +24,16 @@ _FLAG_OPTIONS = frozenset({"--allow-test-root", "--capabilities"})
 _TERMINAL_RECOVERED = frozenset(
     {"succeeded", "failed_unchanged", "failed_rolled_back"}
 )
+_RECOVERY_LOCK_TIMEOUT_SECONDS = 1.0
 
 
 class _UsageError(ValueError):
+    def __init__(self, failure_code: str):
+        self.failure_code = failure_code
+        super().__init__(failure_code)
+
+
+class _RecoveryError(RuntimeError):
     def __init__(self, failure_code: str):
         self.failure_code = failure_code
         super().__init__(failure_code)
@@ -64,13 +72,14 @@ def _bounded_payload(*, ok, status, failure_code, resources=()):
     safe_status = status if status in _TERMINAL_RECOVERED | {"manual_recovery_required", "unsafe"} else "unrecovered"
     safe_failure = failure_code if isinstance(failure_code, str) and re.fullmatch(r"[a-z0-9_]{1,128}", failure_code) else "recovery_failed"
     payload = {
-        "failure_code": safe_failure,
         "manual_recovery_required": safe_status == "manual_recovery_required",
         "ok": bool(ok),
         "resources": [resource for resource in resources if resource in ("app", "source")],
         "schema_version": 1,
         "status": safe_status,
     }
+    if not ok:
+        payload["failure_code"] = safe_failure
     encoded = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > 4096:
         raise RuntimeError("bounded CLI payload unexpectedly exceeded its limit")
@@ -92,7 +101,6 @@ def _emit(*, ok, status, failure_code, resources=()):
 def _capabilities():
     payload = {
         "commands": ["recover"],
-        "default_transactions_root": DEFAULT_TRANSACTIONS_ROOT,
         "schema_version": 1,
     }
     encoded = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
@@ -112,25 +120,47 @@ def _recovery_resources(receipt):
     return [resource for resource in ("app", "source") if resource in exchanges]
 
 
-def _recover(engine, transaction_dir, resources):
-    current_dir = transaction_dir
-    recovered = []
-    receipt = None
-    for index, resource in enumerate(resources):
-        receipt = engine.recover_exchange(
-            current_dir,
-            resource=resource,
-            finish=index == len(resources) - 1,
+def _validate_transaction_directory(transaction_dir):
+    descriptor = None
+    try:
+        before = transaction_dir.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o700
+        ):
+            raise _RecoveryError("unsafe_transaction_directory")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
         )
-        current_dir = receipt.transaction_dir
-        recovered.append(resource)
-        if receipt.data.get("status") == "manual_recovery_required":
-            break
-        if receipt.is_terminal and index != len(resources) - 1:
-            break
-    if receipt is None:
-        raise RuntimeError("no recovery was attempted")
-    return receipt, recovered
+        descriptor = os.open(str(transaction_dir), flags)
+        opened = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or opened.st_uid != os.geteuid()
+        ):
+            raise _RecoveryError("unsafe_transaction_directory")
+    except _RecoveryError:
+        raise
+    except (OSError, ValueError):
+        raise _RecoveryError("unsafe_transaction_directory") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _recover(engine, transaction_dir, resources):
+    return engine.recover_recorded_exchanges(
+        transaction_dir,
+        resources,
+        lock_timeout_seconds=_RECOVERY_LOCK_TIMEOUT_SECONDS,
+    )
 
 
 def main(engine, arguments, *, runtime_transaction_id):
@@ -161,6 +191,7 @@ def main(engine, arguments, *, runtime_transaction_id):
             raise _UsageError("unsafe_transactions_root")
 
         transaction_dir = Path(transactions_root) / transaction_id
+        _validate_transaction_directory(transaction_dir)
         receipt = engine.load_transaction(transaction_dir)
         if receipt.data.get("transaction_id") != transaction_id:
             raise RuntimeError("receipt transaction identity does not match")
@@ -194,6 +225,16 @@ def main(engine, arguments, *, runtime_transaction_id):
     except _UsageError as error:
         _emit(ok=False, status="unsafe", failure_code=error.failure_code)
         return 64
+    except _RecoveryError as error:
+        _emit(ok=False, status="unrecovered", failure_code=error.failure_code)
+        return 75
+    except engine.TransactionLockUnavailableError:
+        _emit(
+            ok=False,
+            status="unrecovered",
+            failure_code="transaction_lock_unavailable",
+        )
+        return 75
     except Exception:
         _emit(ok=False, status="unrecovered", failure_code="recovery_failed")
         return 75

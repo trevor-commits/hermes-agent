@@ -312,6 +312,7 @@ except Exception:
 
 PathLike = _transaction.PathLike
 TransactionReceipt = _transaction.TransactionReceipt
+TransactionLockUnavailableError = _transaction.TransactionLockUnavailableError
 KeeperConflictError = _git.KeeperConflictError
 GitCommandError = _git.GitCommandError
 
@@ -365,11 +366,28 @@ def recover_exchange(
     *,
     resource: str = "standalone",
     finish: bool = True,
+    lock_timeout_seconds: Optional[float] = None,
 ) -> TransactionReceipt:
     return _transaction.recover_exchange(
         transaction_dir,
         resource=resource,
         finish=finish,
+        lock_timeout_seconds=lock_timeout_seconds,
+        _rename_swap_command=_rename_swap_at,
+        _mapping_kind_command=_mapping_kind,
+    )
+
+
+def recover_recorded_exchanges(
+    transaction_dir: PathLike,
+    resources,
+    *,
+    lock_timeout_seconds: Optional[float] = None,
+):
+    return _transaction.recover_recorded_exchanges(
+        transaction_dir,
+        resources,
+        lock_timeout_seconds=lock_timeout_seconds,
         _rename_swap_command=_rename_swap_at,
         _mapping_kind_command=_mapping_kind,
     )

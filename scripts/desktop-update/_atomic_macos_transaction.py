@@ -10,11 +10,13 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+import time
 from typing import Any, Dict, Optional, Union
 import uuid
 
@@ -48,6 +50,10 @@ _SCP_USERINFO_RE = re.compile(
     r"(?P<userinfo>[A-Za-z0-9._%+-]+)@"
     r"(?P<host>[A-Za-z0-9.-]+:)"
 )
+
+
+class TransactionLockUnavailableError(RuntimeError):
+    """The root transaction lock stayed busy for the caller's bounded wait."""
 
 
 def _utc_now() -> str:
@@ -178,8 +184,8 @@ def _open_verified_directory(
         expected_uid=owner,
         label="directory {}".format(path),
     )
-    if owner_only and before.st_mode & 0o077:
-        raise PermissionError(f"transaction directory is not owner-only: {path}")
+    if owner_only and stat.S_IMODE(before.st_mode) != 0o700:
+        raise PermissionError(f"transaction directory must have mode 0700: {path}")
 
     descriptor = os.open(str(path), _directory_open_flags())
     try:
@@ -190,6 +196,10 @@ def _open_verified_directory(
             expected_uid=owner,
             label="directory {}".format(path),
         )
+        if owner_only and stat.S_IMODE(after.st_mode) != 0o700:
+            raise PermissionError(
+                f"opened transaction directory must have mode 0700: {path}"
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -265,7 +275,18 @@ def _validate_transaction_lock(
 def _transaction_guard(
     transactions_root: PathLike,
     transaction_id: str,
+    *,
+    lock_timeout_seconds: Optional[float] = None,
 ):
+    if lock_timeout_seconds is not None:
+        if isinstance(lock_timeout_seconds, bool):
+            raise TypeError("transaction lock timeout must be a number")
+        timeout = float(lock_timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("transaction lock timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+    else:
+        deadline = None
     root = _canonical_transactions_root(transactions_root)
     lock_transaction_id = validate_generated_leaf(transaction_id)
     transaction_dir = root / lock_transaction_id
@@ -298,13 +319,31 @@ def _transaction_guard(
         if created:
             os.fsync(lock_fd)
             os.fsync(directory_fd)
+        attempted = False
         while True:
+            if attempted and deadline is not None and time.monotonic() >= deadline:
+                raise TransactionLockUnavailableError(
+                    "transaction lock is temporarily unavailable"
+                )
+            attempted = True
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                operation = fcntl.LOCK_EX
+                if deadline is not None:
+                    operation |= fcntl.LOCK_NB
+                fcntl.flock(lock_fd, operation)
                 locked = True
                 break
             except InterruptedError:
                 continue
+            except OSError as error:
+                if deadline is None or error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransactionLockUnavailableError(
+                        "transaction lock is temporarily unavailable"
+                    ) from error
+                time.sleep(min(0.01, remaining))
         _validate_transaction_lock(lock_fd, directory_fd)
         guard = _TransactionGuard(root, lock_transaction_id, lock_fd)
         yield guard
@@ -1016,11 +1055,55 @@ def _validated_recorded_exchanges(
     return exchanges
 
 
+def recover_recorded_exchanges(
+    transaction_dir: PathLike,
+    resources,
+    *,
+    lock_timeout_seconds: Optional[float] = None,
+    _rename_swap_command=None,
+    _mapping_kind_command=None,
+):
+    """Recover ordered receipt resources while holding one root transaction guard."""
+    if not isinstance(resources, (list, tuple)) or not resources:
+        raise ValueError("recovery resources must be a non-empty ordered sequence")
+    ordered_resources = [validate_generated_leaf(resource) for resource in resources]
+    if len(set(ordered_resources)) != len(ordered_resources):
+        raise ValueError("recovery resources must not contain duplicates")
+
+    preliminary = load_transaction(transaction_dir)
+    lock_transaction_id = _receipt_lock_transaction_id(preliminary.data)
+    current_dir = preliminary.transaction_dir
+    processed = []
+    receipt = preliminary
+    with _transaction_guard(
+        preliminary.transaction_dir.parent,
+        lock_transaction_id,
+        lock_timeout_seconds=lock_timeout_seconds,
+    ) as guard:
+        for index, resource in enumerate(ordered_resources):
+            receipt = _recover_exchange_locked(
+                current_dir,
+                resource=resource,
+                finish=index == len(ordered_resources) - 1,
+                _rename_swap_command=_rename_swap_command,
+                _mapping_kind_command=_mapping_kind_command,
+                _guard=guard,
+            )
+            current_dir = receipt.transaction_dir
+            processed.append(resource)
+            if receipt.data.get("status") == "manual_recovery_required":
+                break
+            if receipt.is_terminal and index != len(ordered_resources) - 1:
+                break
+    return receipt, processed
+
+
 def recover_exchange(
     transaction_dir: PathLike,
     *,
     resource: str = "standalone",
     finish: bool = True,
+    lock_timeout_seconds: Optional[float] = None,
     _rename_swap_command=None,
     _mapping_kind_command=None,
 ) -> TransactionReceipt:
@@ -1030,6 +1113,7 @@ def recover_exchange(
     with _transaction_guard(
         preliminary.transaction_dir.parent,
         lock_transaction_id,
+        lock_timeout_seconds=lock_timeout_seconds,
     ) as guard:
         return _recover_exchange_locked(
             transaction_dir,

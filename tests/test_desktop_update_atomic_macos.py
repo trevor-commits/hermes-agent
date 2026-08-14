@@ -334,6 +334,20 @@ class TransactionReceiptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "terminal status"):
                 receipt.finish("almost_done", phase="invalid")
 
+    def test_transaction_directory_mode_must_be_exactly_0700(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(Path(raw_tmp), "txn-exact-mode")
+            for mode in (0o500, 0o710, 0o750, 0o701):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(receipt.transaction_dir, mode)
+                    try:
+                        with self.assertRaisesRegex(PermissionError, "mode 0700"):
+                            atomic_macos.load_transaction(receipt.transaction_dir)
+                    finally:
+                        os.chmod(receipt.transaction_dir, 0o700)
+
     def test_stale_handle_cannot_overwrite_terminal_receipt(self):
         atomic_macos = load_atomic_macos()
 
@@ -1801,6 +1815,91 @@ print(recovered.data["status"])
             )
             self.assertTrue(after_source.data["exchanges"]["source"]["rolled_back"])
             self.assertTrue(after_source.data["exchanges"]["app"]["rolled_back"])
+
+    def test_multi_resource_recovery_holds_one_root_guard_across_resources(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            endpoints = {}
+            receipt = atomic_macos.create_transaction(
+                root / "transactions",
+                "txn-one-recovery-guard",
+            )
+            for resource in ("source", "app"):
+                live = root / "{}-live".format(resource)
+                candidate = root / "{}-candidate".format(resource)
+                live.mkdir()
+                candidate.mkdir()
+                (live / "version.txt").write_text("old", encoding="utf-8")
+                (candidate / "version.txt").write_text("new", encoding="utf-8")
+                atomic_macos.atomic_exchange(
+                    live,
+                    candidate,
+                    receipt=receipt,
+                    resource=resource,
+                    finish_on_success=False,
+                )
+                endpoints[resource] = (live, candidate)
+
+            transaction_module = atomic_macos._transaction
+            if not hasattr(transaction_module, "recover_recorded_exchanges"):
+                self.fail("multi-resource recovery has no single-guard engine API")
+            real_recover_locked = transaction_module._recover_exchange_locked
+            observed_guards = []
+
+            def recover_with_barrier(*args, **kwargs):
+                recovered = real_recover_locked(*args, **kwargs)
+                observed_guards.append(kwargs["_guard"])
+                if kwargs["resource"] == "app":
+                    contender = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            "import importlib.util, pathlib, sys; "
+                            "p=pathlib.Path(sys.argv[1]); "
+                            "s=importlib.util.spec_from_file_location('guard_contender', p); "
+                            "m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; "
+                            "s.loader.exec_module(m); "
+                            "code='acquired'; "
+                            "\ntry:\n"
+                            " with m._transaction_guard(pathlib.Path(sys.argv[2]), sys.argv[3], lock_timeout_seconds=0.1): pass\n"
+                            "except m.TransactionLockUnavailableError: code='unavailable'\n"
+                            "print(code)",
+                            str(MODULE_PATH.with_name("_atomic_macos_transaction.py")),
+                            str(receipt.transaction_dir.parent),
+                            receipt.data["lock_transaction_id"],
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=3,
+                    )
+                    self.assertEqual(contender.returncode, 0, contender.stderr)
+                    self.assertEqual(contender.stdout.strip(), "unavailable")
+                return recovered
+
+            with mock.patch.object(
+                transaction_module,
+                "_recover_exchange_locked",
+                side_effect=recover_with_barrier,
+            ):
+                recovered, processed = transaction_module.recover_recorded_exchanges(
+                    receipt.transaction_dir,
+                    ("app", "source"),
+                    lock_timeout_seconds=1.0,
+                    _rename_swap_command=atomic_macos._rename_swap_at,
+                    _mapping_kind_command=atomic_macos._mapping_kind,
+                )
+
+            self.assertEqual(processed, ["app", "source"])
+            self.assertEqual(recovered.data["status"], "failed_rolled_back")
+            self.assertEqual(len(observed_guards), 2)
+            self.assertIs(observed_guards[0], observed_guards[1])
+            for live, candidate in endpoints.values():
+                self.assertEqual((live / "version.txt").read_text(), "old")
+                self.assertEqual((candidate / "version.txt").read_text(), "new")
 
     def test_ambiguous_resource_recovery_preserves_other_exchange_records(self):
         atomic_macos = load_atomic_macos()
