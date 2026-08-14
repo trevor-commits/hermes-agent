@@ -42,13 +42,19 @@ sys.modules.pop("plugins.platforms.telegram.adapter", None)
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
-def _make_adapter(dm_topics_config=None, group_topics_config=None):
+def _make_adapter(
+    dm_topics_config=None,
+    group_topics_config=None,
+    channel_skill_bindings=None,
+):
     """Create a TelegramAdapter with optional DM/group topics config."""
     extra = {}
     if dm_topics_config is not None:
         extra["dm_topics"] = dm_topics_config
     if group_topics_config is not None:
         extra["group_topics"] = group_topics_config
+    if channel_skill_bindings is not None:
+        extra["channel_skill_bindings"] = channel_skill_bindings
     config = PlatformConfig(enabled=True, token="***", extra=extra)
     adapter = TelegramAdapter(config)
     return adapter
@@ -475,6 +481,116 @@ def test_group_topic_skill_binding_second_topic():
     assert event.source.chat_topic == "Sales"
 
 
-# ── _build_message_event: from_user=None fallback in DMs ──
+def test_group_channel_skill_binding_applies_without_forum_topic():
+    from gateway.platforms.base import MessageType
 
+    adapter = _make_adapter(channel_skill_bindings=[
+        {"id": "-5551733823", "skill": "source-card-intake"},
+    ])
+    msg = _make_mock_message(
+        chat_id=-5551733823,
+        chat_type=_ChatType.SUPERGROUP,
+        text="https://example.invalid/source",
+        is_forum=False,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.auto_skill == ["source-card-intake"]
+
+
+def test_forum_exact_binding_beats_parent_regardless_of_config_order():
+    from gateway.platforms.base import MessageType
+
+    for bindings in (
+        [
+            {"id": "-100123:5", "skill": "topic-skill"},
+            {"id": "-100123", "skill": "parent-skill"},
+        ],
+        [
+            {"id": "-100123", "skill": "parent-skill"},
+            {"id": "-100123:5", "skill": "topic-skill"},
+        ],
+    ):
+        adapter = _make_adapter(channel_skill_bindings=bindings)
+        msg = _make_mock_message(
+            chat_id=-100123,
+            chat_type=_ChatType.SUPERGROUP,
+            thread_id=5,
+            is_topic_message=True,
+            is_forum=True,
+        )
+
+        event = adapter._build_message_event(msg, MessageType.TEXT)
+
+        assert event.auto_skill == ["topic-skill"]
+
+
+def test_forum_binding_falls_back_to_parent_group():
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(channel_skill_bindings=[
+        {"id": "-100123", "skills": ["source-card-intake"]},
+    ])
+    msg = _make_mock_message(
+        chat_id=-100123,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.auto_skill == ["source-card-intake"]
+
+
+def test_legacy_group_topic_skill_beats_channel_binding():
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(
+        group_topics_config=[
+            {
+                "chat_id": -100123,
+                "topics": [
+                    {"name": "Legacy", "thread_id": 5, "skill": "legacy-skill"},
+                ],
+            }
+        ],
+        channel_skill_bindings=[
+            {"id": "-100123:5", "skill": "new-exact-skill"},
+            {"id": "-100123", "skill": "new-parent-skill"},
+        ],
+    )
+    msg = _make_mock_message(
+        chat_id=-100123,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=5,
+        is_topic_message=True,
+        is_forum=True,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.auto_skill == "legacy-skill"
+
+
+def test_unbound_group_retains_no_auto_skill():
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(channel_skill_bindings=[
+        {"id": "-999", "skill": "other-skill"},
+    ])
+    msg = _make_mock_message(
+        chat_id=-100123,
+        chat_type=_ChatType.SUPERGROUP,
+        is_forum=False,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.auto_skill is None
+
+
+# ── _build_message_event: from_user=None fallback in DMs ──
 

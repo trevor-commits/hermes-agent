@@ -2837,18 +2837,24 @@ def resolve_channel_skills(
     bindings = config_extra.get("channel_skill_bindings") or []
     if not isinstance(bindings, list) or not bindings:
         return None
-    ids_to_check: set[str] = set()
-    if channel_id:
-        ids_to_check.add(str(channel_id))
-    if parent_id:
-        ids_to_check.add(str(parent_id))
+    ids_to_check: list[str] = []
+    for candidate in (channel_id, parent_id):
+        if candidate:
+            normalized = str(candidate)
+            if normalized not in ids_to_check:
+                ids_to_check.append(normalized)
     if not ids_to_check:
         return None
-    for entry in bindings:
-        if not isinstance(entry, dict):
-            continue
-        entry_id = str(entry.get("id", ""))
-        if entry_id in ids_to_check:
+    # Candidate precedence is semantic: exact channel/thread first, parent
+    # second.  Scan bindings separately for each candidate so YAML insertion
+    # order cannot let a parent entry shadow an exact entry.
+    for candidate_id in ids_to_check:
+        for entry in bindings:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id", ""))
+            if entry_id != candidate_id:
+                continue
             skills = entry.get("skills") or entry.get("skill")
             if isinstance(skills, str):
                 s = skills.strip()
@@ -2862,6 +2868,7 @@ def resolve_channel_skills(
                     if nm and nm not in seen:
                         seen.append(nm)
                 return seen or None
+            return None
     return None
 
 
