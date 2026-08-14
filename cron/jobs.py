@@ -1769,21 +1769,79 @@ def resolve_hard_context_ceiling_tokens() -> int:
         return DEFAULT_HARD_CONTEXT_CEILING_TOKENS
 
 
+def _attached_skill_context_parts(job: Dict[str, Any]) -> List[str]:
+    """Load the exact skill/bundle bodies attached to a stored definition."""
+    skills = job.get("skills")
+    if skills is None:
+        legacy = job.get("skill")
+        skills = [legacy] if legacy else []
+    elif isinstance(skills, str):
+        skills = [skills]
+
+    skill_names = [
+        str(raw_name or "").strip()
+        for raw_name in (skills or [])
+        if str(raw_name or "").strip()
+    ]
+    if not skill_names:
+        return []
+
+    from agent.skill_bundles import (
+        build_bundle_invocation_message,
+        resolve_bundle_command_key,
+    )
+    from agent.skill_utils import normalize_skill_lookup_name
+    from tools.skills_tool import skill_view
+
+    parts: List[str] = []
+    for skill_name in skill_names:
+        try:
+            bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+            if bundle_key:
+                payload = build_bundle_invocation_message(
+                    bundle_key,
+                    user_instruction="",
+                    task_id=str(job.get("id") or "") or None,
+                    include_skill_segments=True,
+                )
+                if payload:
+                    bundle_message, _loaded, _missing, segments = payload
+                    if segments:
+                        parts.extend(str(block) for _name, block in segments)
+                    elif bundle_message:
+                        parts.append(str(bundle_message))
+                continue
+
+            loaded = json.loads(
+                skill_view(normalize_skill_lookup_name(skill_name))
+            )
+            if loaded.get("success"):
+                content = str(loaded.get("content") or "").strip()
+                if content:
+                    parts.append(content)
+        except Exception:
+            # Missing/unready skills are handled by the existing preflight.
+            # The size gate must not turn a transient lookup failure into an
+            # inability to edit, pause, or repair a job.
+            logger.debug(
+                "Could not estimate attached cron skill %r", skill_name,
+                exc_info=True,
+            )
+    return parts
+
+
 def estimate_job_first_turn_tokens(job: Dict[str, Any]) -> int:
-    """Estimate the STATIC first-turn prompt size of one job definition.
+    """Estimate static prompt plus attached skill and bundle bodies."""
+    from cron.context_budget import evaluate_context_parts
 
-    Static means "what the definition itself contributes on every single
-    fire": the stored prompt text. Runtime-collected context (pre-run script
-    stdout, ``context_from`` output, the durable notepad) is deliberately
-    excluded — it varies per fire and is not knowable when the job is saved.
-    Skill bodies are excluded for the same low-coupling reason the provider
-    imports are: the store must not reach into the scheduler's prompt
-    assembly. The estimate is therefore a floor, which is the safe direction
-    for a rejection gate.
-    """
-    from agent.model_metadata import estimate_tokens_rough
-
-    return estimate_tokens_rough(_coerce_job_text(job.get("prompt")))
+    evaluation = evaluate_context_parts(
+        [
+            _coerce_job_text(job.get("prompt")),
+            *_attached_skill_context_parts(job),
+        ],
+        hard_ceiling_tokens=resolve_hard_context_ceiling_tokens(),
+    )
+    return evaluation.estimated_tokens
 
 
 def _validate_job_first_turn_size(
@@ -1806,13 +1864,24 @@ def _validate_job_first_turn_size(
         if type(ceiling_tokens) is int and ceiling_tokens > 0
         else resolve_hard_context_ceiling_tokens()
     )
-    estimated = estimate_job_first_turn_tokens(job)
-    if estimated >= ceiling:
+    from cron.context_budget import evaluate_context_parts
+
+    evaluation = evaluate_context_parts(
+        [
+            _coerce_job_text(job.get("prompt")),
+            *_attached_skill_context_parts(job),
+        ],
+        hard_ceiling_tokens=ceiling,
+    )
+    estimated = evaluation.estimated_tokens
+    if evaluation.exceeded:
         raise ValueError(
             f"Cron job's static first-turn prompt is ~{estimated:,} estimated "
-            f"tokens, at or above the {ceiling:,}-token hard context ceiling — "
+            f"tokens, at or above the {evaluation.usable_tokens:,}-token usable "
+            f"context budget (80% of the {ceiling:,}-token hard context ceiling) — "
             "this job could never complete a single run. Shorten the prompt, "
-            "or have the job fetch the bulk of that text at run time."
+            "remove or compact an attached skill, or have the job fetch the "
+            "bulk of that text at run time."
         )
     return estimated
 
@@ -2077,7 +2146,7 @@ def create_job(
     # does not apply to them.
     if not normalized_no_agent:
         _validate_job_first_turn_size(
-            {"prompt": prompt_text},
+            {"prompt": prompt_text, "skills": normalized_skills},
             ceiling_tokens=first_turn_ceiling_tokens,
         )
 
@@ -2303,7 +2372,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # edit that SHRINKS an oversized legacy job is exactly the repair
             # the gate exists to encourage, so any strict decrease is allowed
             # through even when the result is still over the ceiling.
-            if not updated.get("no_agent") and {"prompt"}.intersection(updates):
+            if not updated.get("no_agent") and {
+                "prompt",
+                "skill",
+                "skills",
+            }.intersection(updates):
                 _previous_estimate = estimate_job_first_turn_tokens(job)
                 try:
                     _validate_job_first_turn_size(updated)
@@ -2578,7 +2651,7 @@ HARD_CONTEXT_CEILING_PAUSE_AFTER = 3
 
 
 def clear_hard_context_ceiling_streak(job_id: str) -> None:
-    """Drop the consecutive hard-ceiling failure counter for one job.
+    """Drop the hard-ceiling counter and its matching fingerprint.
 
     Manual resume (or an explicit trigger) is the operator saying "I changed
     something" — the next failure must start a fresh streak instead of
@@ -2589,10 +2662,27 @@ def clear_hard_context_ceiling_streak(job_id: str) -> None:
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            changed = False
             if job.pop("hard_context_ceiling_streak", None) is not None:
+                changed = True
+            if job.pop("hard_context_ceiling_fingerprint", None) is not None:
+                changed = True
+            if changed:
                 jobs[i] = job
                 save_jobs(jobs)
             return
+
+
+def _hard_context_ceiling_fingerprint(error: Optional[str]) -> Optional[str]:
+    """Extract a stable hard-ceiling failure class from noisy error text."""
+    if not error:
+        return None
+    match = re.search(
+        r"hard_context_ceiling_blocked(?::[a-z0-9_.-]+)?",
+        str(error),
+        flags=re.IGNORECASE,
+    )
+    return match.group(0).lower() if match else None
 
 
 def _update_hard_ceiling_streak(
@@ -2607,13 +2697,20 @@ def _update_hard_ceiling_streak(
     Any ok run — and any failure with a different cause — resets the streak, so
     only a job that is failing the same way every time gets paused.
     """
-    if success or not error or HARD_CONTEXT_CEILING_MARKER not in str(error):
+    fingerprint = None if success else _hard_context_ceiling_fingerprint(error)
+    if fingerprint is None:
         job.pop("hard_context_ceiling_streak", None)
+        job.pop("hard_context_ceiling_fingerprint", None)
         return None
 
+    prior_fingerprint = job.get("hard_context_ceiling_fingerprint")
     streak = job.get("hard_context_ceiling_streak")
-    streak = streak + 1 if type(streak) is int and streak > 0 else 1
+    if prior_fingerprint == fingerprint and type(streak) is int and streak > 0:
+        streak += 1
+    else:
+        streak = 1
     job["hard_context_ceiling_streak"] = streak
+    job["hard_context_ceiling_fingerprint"] = fingerprint
     if streak < HARD_CONTEXT_CEILING_PAUSE_AFTER:
         return None
     if not job.get("enabled", True) or _has_pause_marker(job):
