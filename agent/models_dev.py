@@ -773,14 +773,17 @@ def lookup_models_dev_context(
     # NOTE: keep the zero-argument call on the allow_network path. Dozens
     # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
     # passing the kwarg unconditionally breaks them all (TypeError).
-    data = (
-        fetch_models_dev()
-        if allow_network and allow_disk
-        else fetch_models_dev(
+    if allow_network and allow_disk:
+        data = fetch_models_dev()
+    elif allow_disk:
+        # Exact call shape asserted by upstream tests: the disk-allowed
+        # cached path passes only allow_network.
+        data = fetch_models_dev(allow_network=allow_network)
+    else:
+        data = fetch_models_dev(
             allow_network=allow_network,
             allow_disk=allow_disk,
         )
-    )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return _default_override_context(provider)
