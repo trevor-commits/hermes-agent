@@ -266,6 +266,12 @@ def _emit_bootstrap_failure():
     sys.stdout.buffer.flush()
 
 
+def _emit_unauthenticated_entrypoint():
+    encoded = b'{"failure_code":"unauthenticated_entrypoint","manual_recovery_required":false,"ok":false,"schema_version":1,"status":"unsafe"}\n'
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
+
+
 if __name__ == "__main__":
     try:
         if _TRUSTED_RUNTIME_BOOTSTRAP:
@@ -290,6 +296,9 @@ if __name__ == "__main__":
             )
     except Exception:
         _emit_bootstrap_failure()
+        raise SystemExit(64)
+    if not _TRUSTED_RUNTIME_BOOTSTRAP and "--capabilities" not in sys.argv[1:]:
+        _emit_unauthenticated_entrypoint()
         raise SystemExit(64)
 
 
@@ -406,6 +415,8 @@ def recover_recorded_exchanges(
     resources,
     *,
     lock_timeout_seconds: Optional[float] = None,
+    _transactions_root_fd: Optional[int] = None,
+    _transactions_root_identity: Optional[tuple] = None,
 ):
     return _transaction.recover_recorded_exchanges(
         transaction_dir,
@@ -413,6 +424,8 @@ def recover_recorded_exchanges(
         lock_timeout_seconds=lock_timeout_seconds,
         _rename_swap_command=_rename_swap_at,
         _mapping_kind_command=_mapping_kind,
+        _transactions_root_fd=_transactions_root_fd,
+        _transactions_root_identity=_transactions_root_identity,
     )
 
 

@@ -5,6 +5,7 @@ import path from 'node:path'
 
 const SAFE_LEAF = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/
 const SAFE_TRANSACTION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const MAX_VERIFIED_RUNTIME_BYTES = 32 * 1024 * 1024
 
 export interface RuntimeAsset {
   readonly source: string
@@ -71,7 +72,6 @@ export interface LaunchPublishedAtomicMacosOptions {
   binding: PublishedRuntimeBinding
   command: 'capabilities' | 'recover'
   directory: string
-  environment?: NodeJS.ProcessEnv
   timeoutMs?: number
   transactionId?: string
   transactionsRoot: string
@@ -478,6 +478,11 @@ export function launchPublishedAtomicMacos(
   } catch {
     return launchFailure('runtime_validation_failed')
   }
+  if (
+    Object.values(validated.files).reduce((total, bytes) => total + bytes.byteLength, 0) > MAX_VERIFIED_RUNTIME_BYTES
+  ) {
+    return launchFailure('runtime_validation_failed')
+  }
 
   let argumentsList: string[]
   try {
@@ -517,18 +522,22 @@ export function launchPublishedAtomicMacos(
   const modes = Object.fromEntries(
     POSIX_UPDATER_RUNTIME_ASSETS.map(asset => [asset.target, asset.executable ? 0o500 : 0o400])
   )
-  const launched = spawnSync('/usr/bin/python3', ['-c', TRUSTED_PYTHON_BOOTSTRAP, path.resolve(options.directory)], {
-    encoding: 'utf8',
-    env: options.environment,
-    input: JSON.stringify({
-      arguments: argumentsList,
-      files,
-      modes,
-      runtime_transaction_id: options.binding.transactionId
-    }),
-    maxBuffer: 8192,
-    timeout: options.timeoutMs ?? 5000
-  })
+  const launched = spawnSync(
+    '/usr/bin/python3',
+    ['-I', '-S', '-c', TRUSTED_PYTHON_BOOTSTRAP, path.resolve(options.directory)],
+    {
+      encoding: 'utf8',
+      env: {},
+      input: JSON.stringify({
+        arguments: argumentsList,
+        files,
+        modes,
+        runtime_transaction_id: options.binding.transactionId
+      }),
+      maxBuffer: 8192,
+      timeout: options.timeoutMs ?? 5000
+    }
+  )
 
   const stdout = typeof launched.stdout === 'string' ? launched.stdout : ''
   const stderr = typeof launched.stderr === 'string' ? launched.stderr : ''

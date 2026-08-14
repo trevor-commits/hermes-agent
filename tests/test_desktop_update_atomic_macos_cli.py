@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import tempfile
 import time
 from typing import Optional
 import unittest
+from unittest import mock
 
 
 SOURCE_RUNTIME = Path(__file__).resolve().parents[1] / "scripts" / "desktop-update"
@@ -28,6 +30,29 @@ RUNTIME_MODES = {
     "serve-ui.py": 0o400,
     "ui.html": 0o400,
 }
+TRUSTED_TEST_BOOTSTRAP = """\
+import json
+import pathlib
+import sys
+import types
+
+runtime = pathlib.Path(sys.argv[1])
+modes = json.loads(sys.argv[2])
+verified = {leaf: (runtime / leaf).read_bytes() for leaf in modes}
+module = types.ModuleType("__main__")
+namespace = module.__dict__
+namespace.update({
+    "__file__": str(runtime / "atomic_macos.py"),
+    "__name__": "__main__",
+    "_HERMES_TRUSTED_RUNTIME_BOOTSTRAP": True,
+    "_HERMES_VERIFIED_RUNTIME_BYTES": verified,
+    "_HERMES_VERIFIED_RUNTIME_MODES": modes,
+    "_HERMES_VERIFIED_RUNTIME_TRANSACTION_ID": runtime.name,
+})
+sys.modules["__main__"] = module
+sys.argv = [namespace["__file__"], *sys.argv[3:]]
+exec(compile(verified["atomic_macos.py"], namespace["__file__"], "exec"), namespace, namespace)
+"""
 
 
 def canonical_manifest_bytes(transaction_id: str, runtime: Path) -> bytes:
@@ -188,10 +213,9 @@ def run_cli(
     *extra: str,
     environment: Optional[dict] = None,
     timeout: Optional[float] = None,
+    trusted: bool = True,
 ) -> subprocess.CompletedProcess:
-    command = [
-        PYTHON,
-        str(runtime / "atomic_macos.py"),
+    arguments = [
         "recover",
         "--transaction",
         transaction_id,
@@ -205,6 +229,10 @@ def run_cli(
         str(transactions_root),
         *extra,
     ]
+    if trusted:
+        command = trusted_cli_command(runtime, *arguments)
+    else:
+        command = [PYTHON, str(runtime / "atomic_macos.py"), *arguments]
     process_environment = os.environ.copy()
     if environment:
         process_environment.update(environment)
@@ -217,6 +245,19 @@ def run_cli(
         env=process_environment,
         timeout=timeout,
     )
+
+
+def trusted_cli_command(runtime: Path, *arguments: str) -> list:
+    return [
+        PYTHON,
+        "-I",
+        "-S",
+        "-c",
+        TRUSTED_TEST_BOOTSTRAP,
+        str(runtime),
+        json.dumps(RUNTIME_MODES, sort_keys=True),
+        *arguments,
+    ]
 
 
 class AtomicMacosRecoveryCliTests(unittest.TestCase):
@@ -262,9 +303,8 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(os.path.realpath(raw_tmp))
             runtime, binding = publish_real_runtime(root, "tx-test-root-gate")
-            command = [
-                PYTHON,
-                str(runtime / "atomic_macos.py"),
+            command = trusted_cli_command(
+                runtime,
                 "recover",
                 "--transaction",
                 "tx-test-root-gate",
@@ -276,7 +316,7 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 binding["manifest_sha256"],
                 "--transactions-root",
                 str(root / "transactions"),
-            ]
+            )
 
             selected_root = subprocess.run(command, check=False, capture_output=True, text=True)
             missing_root = subprocess.run(
@@ -321,6 +361,90 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 )
                 self.assertEqual(result.stderr, "")
 
+    def test_transactions_root_binding_rejects_an_ancestor_swap(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(os.path.realpath(raw_tmp))
+            active_parent = root / "active"
+            alternate_parent = root / "alternate"
+            active_parent.mkdir(mode=0o700)
+            alternate_parent.mkdir(mode=0o700)
+            requested_root = active_parent / "transactions"
+            alternate_root = alternate_parent / "transactions"
+            module_path = SOURCE_RUNTIME / "atomic_macos.py"
+            spec = importlib.util.spec_from_file_location("cli_root_binding_atomic", module_path)
+            atomic_macos = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = atomic_macos
+            spec.loader.exec_module(atomic_macos)
+            cli_module = atomic_macos._load_sibling("_atomic_macos_cli")
+            transaction_id = "tx-ancestor-swap"
+            intended = atomic_macos.create_transaction(requested_root, transaction_id)
+            intended.finish("succeeded", phase="intended_terminal")
+
+            live = root / "alternate-live"
+            candidate = root / "alternate-candidate"
+            live.mkdir()
+            candidate.mkdir()
+            (live / "version.txt").write_text("old", encoding="utf-8")
+            (candidate / "version.txt").write_text("new", encoding="utf-8")
+            alternate = atomic_macos.create_transaction(alternate_root, transaction_id)
+            atomic_macos.atomic_exchange(
+                live,
+                candidate,
+                receipt=alternate,
+                resource="source",
+                finish_on_success=False,
+            )
+            intended_before = intended.path.read_bytes()
+            alternate_before = alternate.path.read_bytes()
+            live_before = (live.stat().st_ino, (live / "version.txt").read_bytes())
+            candidate_before = (candidate.stat().st_ino, (candidate / "version.txt").read_bytes())
+            preserved_parent = root / "preserved-active"
+            real_validate_transaction = cli_module._validate_transaction_directory
+            swapped = False
+
+            def swap_ancestor_then_validate(*args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    os.rename(active_parent, preserved_parent)
+                    os.rename(alternate_parent, active_parent)
+                return real_validate_transaction(*args, **kwargs)
+
+            emitted = {}
+            with mock.patch.object(
+                cli_module,
+                "_validate_transaction_directory",
+                side_effect=swap_ancestor_then_validate,
+            ), mock.patch.object(
+                cli_module,
+                "_emit",
+                side_effect=lambda **payload: emitted.update(payload),
+            ):
+                result = cli_module.main(
+                    atomic_macos,
+                    [
+                        "recover",
+                        "--transaction",
+                        transaction_id,
+                        "--runtime-device",
+                        "1",
+                        "--runtime-inode",
+                        "1",
+                        "--manifest-sha256",
+                        "0" * 64,
+                        "--transactions-root",
+                        str(requested_root),
+                    ],
+                    runtime_transaction_id=transaction_id,
+                )
+
+            self.assertEqual(result, 75)
+            self.assertEqual(emitted["failure_code"], "unsafe_transactions_root")
+            self.assertEqual((preserved_parent / "transactions" / transaction_id / "receipt.json").read_bytes(), intended_before)
+            self.assertEqual((active_parent / "transactions" / transaction_id / "receipt.json").read_bytes(), alternate_before)
+            self.assertEqual((live.stat().st_ino, (live / "version.txt").read_bytes()), live_before)
+            self.assertEqual((candidate.stat().st_ino, (candidate / "version.txt").read_bytes()), candidate_before)
+
     def test_runtime_validation_happens_before_any_receipt_read(self):
         mutations = ("missing", "corrupt", "symlink", "digest", "inode")
         for mutation in mutations:
@@ -344,7 +468,13 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 else:
                     binding["runtime_inode"] = str(int(binding["runtime_inode"]) + 1)
 
-                result = run_cli(runtime, binding, transaction_id, transactions_root)
+                result = run_cli(
+                    runtime,
+                    binding,
+                    transaction_id,
+                    transactions_root,
+                    trusted=False,
+                )
 
                 self.assertEqual(result.returncode, 64, result.stderr)
                 payload = json.loads(result.stdout)
@@ -386,7 +516,13 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 else:
                     (runtime / "unexpected.py").write_text("unexpected\n", encoding="utf-8")
 
-                result = run_cli(runtime, binding, transaction_id, transactions_root)
+                result = run_cli(
+                    runtime,
+                    binding,
+                    transaction_id,
+                    transactions_root,
+                    trusted=False,
+                )
 
                 self.assertEqual(result.returncode, 64, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["failure_code"], "runtime_validation_failed")
@@ -405,6 +541,58 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64)
                 self.assertEqual(json.loads(result.stdout)["failure_code"], "invalid_transaction")
                 self.assertFalse(transactions_root.exists())
+
+    def test_direct_pathname_recovery_is_explicitly_unauthenticated(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(os.path.realpath(raw_tmp))
+            transaction_id = "tx-direct-unauthenticated"
+            runtime, binding = publish_real_runtime(root / "runtime", transaction_id)
+            transactions_root = root / "transactions"
+            live = root / "live"
+            candidate = root / "candidate"
+            live.mkdir()
+            candidate.mkdir()
+            (live / "version.txt").write_text("old", encoding="utf-8")
+            (candidate / "version.txt").write_text("new", encoding="utf-8")
+            create_original_receipt(
+                runtime,
+                transactions_root,
+                transaction_id,
+                live,
+                candidate,
+            )
+            receipt_path = transactions_root / transaction_id / "receipt.json"
+            receipt_before = receipt_path.read_bytes()
+            live_before = (live.stat().st_ino, (live / "version.txt").read_bytes())
+            candidate_before = (
+                candidate.stat().st_ino,
+                (candidate / "version.txt").read_bytes(),
+            )
+
+            result = run_cli(
+                runtime,
+                binding,
+                transaction_id,
+                transactions_root,
+                trusted=False,
+            )
+
+            self.assertEqual(result.returncode, 64, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                json.loads(result.stdout)["failure_code"],
+                "unauthenticated_entrypoint",
+            )
+            self.assertLessEqual(len(result.stdout.encode("utf-8")), 4096)
+            self.assertEqual(receipt_path.read_bytes(), receipt_before)
+            self.assertEqual(
+                (live.stat().st_ino, (live / "version.txt").read_bytes()),
+                live_before,
+            )
+            self.assertEqual(
+                (candidate.stat().st_ino, (candidate / "version.txt").read_bytes()),
+                candidate_before,
+            )
 
     def test_successful_noop_recovery_emits_a_bounded_terminal_result(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -601,9 +789,8 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(locker.stdout.readline().strip(), "locked")
-            command = [
-                PYTHON,
-                str(runtime / "atomic_macos.py"),
+            command = trusted_cli_command(
+                runtime,
                 "recover",
                 "--transaction",
                 transaction_id,
@@ -615,7 +802,7 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
                 binding["manifest_sha256"],
                 "--transactions-root",
                 str(transactions_root),
-            ]
+            )
             environment = os.environ.copy()
             queued = [
                 subprocess.Popen(

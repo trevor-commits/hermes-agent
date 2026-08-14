@@ -399,3 +399,114 @@ test('trusted launcher maps unsafe caller input to a bounded failure', () => {
   assert.equal(launched.stdout.includes(path.dirname(runtimeRoot)), false)
   assert.equal(launched.stderr, '')
 })
+
+test('trusted launcher isolates Python startup from inherited environment hooks', () => {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'hermes-isolated-launch-'))
+  const runtimeRoot = path.join(root, 'runtime')
+  const transactionsRoot = path.join(root, 'transactions')
+  const startupRoot = path.join(root, 'python-startup')
+  const sitecustomizeMarker = path.join(root, 'sitecustomize-executed')
+  const environmentMarker = path.join(root, 'child-environment')
+  const canonicalSourceRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../../scripts/desktop-update'
+  )
+  const sourceRoot = path.join(root, 'source')
+  const transactionId = 'tx-isolated-launch'
+  fs.mkdirSync(sourceRoot)
+  for (const asset of POSIX_UPDATER_RUNTIME_ASSETS) {
+    fs.copyFileSync(path.join(canonicalSourceRoot, asset.source), path.join(sourceRoot, asset.source))
+  }
+  const atomicPath = path.join(sourceRoot, 'atomic_macos.py')
+  const atomicSource = fs.readFileSync(atomicPath, 'utf8')
+  fs.writeFileSync(
+    atomicPath,
+    atomicSource.replace(
+      'import os\n',
+      [
+        'import os',
+        `__import__("pathlib").Path(${JSON.stringify(environmentMarker)}).write_text(os.environ.get("HERMES_CREDENTIAL_SENTINEL", "missing"))`
+      ].join('\n') + '\n'
+    )
+  )
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  fs.mkdirSync(startupRoot)
+  fs.writeFileSync(
+    path.join(startupRoot, 'sitecustomize.py'),
+    [
+      'import os',
+      'import pathlib',
+      `pathlib.Path(${JSON.stringify(sitecustomizeMarker)}).write_text(os.environ.get("HERMES_CREDENTIAL_SENTINEL", "missing"))`,
+      'print("forged startup output")'
+    ].join('\n')
+  )
+  const previousPythonPath = process.env.PYTHONPATH
+  const previousCredential = process.env.HERMES_CREDENTIAL_SENTINEL
+  process.env.PYTHONPATH = startupRoot
+  process.env.HERMES_CREDENTIAL_SENTINEL = 'must-not-reach-child'
+  let launched
+  try {
+    launched = launchPublishedAtomicMacos({
+      binding: {
+        directoryDevice: result.directoryDevice,
+        directoryInode: result.directoryInode,
+        manifestSha256: result.manifestSha256,
+        transactionId
+      },
+      command: 'capabilities',
+      directory: result.directory,
+      transactionsRoot
+    })
+  } finally {
+    if (previousPythonPath === undefined) delete process.env.PYTHONPATH
+    else process.env.PYTHONPATH = previousPythonPath
+    if (previousCredential === undefined) delete process.env.HERMES_CREDENTIAL_SENTINEL
+    else process.env.HERMES_CREDENTIAL_SENTINEL = previousCredential
+  }
+
+  assert.equal(launched.status, 0, launched.stderr || launched.stdout)
+  assert.deepEqual(JSON.parse(launched.stdout), { commands: ['recover'], schema_version: 1 })
+  assert.equal(launched.stderr, '')
+  assert.equal(fs.existsSync(sitecustomizeMarker), false)
+  assert.equal(fs.readFileSync(environmentMarker, 'utf8'), 'missing')
+})
+
+test('trusted launcher rejects aggregate-valid oversized runtime before execution', () => {
+  const { root, runtimeRoot, sourceRoot } = fixture()
+  const marker = path.join(root, 'aggregate-runtime-executed')
+  const perAssetSize = 4 * 1024 * 1024 + 1
+  for (const asset of POSIX_UPDATER_RUNTIME_ASSETS) {
+    const prefix =
+      asset.target === 'atomic_macos.py'
+        ? Buffer.from(
+            [
+              'import pathlib',
+              `pathlib.Path(${JSON.stringify(marker)}).write_text("executed")`,
+              'print("{\\"commands\\":[\\"recover\\"],\\"schema_version\\":1}")',
+              '#'
+            ].join('\n')
+          )
+        : Buffer.from('#\n')
+    const payload = Buffer.alloc(perAssetSize, 0x20)
+    prefix.copy(payload)
+    fs.writeFileSync(path.join(sourceRoot, asset.source), payload)
+  }
+  const transactionId = 'tx-aggregate-limit'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: result.manifestSha256,
+      transactionId
+    },
+    command: 'capabilities',
+    directory: result.directory,
+    transactionsRoot: path.join(root, 'transactions')
+  })
+
+  assert.equal(launched.status, 64)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'runtime_validation_failed')
+  assert.equal(fs.existsSync(marker), false)
+})

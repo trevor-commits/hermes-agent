@@ -153,6 +153,25 @@ def _identity_tuple(file_stat: os.stat_result) -> tuple:
     return (file_stat.st_dev, file_stat.st_ino)
 
 
+def _receipt_file_identity(file_stat: os.stat_result) -> tuple:
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PermissionError("transaction receipt must be an owner-owned regular file")
+    if file_stat.st_uid != os.geteuid():
+        raise PermissionError("transaction receipt must be an owner-owned regular file")
+    if stat.S_IMODE(file_stat.st_mode) & 0o077:
+        raise PermissionError("transaction receipt must be owner-only")
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        stat.S_IMODE(file_stat.st_mode),
+        file_stat.st_uid,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
 def _validated_directory_identity(
     path_stat: os.stat_result,
     opened_stat: os.stat_result,
@@ -215,6 +234,151 @@ def _canonical_transactions_root(path: PathLike) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
 
+def _root_directory_identity(file_stat: os.stat_result) -> tuple:
+    if not stat.S_ISDIR(file_stat.st_mode) or stat.S_ISLNK(file_stat.st_mode):
+        raise PermissionError("transactions root must be a real directory")
+    if file_stat.st_uid != os.geteuid():
+        raise PermissionError("transactions root must be owner-owned")
+    if stat.S_IMODE(file_stat.st_mode) != 0o700:
+        raise PermissionError("transactions root must have mode 0700")
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        stat.S_IFMT(file_stat.st_mode),
+        stat.S_IMODE(file_stat.st_mode),
+        file_stat.st_uid,
+    )
+
+
+def _open_canonical_transactions_root(path: Path) -> tuple:
+    """Open every absolute path component without following a symlink."""
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError("transactions root must be canonical and absolute")
+    descriptor = os.open(os.path.sep, _directory_open_flags())
+    try:
+        for component in path.parts[1:]:
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise PermissionError("transactions root path must contain real directories")
+            opened_descriptor = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(opened_descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                stat.S_IFMT(before.st_mode),
+                stat.S_IMODE(before.st_mode),
+                before.st_uid,
+            )
+            opened_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                stat.S_IFMT(opened.st_mode),
+                stat.S_IMODE(opened.st_mode),
+                opened.st_uid,
+            )
+            if before_identity != opened_identity:
+                os.close(opened_descriptor)
+                raise RuntimeError("transactions root path changed while opening")
+            os.close(descriptor)
+            descriptor = opened_descriptor
+        identity = _root_directory_identity(os.fstat(descriptor))
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class _TransactionsRootBinding:
+    """Borrowed caller-held descriptor binding all transaction path operations."""
+
+    def __init__(self, path: PathLike, descriptor: int, identity: tuple) -> None:
+        self.path = _canonical_transactions_root(path)
+        self.descriptor = descriptor
+        self.identity = tuple(identity)
+        self.require(self.path)
+
+    def require(self, path: PathLike) -> None:
+        expected_path = _canonical_transactions_root(path)
+        if expected_path != self.path:
+            raise RuntimeError("transactions root binding path does not match")
+        if _root_directory_identity(os.fstat(self.descriptor)) != self.identity:
+            raise RuntimeError("held transactions root identity changed")
+        current_fd, current_identity = _open_canonical_transactions_root(self.path)
+        try:
+            if current_identity != self.identity:
+                raise RuntimeError("transactions root path no longer matches its binding")
+        finally:
+            os.close(current_fd)
+
+
+def _root_binding_from_options(
+    transactions_root: PathLike,
+    *,
+    _root_binding: Optional[_TransactionsRootBinding] = None,
+    _transactions_root_fd: Optional[int] = None,
+    _transactions_root_identity: Optional[tuple] = None,
+) -> Optional[_TransactionsRootBinding]:
+    if _root_binding is not None:
+        if _transactions_root_fd is not None or _transactions_root_identity is not None:
+            raise ValueError("transactions root binding arguments conflict")
+        _root_binding.require(transactions_root)
+        return _root_binding
+    if (_transactions_root_fd is None) != (_transactions_root_identity is None):
+        raise ValueError("transactions root binding is incomplete")
+    if _transactions_root_fd is None:
+        return None
+    return _TransactionsRootBinding(
+        transactions_root,
+        _transactions_root_fd,
+        _transactions_root_identity,
+    )
+
+
+def _open_transaction_directory(
+    directory: Path,
+    binding: Optional[_TransactionsRootBinding],
+) -> int:
+    if binding is None:
+        return _open_verified_directory(directory, owner_only=True)
+    binding.require(directory.parent)
+    leaf = validate_generated_leaf(directory.name)
+    before = os.stat(leaf, dir_fd=binding.descriptor, follow_symlinks=False)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) != 0o700
+    ):
+        raise PermissionError("transaction directory must be owner-only")
+    descriptor = os.open(leaf, _directory_open_flags(), dir_fd=binding.descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            stat.S_IFMT(before.st_mode),
+            stat.S_IMODE(before.st_mode),
+            before.st_uid,
+        )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+            stat.S_IMODE(opened.st_mode),
+            opened.st_uid,
+        )
+        if before_identity != opened_identity:
+            raise RuntimeError("transaction directory changed while opening")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _receipt_lock_transaction_id(data: Dict[str, Any]) -> str:
     lock_transaction_id = data.get("lock_transaction_id")
     if lock_transaction_id is None:
@@ -236,10 +400,12 @@ class _TransactionGuard:
         transactions_root: Path,
         transaction_id: str,
         descriptor: int,
+        root_binding: Optional[_TransactionsRootBinding] = None,
     ) -> None:
         self.transactions_root = transactions_root
         self.transaction_id = transaction_id
         self.descriptor = descriptor
+        self.root_binding = root_binding
         self._active = True
 
     def require(self, transactions_root: PathLike, transaction_id: str) -> None:
@@ -252,6 +418,8 @@ class _TransactionGuard:
             or expected_id != self.transaction_id
         ):
             raise RuntimeError("transaction guard does not match the receipt lock root")
+        if self.root_binding is not None:
+            self.root_binding.require(expected_root)
 
     def release(self) -> None:
         self._active = False
@@ -282,6 +450,7 @@ def _transaction_guard(
     transaction_id: str,
     *,
     lock_timeout_seconds: Optional[float] = None,
+    _root_binding: Optional[_TransactionsRootBinding] = None,
 ):
     if lock_timeout_seconds is not None:
         if isinstance(lock_timeout_seconds, bool):
@@ -293,9 +462,10 @@ def _transaction_guard(
     else:
         deadline = None
     root = _canonical_transactions_root(transactions_root)
+    binding = _root_binding_from_options(root, _root_binding=_root_binding)
     lock_transaction_id = validate_generated_leaf(transaction_id)
     transaction_dir = root / lock_transaction_id
-    directory_fd = _open_verified_directory(transaction_dir, owner_only=True)
+    directory_fd = _open_transaction_directory(transaction_dir, binding)
     base_flags = (
         os.O_RDWR
         | getattr(os, "O_NOFOLLOW", 0)
@@ -350,7 +520,9 @@ def _transaction_guard(
                     ) from error
                 time.sleep(min(0.01, remaining))
         _validate_transaction_lock(lock_fd, directory_fd)
-        guard = _TransactionGuard(root, lock_transaction_id, lock_fd)
+        if binding is not None:
+            binding.require(root)
+        guard = _TransactionGuard(root, lock_transaction_id, lock_fd, binding)
         yield guard
     finally:
         if guard is not None:
@@ -366,8 +538,13 @@ def _transaction_guard(
             os.close(directory_fd)
 
 
-def _atomic_json_write(directory: Path, payload: Dict[str, Any]) -> Path:
-    directory_fd = _open_verified_directory(directory, owner_only=True)
+def _atomic_json_write(
+    directory: Path,
+    payload: Dict[str, Any],
+    *,
+    _root_binding: Optional[_TransactionsRootBinding] = None,
+) -> Path:
+    directory_fd = _open_transaction_directory(directory, _root_binding)
     temporary_leaf = ".receipt-{}.tmp".format(uuid.uuid4().hex)
     validate_generated_leaf(temporary_leaf)
     flags = (
@@ -423,7 +600,11 @@ def _receipt_write_guard(
         guard.require(transactions_root, lock_transaction_id)
         yield guard
         return
-    with _transaction_guard(transactions_root, lock_transaction_id) as acquired:
+    with _transaction_guard(
+        transactions_root,
+        lock_transaction_id,
+        _root_binding=receipt._root_binding,
+    ) as acquired:
         yield acquired
 
 
@@ -437,15 +618,20 @@ class TransactionReceipt:
         *,
         receipt_identity: Optional[tuple] = None,
         receipt_digest: Optional[str] = None,
+        root_binding: Optional[_TransactionsRootBinding] = None,
     ) -> None:
         self.transaction_dir = Path(transaction_dir)
         self.path = self.transaction_dir / _RECEIPT_NAME
         self.data = data
         self._receipt_identity = receipt_identity
         self._receipt_digest = receipt_digest
+        self._root_binding = root_binding
 
     def _refresh_metadata(self) -> None:
-        refreshed = load_transaction(self.transaction_dir)
+        refreshed = load_transaction(
+            self.transaction_dir,
+            _root_binding=self._root_binding,
+        )
         self._receipt_identity = refreshed._receipt_identity
         self._receipt_digest = refreshed._receipt_digest
 
@@ -454,7 +640,10 @@ class TransactionReceipt:
             self.transaction_dir.parent,
             _receipt_lock_transaction_id(self.data),
         )
-        current = load_transaction(self.transaction_dir)
+        current = load_transaction(
+            self.transaction_dir,
+            _root_binding=self._root_binding,
+        )
         guard.require(
             current.transaction_dir.parent,
             _receipt_lock_transaction_id(current.data),
@@ -493,7 +682,11 @@ class TransactionReceipt:
                 self.transaction_dir.parent,
                 _receipt_lock_transaction_id(proposed),
             )
-            _atomic_json_write(self.transaction_dir, proposed)
+            _atomic_json_write(
+                self.transaction_dir,
+                proposed,
+                _root_binding=self._root_binding,
+            )
             self.data = proposed
             self._refresh_metadata()
 
@@ -534,7 +727,11 @@ class TransactionReceipt:
                 self.transaction_dir.parent,
                 _receipt_lock_transaction_id(proposed),
             )
-            _atomic_json_write(self.transaction_dir, proposed)
+            _atomic_json_write(
+                self.transaction_dir,
+                proposed,
+                _root_binding=self._root_binding,
+            )
             self.data = proposed
             self._refresh_metadata()
 
@@ -545,21 +742,29 @@ def create_transaction(
     *,
     lock_transaction_id: Optional[str] = None,
     _guard: Optional[_TransactionGuard] = None,
+    _root_binding: Optional[_TransactionsRootBinding] = None,
 ) -> TransactionReceipt:
     """Create an owner-only transaction directory and initial receipt."""
     root = _canonical_transactions_root(transactions_root)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    binding = _root_binding_from_options(root, _root_binding=_root_binding)
+    if binding is None:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
     leaf = validate_generated_leaf(
         transaction_id or "txn-{}".format(uuid.uuid4().hex)
     )
     lock_leaf = validate_generated_leaf(lock_transaction_id or leaf)
     transaction_dir = root / leaf
-    root_fd = _open_verified_directory(root, owner_only=True)
+    root_fd = (
+        _open_verified_directory(root, owner_only=True)
+        if binding is None
+        else binding.descriptor
+    )
     try:
         os.mkdir(leaf, 0o700, dir_fd=root_fd)
         os.fsync(root_fd)
     finally:
-        os.close(root_fd)
+        if binding is None:
+            os.close(root_fd)
 
     now = _utc_now()
     data: Dict[str, Any] = {
@@ -581,17 +786,29 @@ def create_transaction(
     }
     if _guard is not None:
         _guard.require(root, lock_leaf)
-        _atomic_json_write(transaction_dir, data)
+        _atomic_json_write(transaction_dir, data, _root_binding=binding)
     else:
-        with _transaction_guard(root, lock_leaf):
-            _atomic_json_write(transaction_dir, data)
-    return load_transaction(transaction_dir)
+        with _transaction_guard(root, lock_leaf, _root_binding=binding):
+            _atomic_json_write(transaction_dir, data, _root_binding=binding)
+    return load_transaction(transaction_dir, _root_binding=binding)
 
 
-def load_transaction(transaction_dir: PathLike) -> TransactionReceipt:
+def load_transaction(
+    transaction_dir: PathLike,
+    *,
+    _root_binding: Optional[_TransactionsRootBinding] = None,
+    _transactions_root_fd: Optional[int] = None,
+    _transactions_root_identity: Optional[tuple] = None,
+) -> TransactionReceipt:
     """Load and validate an existing schema-v1 transaction receipt."""
     directory = Path(transaction_dir)
-    directory_fd = _open_verified_directory(directory, owner_only=True)
+    binding = _root_binding_from_options(
+        directory.parent,
+        _root_binding=_root_binding,
+        _transactions_root_fd=_transactions_root_fd,
+        _transactions_root_identity=_transactions_root_identity,
+    )
+    directory_fd = _open_transaction_directory(directory, binding)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     receipt_fd: Optional[int] = None
     try:
@@ -600,18 +817,13 @@ def load_transaction(transaction_dir: PathLike) -> TransactionReceipt:
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
-            raise PermissionError("transaction receipt must be an owner-owned regular file")
-        if before.st_mode & 0o077:
-            raise PermissionError("transaction receipt must be owner-only")
+        before_identity = _receipt_file_identity(before)
         if before.st_size < 0 or before.st_size > _MAX_RECEIPT_BYTES:
             raise ValueError("transaction receipt exceeds the receipt size limit")
         receipt_fd = os.open(_RECEIPT_NAME, flags, dir_fd=directory_fd)
         opened = os.fstat(receipt_fd)
-        if (
-            _identity_tuple(before) != _identity_tuple(opened)
-            or before.st_size != opened.st_size
-        ):
+        opened_identity = _receipt_file_identity(opened)
+        if before_identity != opened_identity:
             raise RuntimeError("transaction receipt identity changed while opening")
         chunks = []
         remaining = _MAX_RECEIPT_BYTES + 1
@@ -623,11 +835,11 @@ def load_transaction(transaction_dir: PathLike) -> TransactionReceipt:
             remaining -= len(chunk)
         encoded = b"".join(chunks)
         after = os.fstat(receipt_fd)
+        after_identity = _receipt_file_identity(after)
         if len(encoded) > _MAX_RECEIPT_BYTES:
             raise ValueError("transaction receipt exceeds the receipt size limit")
         if (
-            _identity_tuple(opened) != _identity_tuple(after)
-            or opened.st_size != after.st_size
+            opened_identity != after_identity
             or len(encoded) != opened.st_size
         ):
             raise RuntimeError("transaction receipt changed while reading")
@@ -666,6 +878,7 @@ def load_transaction(transaction_dir: PathLike) -> TransactionReceipt:
         data,
         receipt_identity=_identity_tuple(after),
         receipt_digest=hashlib.sha256(encoded).hexdigest(),
+        root_binding=binding,
     )
 
 
@@ -1062,7 +1275,10 @@ def _validate_original_receipt_reference(
     expected_path = receipt.transaction_dir.parent / transaction_id / _RECEIPT_NAME
     if receipt_path != expected_path:
         raise ValueError("original recovery receipt path leaves the transaction root")
-    original = load_transaction(receipt_path.parent)
+    original = load_transaction(
+        receipt_path.parent,
+        _root_binding=receipt._root_binding,
+    )
     if original.data["transaction_id"] != transaction_id:
         raise RuntimeError("original recovery transaction identity changed")
     if original._receipt_identity != expected_identity:
@@ -1325,6 +1541,8 @@ def recover_recorded_exchanges(
     lock_timeout_seconds: Optional[float] = None,
     _rename_swap_command=None,
     _mapping_kind_command=None,
+    _transactions_root_fd: Optional[int] = None,
+    _transactions_root_identity: Optional[tuple] = None,
 ):
     """Recover ordered receipt resources while holding one root transaction guard."""
     if not isinstance(resources, (list, tuple)) or not resources:
@@ -1336,7 +1554,11 @@ def recover_recorded_exchanges(
     if len(set(ordered_resources)) != len(ordered_resources):
         raise ValueError("recovery resource sequence must not contain duplicates")
 
-    preliminary = load_transaction(transaction_dir)
+    preliminary = load_transaction(
+        transaction_dir,
+        _transactions_root_fd=_transactions_root_fd,
+        _transactions_root_identity=_transactions_root_identity,
+    )
     _validate_complete_recovery_sequence(preliminary, ordered_resources)
     lock_transaction_id = _receipt_lock_transaction_id(preliminary.data)
     current_dir = preliminary.transaction_dir
@@ -1346,8 +1568,12 @@ def recover_recorded_exchanges(
         preliminary.transaction_dir.parent,
         lock_transaction_id,
         lock_timeout_seconds=lock_timeout_seconds,
+        _root_binding=preliminary._root_binding,
     ) as guard:
-        receipt = load_transaction(current_dir)
+        receipt = load_transaction(
+            current_dir,
+            _root_binding=guard.root_binding,
+        )
         _validate_complete_recovery_sequence(receipt, ordered_resources)
         if receipt.is_terminal and receipt.data.get("status") != "manual_recovery_required":
             return receipt, processed
@@ -1451,7 +1677,10 @@ def _recover_exchange_locked(
     mapping_kind = (
         _mapping_kind if _mapping_kind_command is None else _mapping_kind_command
     )
-    receipt = load_transaction(transaction_dir)
+    receipt = load_transaction(
+        transaction_dir,
+        _root_binding=_guard.root_binding,
+    )
     _guard.require(
         receipt.transaction_dir.parent,
         _receipt_lock_transaction_id(receipt.data),
@@ -1482,6 +1711,7 @@ def _recover_exchange_locked(
             "recovery-{}".format(uuid.uuid4().hex),
             lock_transaction_id=_guard.transaction_id,
             _guard=_guard,
+            _root_binding=_guard.root_binding,
         )
         attempt.record_phase(
             "recovery_attempt_created",

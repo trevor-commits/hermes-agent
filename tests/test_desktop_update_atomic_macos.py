@@ -2146,6 +2146,45 @@ print(recovered.data["status"])
                 with self.assertRaisesRegex(RuntimeError, "changed while reading"):
                     atomic_macos.load_transaction(receipt.transaction_dir)
 
+    def test_transaction_receipt_detects_same_size_rewrite_while_reading(self):
+        atomic_macos = load_atomic_macos()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            receipt = atomic_macos.create_transaction(
+                Path(raw_tmp) / "transactions",
+                "txn-same-size-rewrite",
+            )
+            original = receipt.path.read_bytes()
+            replacement = original.replace(
+                b'"phase":"created"',
+                b'"phase":"altered"',
+            )
+            self.assertNotEqual(replacement, original)
+            self.assertEqual(len(replacement), len(original))
+            transaction_module = atomic_macos._transaction
+            real_read = transaction_module.os.read
+            rewritten = False
+
+            def read_then_rewrite(descriptor, size):
+                nonlocal rewritten
+                payload = real_read(descriptor, size)
+                if payload and not rewritten:
+                    rewritten = True
+                    before = receipt.path.stat()
+                    with receipt.path.open("r+b") as handle:
+                        handle.write(replacement)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        receipt.path,
+                        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+                    )
+                return payload
+
+            with mock.patch.object(transaction_module.os, "read", side_effect=read_then_rewrite):
+                with self.assertRaisesRegex(RuntimeError, "changed while reading"):
+                    atomic_macos.load_transaction(receipt.transaction_dir)
+
     def test_ambiguous_resource_recovery_preserves_other_exchange_records(self):
         atomic_macos = load_atomic_macos()
 

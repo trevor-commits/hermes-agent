@@ -119,10 +119,95 @@ def _recovery_resources(receipt):
     return [resource for resource in ("app", "source") if resource in exchanges]
 
 
-def _validate_transaction_directory(transaction_dir):
+def _directory_identity(observed):
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        stat.S_IFMT(observed.st_mode),
+        stat.S_IMODE(observed.st_mode),
+        observed.st_uid,
+    )
+
+
+def _directory_flags():
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_transactions_root_components(canonical):
+    descriptor = os.open(os.path.sep, _directory_flags())
+    try:
+        for component in Path(canonical).parts[1:]:
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise _RecoveryError("unsafe_transactions_root")
+            opened_descriptor = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(opened_descriptor)
+            if _directory_identity(before) != _directory_identity(opened):
+                os.close(opened_descriptor)
+                raise _RecoveryError("unsafe_transactions_root")
+            os.close(descriptor)
+            descriptor = opened_descriptor
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise _RecoveryError("unsafe_transactions_root")
+        return descriptor, _directory_identity(opened)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class _TransactionsRootBinding:
+    def __init__(self, path, descriptor, identity):
+        self.path = Path(path)
+        self.descriptor = descriptor
+        self.identity = identity
+
+    def require_current(self):
+        if _directory_identity(os.fstat(self.descriptor)) != self.identity:
+            raise _RecoveryError("unsafe_transactions_root")
+        current_descriptor = None
+        try:
+            current_descriptor, current_identity = _open_transactions_root_components(
+                str(self.path)
+            )
+            if current_identity != self.identity:
+                raise _RecoveryError("unsafe_transactions_root")
+        finally:
+            if current_descriptor is not None:
+                os.close(current_descriptor)
+
+    def close(self):
+        descriptor = self.descriptor
+        self.descriptor = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _validate_transaction_directory(root_binding, transaction_id):
     descriptor = None
     try:
-        before = transaction_dir.lstat()
+        root_binding.require_current()
+        before = os.stat(
+            transaction_id,
+            dir_fd=root_binding.descriptor,
+            follow_symlinks=False,
+        )
         if (
             stat.S_ISLNK(before.st_mode)
             or not stat.S_ISDIR(before.st_mode)
@@ -130,21 +215,15 @@ def _validate_transaction_directory(transaction_dir):
             or stat.S_IMODE(before.st_mode) != 0o700
         ):
             raise _RecoveryError("unsafe_transaction_directory")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(
+            transaction_id,
+            _directory_flags(),
+            dir_fd=root_binding.descriptor,
         )
-        descriptor = os.open(str(transaction_dir), flags)
         opened = os.fstat(descriptor)
-        if (
-            (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
-            or not stat.S_ISDIR(opened.st_mode)
-            or stat.S_IMODE(opened.st_mode) != 0o700
-            or opened.st_uid != os.geteuid()
-        ):
+        if _directory_identity(before) != _directory_identity(opened):
             raise _RecoveryError("unsafe_transaction_directory")
+        root_binding.require_current()
     except _RecoveryError:
         raise
     except (OSError, ValueError):
@@ -161,54 +240,27 @@ def _validate_transactions_root(requested_root):
     if not os.path.isabs(requested_root) or os.path.normpath(requested_root) != requested_root:
         raise _RecoveryError("unsafe_transactions_root")
 
-    current = Path(canonical).anchor
     try:
-        for component in Path(canonical).parts[1:]:
-            current = os.path.join(current, component)
-            if stat.S_ISLNK(os.lstat(current).st_mode):
-                raise _RecoveryError("unsafe_transactions_root")
-        before = os.lstat(canonical)
-        if (
-            not stat.S_ISDIR(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or stat.S_IMODE(before.st_mode) != 0o700
-        ):
-            raise _RecoveryError("unsafe_transactions_root")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        descriptor = os.open(canonical, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
-                != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid)
-                or not stat.S_ISDIR(opened.st_mode)
-                or stat.S_IMODE(opened.st_mode) != 0o700
-                or opened.st_uid != os.geteuid()
-            ):
-                raise _RecoveryError("unsafe_transactions_root")
-        finally:
-            os.close(descriptor)
+        descriptor, identity = _open_transactions_root_components(canonical)
     except _RecoveryError:
         raise
     except (OSError, ValueError):
         raise _RecoveryError("unsafe_transactions_root") from None
-    return Path(canonical)
+    return _TransactionsRootBinding(Path(canonical), descriptor, identity)
 
 
-def _recover(engine, transaction_dir, resources):
+def _recover(engine, transaction_dir, resources, root_binding):
     return engine.recover_recorded_exchanges(
         transaction_dir,
         resources,
         lock_timeout_seconds=_RECOVERY_LOCK_TIMEOUT_SECONDS,
+        _transactions_root_fd=root_binding.descriptor,
+        _transactions_root_identity=root_binding.identity,
     )
 
 
 def main(engine, arguments, *, runtime_transaction_id):
+    root_binding = None
     try:
         values, flags, positionals = _parse(arguments)
         if "--capabilities" in flags:
@@ -227,11 +279,15 @@ def main(engine, arguments, *, runtime_transaction_id):
         ):
             raise _UsageError("invalid_transaction")
 
-        transactions_root = _validate_transactions_root(values.get("--transactions-root"))
+        root_binding = _validate_transactions_root(values.get("--transactions-root"))
 
-        transaction_dir = transactions_root / transaction_id
-        _validate_transaction_directory(transaction_dir)
-        receipt = engine.load_transaction(transaction_dir)
+        transaction_dir = root_binding.path / transaction_id
+        _validate_transaction_directory(root_binding, transaction_id)
+        receipt = engine.load_transaction(
+            transaction_dir,
+            _transactions_root_fd=root_binding.descriptor,
+            _transactions_root_identity=root_binding.identity,
+        )
         if receipt.data.get("transaction_id") != transaction_id:
             raise RuntimeError("receipt transaction identity does not match")
         if receipt.is_terminal and receipt.data.get("status") in _TERMINAL_RECOVERED:
@@ -243,7 +299,12 @@ def main(engine, arguments, *, runtime_transaction_id):
             return 0
 
         resources = _recovery_resources(receipt)
-        recovered, processed = _recover(engine, transaction_dir, resources)
+        recovered, processed = _recover(
+            engine,
+            transaction_dir,
+            resources,
+            root_binding,
+        )
         status = recovered.data.get("status")
         failure_code = recovered.data.get("failure_code")
         if status in _TERMINAL_RECOVERED and (
@@ -279,3 +340,6 @@ def main(engine, arguments, *, runtime_transaction_id):
     except Exception:
         _emit(ok=False, status="unrecovered", failure_code="recovery_failed")
         return 75
+    finally:
+        if root_binding is not None:
+            root_binding.close()
