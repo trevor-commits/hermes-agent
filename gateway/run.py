@@ -18019,6 +18019,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _proactive_rollover_must_defer(
+        self,
+        source,
+        session_key: str,
+        session_id: str,
+    ) -> bool:
+        """Fail closed when any current-session work could cross rollover."""
+        try:
+            adapter = self._adapter_for_source(source)
+            adapter_pending = (
+                getattr(adapter, "_pending_messages", None) if adapter else None
+            )
+            if adapter_pending and adapter_pending.get(session_key) is not None:
+                return True
+            if (getattr(self, "_queued_events", None) or {}).get(session_key):
+                return True
+
+            from tools.async_delegation import has_live_for_session
+
+            if has_live_for_session(
+                session_key=session_key,
+                parent_session_id=session_id,
+            ):
+                return True
+            if await self.async_session_store.has_dirty_transcript(session_id):
+                return True
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Proactive rollover pending-work probe failed for %s; "
+                "deferring: %s",
+                session_key,
+                exc,
+            )
+            return True
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -20015,7 +20051,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not is_context_overflow_failure
                     and session_entry
                     and session_key
-                    and not self._pending_messages.get(session_key)
                 ):
                     _pr_threshold = int(
                         getattr(
@@ -20028,50 +20063,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr_used = int(agent_result.get("last_prompt_tokens") or 0)
                     if _pr_threshold > 0 and _pr_used >= _pr_threshold:
                         _pr_old_id = session_entry.session_id
-                        _pr_digest = _build_proactive_rollover_carryover(
-                            agent_messages, old_session_id=_pr_old_id
-                        )
-                        new_entry = await self.async_session_store.reset_session(
-                            session_key
-                        )
-                        self._evict_cached_agent(session_key)
-                        self._clear_conversation_scope(
-                            session_key, reason="proactive_rollover"
-                        )
-                        if new_entry is not None:
-                            session_entry = new_entry
-                            await asyncio.to_thread(
-                                self._sync_telegram_topic_binding,
-                                source,
-                                session_entry,
-                                reason="proactive-rollover",
-                            )
-                            await self.async_session_store.append_to_transcript(
-                                session_entry.session_id,
-                                {
-                                    "role": "user",
-                                    "content": _pr_digest,
-                                    "_compressed_summary": True,
-                                    "display_kind": "hidden",
-                                    "timestamp": time.time(),
-                                },
-                            )
-                        logger.info(
-                            "Proactive rollover: session %s reached %d prompt "
-                            "tokens (threshold %d); rolled to fresh session %s "
-                            "with a carryover digest.",
+                        if await self._proactive_rollover_must_defer(
+                            source,
+                            session_key,
                             _pr_old_id,
-                            _pr_used,
-                            _pr_threshold,
-                            session_entry.session_id,
-                        )
-                        response = (response or "") + (
-                            f"\n\n🔄 Rolled to a fresh session — this chat "
-                            f"reached ~{_pr_used:,} prompt tokens (soft "
-                            f"threshold {_pr_threshold:,}). A compact summary "
-                            "was carried over; full history stays saved in "
-                            "the previous session."
-                        )
+                        ):
+                            logger.info(
+                                "Proactive rollover deferred for %s: pending "
+                                "or uncommitted work remains.",
+                                session_key,
+                            )
+                        else:
+                            _pr_digest = _build_proactive_rollover_carryover(
+                                agent_messages,
+                                old_session_id=_pr_old_id,
+                            )
+                            new_entry = await (
+                                self.async_session_store
+                                .rollover_session_with_carryover(
+                                    session_key,
+                                    _pr_old_id,
+                                    {
+                                        "role": "user",
+                                        "content": _pr_digest,
+                                        "_compressed_summary": True,
+                                        "display_kind": "hidden",
+                                        "timestamp": time.time(),
+                                    },
+                                )
+                            )
+                            if new_entry is None:
+                                logger.info(
+                                    "Proactive rollover CAS deferred for %s; "
+                                    "the route or transcript state changed.",
+                                    session_key,
+                                )
+                            else:
+                                session_entry = new_entry
+                                try:
+                                    self._evict_cached_agent(session_key)
+                                    self._clear_conversation_scope(
+                                        session_key,
+                                        reason="proactive_rollover",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Post-commit proactive-rollover cache "
+                                        "cleanup failed for %s",
+                                        session_key,
+                                    )
+                                try:
+                                    await asyncio.to_thread(
+                                        self._sync_telegram_topic_binding,
+                                        source,
+                                        session_entry,
+                                        reason="proactive-rollover",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Post-commit Telegram topic sync failed "
+                                        "for proactive rollover %s; database "
+                                        "routing remains authoritative.",
+                                        session_key,
+                                    )
+                                logger.info(
+                                    "Proactive rollover: session %s reached %d "
+                                    "prompt tokens (threshold %d); rolled to "
+                                    "fresh session %s with a carryover digest.",
+                                    _pr_old_id,
+                                    _pr_used,
+                                    _pr_threshold,
+                                    session_entry.session_id,
+                                )
+                                response = (response or "") + (
+                                    f"\n\n🔄 Rolled to a fresh session — this "
+                                    f"chat reached ~{_pr_used:,} prompt tokens "
+                                    f"(soft threshold {_pr_threshold:,}). A "
+                                    "compact summary was carried over; full "
+                                    "history stays saved in the previous "
+                                    "session."
+                                )
             except Exception:
                 logger.exception(
                     "Proactive rollover failed for session %s — continuing "

@@ -4060,6 +4060,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        _transaction_conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4229,10 +4230,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
+        if _transaction_conn is not None:
+            _do(_transaction_conn)
+            return
+
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _insert_session_row_tx(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        source: str,
+        **kwargs: Any,
+    ) -> None:
+        """Insert a session using the caller's already-open transaction.
+
+        This is the transaction-aware twin of :meth:`_insert_session_row`.
+        Keeping both paths on the same SQL implementation prevents lifecycle
+        transactions such as proactive rollover from drifting away from the
+        normal session-creation contract.
+        """
+        self._insert_session_row(
+            session_id,
+            source,
+            _transaction_conn=conn,
+            **kwargs,
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -4415,6 +4441,170 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    def _insert_gateway_rollover_carryover_tx(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        message: Dict[str, Any],
+    ) -> None:
+        """Persist the proactive-rollover carryover inside ``conn``."""
+        inserted, tool_calls = self._insert_message_rows(
+            conn,
+            session_id,
+            [dict(message)],
+        )
+        conn.execute(
+            """UPDATE sessions
+               SET message_count = message_count + ?,
+                   tool_call_count = tool_call_count + ?
+               WHERE id = ?""",
+            (inserted, tool_calls, session_id),
+        )
+
+    @staticmethod
+    def _end_gateway_rollover_parent_tx(
+        conn: sqlite3.Connection,
+        session_id: str,
+    ) -> bool:
+        """End exactly one still-live rollover parent inside ``conn``."""
+        cursor = conn.execute(
+            """UPDATE sessions
+               SET ended_at = ?, end_reason = 'proactive_rollover'
+               WHERE id = ? AND ended_at IS NULL AND end_reason IS NULL""",
+            (time.time(), session_id),
+        )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _update_gateway_rollover_route_tx(
+        conn: sqlite3.Connection,
+        *,
+        scope: str,
+        session_key: str,
+        expected_entry_json: str,
+        new_entry_json: str,
+    ) -> bool:
+        """CAS one durable gateway route inside ``conn``."""
+        cursor = conn.execute(
+            """UPDATE gateway_routing
+               SET entry_json = ?, updated_at = ?
+               WHERE scope = ? AND session_key = ? AND entry_json = ?""",
+            (
+                new_entry_json,
+                time.time(),
+                scope,
+                session_key,
+                expected_entry_json,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def atomic_gateway_rollover(
+        self,
+        *,
+        scope: str,
+        session_key: str,
+        expected_session_id: str,
+        new_entry_json: str,
+        source: str,
+        session_kwargs: Dict[str, Any],
+        carryover_message: Dict[str, Any],
+    ) -> bool:
+        """Atomically create and publish one proactive gateway rollover.
+
+        The durable routing row is compare-and-swapped against the exact old
+        session. Child creation, lineage, hidden carryover, parent ending, and
+        route publication commit together. A concurrent route or lifecycle
+        change is a safe no-op; every other exception rolls the transaction
+        back and propagates to the caller.
+        """
+        if not session_key or not expected_session_id or not new_entry_json:
+            return False
+
+        new_kwargs = dict(session_kwargs)
+        new_session_id = str(new_kwargs.pop("session_id", "") or "")
+        if not new_session_id:
+            raise ValueError("gateway rollover requires a new session_id")
+        new_kwargs["parent_session_id"] = expected_session_id
+
+        try:
+            decoded_new_entry = json.loads(new_entry_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("gateway rollover requires valid entry JSON") from exc
+        if (
+            not isinstance(decoded_new_entry, dict)
+            or decoded_new_entry.get("session_key") != session_key
+            or decoded_new_entry.get("session_id") != new_session_id
+        ):
+            raise ValueError("gateway rollover entry identity mismatch")
+
+        class _RouteChanged(RuntimeError):
+            pass
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            route_row = conn.execute(
+                """SELECT entry_json FROM gateway_routing
+                   WHERE scope = ? AND session_key = ?""",
+                (scope, session_key),
+            ).fetchone()
+            if route_row is None:
+                return False
+            expected_entry_json = str(route_row["entry_json"])
+            try:
+                current_entry = json.loads(expected_entry_json)
+            except (TypeError, ValueError):
+                return False
+            if (
+                not isinstance(current_entry, dict)
+                or current_entry.get("session_id") != expected_session_id
+            ):
+                return False
+
+            parent = conn.execute(
+                """SELECT id, ended_at, end_reason FROM sessions WHERE id = ?""",
+                (expected_session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is not None
+                or parent["end_reason"] is not None
+            ):
+                return False
+
+            self._insert_session_row_tx(
+                conn,
+                new_session_id,
+                source,
+                **new_kwargs,
+            )
+            self._insert_gateway_rollover_carryover_tx(
+                conn,
+                new_session_id,
+                carryover_message,
+            )
+            if not self._end_gateway_rollover_parent_tx(
+                conn,
+                expected_session_id,
+            ):
+                raise _RouteChanged("gateway rollover parent changed")
+            if not self._update_gateway_rollover_route_tx(
+                conn,
+                scope=scope,
+                session_key=session_key,
+                expected_entry_json=expected_entry_json,
+                new_entry_json=new_entry_json,
+            ):
+                raise _RouteChanged("gateway rollover route changed")
+            return True
+
+        try:
+            return self._execute_write(
+                _do,
+                patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            )
+        except _RouteChanged:
+            return False
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = ""
