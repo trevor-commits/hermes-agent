@@ -474,8 +474,10 @@ test('trusted launcher isolates Python startup from inherited environment hooks'
 test('trusted launcher rejects aggregate-valid oversized runtime before execution', () => {
   const { root, runtimeRoot, sourceRoot } = fixture()
   const marker = path.join(root, 'aggregate-runtime-executed')
+  const transactionId = 'tx-aggregate-limit'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
   const perAssetSize = 4 * 1024 * 1024 + 1
-  for (const asset of POSIX_UPDATER_RUNTIME_ASSETS) {
+  const files = POSIX_UPDATER_RUNTIME_ASSETS.map(asset => {
     const prefix =
       asset.target === 'atomic_macos.py'
         ? Buffer.from(
@@ -489,9 +491,115 @@ test('trusted launcher rejects aggregate-valid oversized runtime before executio
         : Buffer.from('#\n')
     const payload = Buffer.alloc(perAssetSize, 0x20)
     prefix.copy(payload)
-    fs.writeFileSync(path.join(sourceRoot, asset.source), payload)
+    const member = path.join(result.directory, asset.target)
+    fs.chmodSync(member, 0o600)
+    fs.writeFileSync(member, payload)
+    const mode = asset.executable ? 0o500 : 0o400
+    fs.chmodSync(member, mode)
+    return {
+      mode,
+      path: asset.target,
+      sha256: createHash('sha256').update(payload).digest('hex'),
+      size: payload.byteLength
+    }
+  }).sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+  const manifest = Buffer.from(
+    `${JSON.stringify({ files, principal: 'hermes-atomic-update', schema_version: 1, transaction_id: transactionId })}\n`
+  )
+  const manifestPath = path.join(result.directory, 'manifest.json')
+  fs.chmodSync(manifestPath, 0o600)
+  fs.writeFileSync(manifestPath, manifest)
+  fs.chmodSync(manifestPath, 0o400)
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: createHash('sha256').update(manifest).digest('hex'),
+      transactionId
+    },
+    command: 'capabilities',
+    directory: result.directory,
+    transactionsRoot: path.join(root, 'transactions')
+  })
+
+  assert.equal(launched.status, 64)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'runtime_validation_failed')
+  assert.equal(fs.existsSync(marker), false)
+})
+
+test('publisher rejects cumulative runtime bytes before creating a transaction runtime', () => {
+  const { runtimeRoot, sourceRoot } = fixture()
+  const perAssetSize = 4 * 1024 * 1024 + 1
+  for (const asset of POSIX_UPDATER_RUNTIME_ASSETS) {
+    fs.writeFileSync(path.join(sourceRoot, asset.source), Buffer.alloc(perAssetSize, 0x20))
   }
-  const transactionId = 'tx-aggregate-limit'
+
+  assert.throws(
+    () => publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId: 'tx-publish-aggregate-limit' }),
+    /aggregate.*size limit/i
+  )
+  assert.equal(fs.existsSync(path.join(runtimeRoot, 'tx-publish-aggregate-limit')), false)
+})
+
+test('validator rejects a published runtime whose cumulative member bytes exceed the limit', () => {
+  const { runtimeRoot, sourceRoot } = fixture()
+  const transactionId = 'tx-validate-aggregate-limit'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  const perAssetSize = 4 * 1024 * 1024 + 1
+  const files = POSIX_UPDATER_RUNTIME_ASSETS.map(asset => {
+    const member = path.join(result.directory, asset.target)
+    const bytes = Buffer.alloc(perAssetSize, 0x20)
+    fs.chmodSync(member, 0o600)
+    fs.writeFileSync(member, bytes)
+    const mode = asset.executable ? 0o500 : 0o400
+    fs.chmodSync(member, mode)
+    return {
+      mode,
+      path: asset.target,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      size: bytes.byteLength
+    }
+  }).sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+  const manifest = Buffer.from(
+    `${JSON.stringify({ files, principal: 'hermes-atomic-update', schema_version: 1, transaction_id: transactionId })}\n`
+  )
+  const manifestPath = path.join(result.directory, 'manifest.json')
+  fs.chmodSync(manifestPath, 0o600)
+  fs.writeFileSync(manifestPath, manifest)
+  fs.chmodSync(manifestPath, 0o400)
+
+  assert.throws(
+    () =>
+      validatePublishedUpdaterRuntime(result.directory, {
+        directoryDevice: result.directoryDevice,
+        directoryInode: result.directoryInode,
+        manifestSha256: createHash('sha256').update(manifest).digest('hex'),
+        transactionId
+      }),
+    /aggregate.*size limit/i
+  )
+})
+
+test.each([
+  ['zero', 0],
+  ['negative', -1],
+  ['not-a-number', Number.NaN],
+  ['infinite', Number.POSITIVE_INFINITY],
+  ['fractional', 1.5],
+  ['above-cap', 30_001]
+])('trusted launcher rejects %s timeout without spawning', (_label, timeoutMs) => {
+  const { root, runtimeRoot, sourceRoot } = fixture()
+  const marker = path.join(root, 'invalid-timeout-child-executed')
+  fs.writeFileSync(
+    path.join(sourceRoot, 'atomic_macos.py'),
+    [
+      'import pathlib',
+      `pathlib.Path(${JSON.stringify(marker)}).write_text("executed")`,
+      'print("{\\"commands\\":[\\"recover\\"],\\"schema_version\\":1}")'
+    ].join('\n')
+  )
+  const transactionId = 'tx-invalid-timeout'
   const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
 
   const launched = launchPublishedAtomicMacos({
@@ -503,10 +611,38 @@ test('trusted launcher rejects aggregate-valid oversized runtime before executio
     },
     command: 'capabilities',
     directory: result.directory,
+    timeoutMs,
     transactionsRoot: path.join(root, 'transactions')
   })
 
-  assert.equal(launched.status, 64)
-  assert.equal(JSON.parse(launched.stdout).failure_code, 'runtime_validation_failed')
+  assert.equal(launched.status, 75)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'recovery_launcher_failed')
+  assert.equal(Buffer.byteLength(launched.stdout) <= 4096, true)
+  assert.equal(launched.stderr, '')
   assert.equal(fs.existsSync(marker), false)
+})
+
+test('trusted launcher sanitizes a real child-process timeout error', () => {
+  const { root, runtimeRoot, sourceRoot } = fixture()
+  fs.writeFileSync(path.join(sourceRoot, 'atomic_macos.py'), 'import time\ntime.sleep(1)\n')
+  const transactionId = 'tx-child-timeout'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: result.manifestSha256,
+      transactionId
+    },
+    command: 'capabilities',
+    directory: result.directory,
+    timeoutMs: 1,
+    transactionsRoot: path.join(root, 'transactions')
+  })
+
+  assert.equal(launched.status, 75)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'recovery_launcher_failed')
+  assert.equal(Buffer.byteLength(launched.stdout) <= 4096, true)
+  assert.equal(launched.stderr, '')
 })

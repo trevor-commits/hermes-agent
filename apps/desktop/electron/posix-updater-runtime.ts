@@ -5,7 +5,10 @@ import path from 'node:path'
 
 const SAFE_LEAF = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/
 const SAFE_TRANSACTION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const MAX_RUNTIME_MEMBER_BYTES = 16 * 1024 * 1024
 const MAX_VERIFIED_RUNTIME_BYTES = 32 * 1024 * 1024
+const DEFAULT_TRUSTED_LAUNCH_TIMEOUT_MS = 5_000
+const MAX_TRUSTED_LAUNCH_TIMEOUT_MS = 30_000
 
 export interface RuntimeAsset {
   readonly source: string
@@ -186,7 +189,12 @@ function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean 
   )
 }
 
-function readVerifiedRegularFile(file: string, mode?: number, maximumSize = 16 * 1024 * 1024): Buffer {
+function readVerifiedRegularFile(
+  file: string,
+  mode?: number,
+  maximumSize = MAX_RUNTIME_MEMBER_BYTES,
+  sizeLimitLabel: 'member' | 'aggregate' = 'member'
+): Buffer {
   const before = fs.lstatSync(file, { bigint: true })
   const uid = expectedUid()
 
@@ -200,7 +208,7 @@ function readVerifiedRegularFile(file: string, mode?: number, maximumSize = 16 *
     throw new Error(`updater runtime member has unsafe mode: ${file}`)
   }
   if (before.size < 0n || before.size > BigInt(maximumSize)) {
-    throw new Error(`updater runtime member exceeds its size limit: ${file}`)
+    throw new Error(`updater runtime ${sizeLimitLabel} size limit exceeded: ${file}`)
   }
 
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
@@ -267,14 +275,24 @@ export function publishPosixUpdaterRuntime(options: PublishPosixUpdaterRuntimeOp
   assertNoSymlinkAncestors(sourceRoot)
   assertOwnedRealDirectory(sourceRoot)
 
-  const preparedAssets = assets.map(asset => {
+  const preparedAssets: Array<{ asset: RuntimeAsset; bytes: Buffer }> = []
+  let preparedRuntimeBytes = 0
+  for (const asset of assets) {
     validateLeaf(asset.source, 'updater runtime source')
-
-    return {
-      asset,
-      bytes: readVerifiedRegularFile(path.join(sourceRoot, asset.source))
+    const remainingBytes = MAX_VERIFIED_RUNTIME_BYTES - preparedRuntimeBytes
+    const maximumSize = Math.min(MAX_RUNTIME_MEMBER_BYTES, remainingBytes)
+    const bytes = readVerifiedRegularFile(
+      path.join(sourceRoot, asset.source),
+      undefined,
+      maximumSize,
+      maximumSize < MAX_RUNTIME_MEMBER_BYTES ? 'aggregate' : 'member'
+    )
+    preparedRuntimeBytes += bytes.byteLength
+    if (preparedRuntimeBytes > MAX_VERIFIED_RUNTIME_BYTES) {
+      throw new Error('updater runtime aggregate size limit exceeded while preparing assets')
     }
-  })
+    preparedAssets.push({ asset, bytes })
+  }
 
   try {
     fs.mkdirSync(finalDirectory, { mode: 0o700 })
@@ -393,13 +411,25 @@ function readValidatedPublishedUpdaterRuntime(
   }
 
   const verifiedFiles: Record<string, Buffer> = {}
+  let verifiedRuntimeBytes = 0
 
   for (let index = 0; index < expectedFiles.length; index += 1) {
     const asset = expectedFiles[index]
     const record = manifest.files[index]
     const recordKeys = Object.keys(record ?? {}).sort()
     const mode = asset.executable ? 0o500 : 0o400
-    const bytes = readVerifiedRegularFile(path.join(root, asset.target), mode)
+    const remainingBytes = MAX_VERIFIED_RUNTIME_BYTES - verifiedRuntimeBytes
+    const maximumSize = Math.min(MAX_RUNTIME_MEMBER_BYTES, remainingBytes)
+    const bytes = readVerifiedRegularFile(
+      path.join(root, asset.target),
+      mode,
+      maximumSize,
+      maximumSize < MAX_RUNTIME_MEMBER_BYTES ? 'aggregate' : 'member'
+    )
+    verifiedRuntimeBytes += bytes.byteLength
+    if (verifiedRuntimeBytes > MAX_VERIFIED_RUNTIME_BYTES) {
+      throw new Error('published updater runtime aggregate size limit exceeded during validation')
+    }
 
     if (
       JSON.stringify(recordKeys) !== JSON.stringify(['mode', 'path', 'sha256', 'size']) ||
@@ -471,6 +501,16 @@ function launchFailure(
 export function launchPublishedAtomicMacos(
   options: LaunchPublishedAtomicMacosOptions
 ): PublishedAtomicMacosLaunchResult {
+  try {
+    return launchPublishedAtomicMacosChecked(options)
+  } catch {
+    return launchFailure('recovery_launcher_failed')
+  }
+}
+
+function launchPublishedAtomicMacosChecked(
+  options: LaunchPublishedAtomicMacosOptions
+): PublishedAtomicMacosLaunchResult {
   let validated: ReturnType<typeof readValidatedPublishedUpdaterRuntime>
 
   try {
@@ -482,6 +522,15 @@ export function launchPublishedAtomicMacos(
     Object.values(validated.files).reduce((total, bytes) => total + bytes.byteLength, 0) > MAX_VERIFIED_RUNTIME_BYTES
   ) {
     return launchFailure('runtime_validation_failed')
+  }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TRUSTED_LAUNCH_TIMEOUT_MS
+  if (
+    !Number.isFinite(timeoutMs) ||
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > MAX_TRUSTED_LAUNCH_TIMEOUT_MS
+  ) {
+    return launchFailure('recovery_launcher_failed')
   }
 
   let argumentsList: string[]
@@ -522,22 +571,27 @@ export function launchPublishedAtomicMacos(
   const modes = Object.fromEntries(
     POSIX_UPDATER_RUNTIME_ASSETS.map(asset => [asset.target, asset.executable ? 0o500 : 0o400])
   )
-  const launched = spawnSync(
-    '/usr/bin/python3',
-    ['-I', '-S', '-c', TRUSTED_PYTHON_BOOTSTRAP, path.resolve(options.directory)],
-    {
-      encoding: 'utf8',
-      env: {},
-      input: JSON.stringify({
-        arguments: argumentsList,
-        files,
-        modes,
-        runtime_transaction_id: options.binding.transactionId
-      }),
-      maxBuffer: 8192,
-      timeout: options.timeoutMs ?? 5000
-    }
-  )
+  let launched: ReturnType<typeof spawnSync>
+  try {
+    launched = spawnSync(
+      '/usr/bin/python3',
+      ['-I', '-S', '-c', TRUSTED_PYTHON_BOOTSTRAP, path.resolve(options.directory)],
+      {
+        encoding: 'utf8',
+        env: {},
+        input: JSON.stringify({
+          arguments: argumentsList,
+          files,
+          modes,
+          runtime_transaction_id: options.binding.transactionId
+        }),
+        maxBuffer: 8192,
+        timeout: timeoutMs
+      }
+    )
+  } catch {
+    return launchFailure('recovery_launcher_failed')
+  }
 
   const stdout = typeof launched.stdout === 'string' ? launched.stdout : ''
   const stderr = typeof launched.stderr === 'string' ? launched.stderr : ''
