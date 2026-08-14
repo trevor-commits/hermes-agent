@@ -55,10 +55,13 @@ def test_cron_create_and_edit_accept_job_scoped_tool_budgets():
             "terminal",
             "--tool-result-max-chars",
             "4000",
+            "--tool-result-total-max-chars",
+            "40000",
         ]
     )
     assert created.enabled_toolsets == ["web", "terminal"]
     assert created.tool_result_max_chars == 4_000
+    assert created.tool_result_total_max_chars == 40_000
 
     edited = parser.parse_args(
         [
@@ -69,10 +72,13 @@ def test_cron_create_and_edit_accept_job_scoped_tool_budgets():
             "file",
             "--tool-result-max-chars",
             "4000",
+            "--tool-result-total-max-chars",
+            "40000",
         ]
     )
     assert edited.enabled_toolsets == ["file"]
     assert edited.tool_result_max_chars == 4_000
+    assert edited.tool_result_total_max_chars == 40_000
 
 
 def test_cron_accept_hooks_flag_on_run_and_tick():

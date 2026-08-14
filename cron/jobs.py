@@ -1483,6 +1483,8 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
 
 MIN_TOOL_RESULT_MAX_CHARS = 1_000
 MAX_TOOL_RESULT_MAX_CHARS = 50_000
+MIN_TOOL_RESULT_TOTAL_MAX_CHARS = 4_000
+MAX_TOOL_RESULT_TOTAL_MAX_CHARS = 400_000
 
 
 def _normalize_tool_result_max_chars(value: Any) -> int | None:
@@ -1498,6 +1500,110 @@ def _normalize_tool_result_max_chars(value: Any) -> int | None:
             f"{MIN_TOOL_RESULT_MAX_CHARS} and {MAX_TOOL_RESULT_MAX_CHARS}"
         )
     return value
+
+
+def _normalize_tool_result_total_max_chars(value: Any) -> int | None:
+    """Validate the run-scoped cumulative tool-output budget (None = unlimited)."""
+    if value is None:
+        return None
+    if (
+        type(value) is not int
+        or value < MIN_TOOL_RESULT_TOTAL_MAX_CHARS
+        or value > MAX_TOOL_RESULT_TOTAL_MAX_CHARS
+    ):
+        raise ValueError(
+            "tool_result_total_max_chars must be an integer between "
+            f"{MIN_TOOL_RESULT_TOTAL_MAX_CHARS} and {MAX_TOOL_RESULT_TOTAL_MAX_CHARS}"
+        )
+    return value
+
+
+# Fallback hard context ceiling for the definition-time first-turn size gate.
+# Stock config ships ``compression.threshold_tokens: None`` ("no absolute
+# cap configured"), which for THIS gate must still mean the documented 30K
+# ceiling — resolving None to "unlimited" would silently disable the check in
+# every environment that never set the key.
+DEFAULT_HARD_CONTEXT_CEILING_TOKENS = 30_000
+
+
+def resolve_hard_context_ceiling_tokens() -> int:
+    """Return the effective hard context ceiling for definition-time checks.
+
+    Reads the same ``compression.threshold_tokens`` the agent's compressor
+    honours. Fails open to ``DEFAULT_HARD_CONTEXT_CEILING_TOKENS`` on a
+    missing key, a non-positive value, or any config-read failure — for the
+    same reason every other config read in this module fails open: a broken
+    config must never make job creation impossible.
+    """
+    try:
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if not cfg_path.exists():
+            return DEFAULT_HARD_CONTEXT_CEILING_TOKENS
+        cfg = read_user_config_raw(cfg_path)
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+        cfg = _expand_env_vars(cfg)
+        compression_cfg = cfg.get("compression") or {}
+        if isinstance(compression_cfg, dict):
+            value = compression_cfg.get("threshold_tokens")
+            if type(value) is int and value > 0:
+                return value
+        return DEFAULT_HARD_CONTEXT_CEILING_TOKENS
+    except Exception:
+        return DEFAULT_HARD_CONTEXT_CEILING_TOKENS
+
+
+def estimate_job_first_turn_tokens(job: Dict[str, Any]) -> int:
+    """Estimate the STATIC first-turn prompt size of one job definition.
+
+    Static means "what the definition itself contributes on every single
+    fire": the stored prompt text. Runtime-collected context (pre-run script
+    stdout, ``context_from`` output, the durable notepad) is deliberately
+    excluded — it varies per fire and is not knowable when the job is saved.
+    Skill bodies are excluded for the same low-coupling reason the provider
+    imports are: the store must not reach into the scheduler's prompt
+    assembly. The estimate is therefore a floor, which is the safe direction
+    for a rejection gate.
+    """
+    from agent.model_metadata import estimate_tokens_rough
+
+    return estimate_tokens_rough(_coerce_job_text(job.get("prompt")))
+
+
+def _validate_job_first_turn_size(
+    job: Dict[str, Any],
+    *,
+    ceiling_tokens: Optional[int] = None,
+) -> int:
+    """Reject a definition whose static first turn can never fit the ceiling.
+
+    A job whose stored prompt alone already meets or exceeds the hard context
+    ceiling cannot produce even one successful run: on turn one there is no
+    prior history for compression to reclaim, so the run dies with
+    ``hard_context_ceiling_blocked`` and the next scheduled slot burns the
+    same way. Fail at definition time instead of every four hours forever.
+
+    Returns the estimate so callers can compare it against a prior one.
+    """
+    ceiling = (
+        ceiling_tokens
+        if type(ceiling_tokens) is int and ceiling_tokens > 0
+        else resolve_hard_context_ceiling_tokens()
+    )
+    estimated = estimate_job_first_turn_tokens(job)
+    if estimated >= ceiling:
+        raise ValueError(
+            f"Cron job's static first-turn prompt is ~{estimated:,} estimated "
+            f"tokens, at or above the {ceiling:,}-token hard context ceiling — "
+            "this job could never complete a single run. Shorten the prompt, "
+            "or have the job fetch the bulk of that text at run time."
+        )
+    return estimated
 
 
 def _compute_provider_model_snapshots(
@@ -1601,11 +1707,13 @@ def create_job(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     tool_result_max_chars: Optional[int] = None,
+    tool_result_total_max_chars: Optional[int] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    first_turn_ceiling_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1640,6 +1748,14 @@ def create_job(
         tool_result_max_chars: Optional job-scoped cap for each text tool result
                           added to model context. Oversized results use the
                           existing persisted-output preview path.
+        tool_result_total_max_chars: Optional job-scoped cap on the SUM of
+                          tool-result characters within ONE run (None =
+                          unlimited). Once the run's cumulative total reaches
+                          the budget, each further tool result is replaced
+                          with a short withheld-notice instead of failing the
+                          run. Bounds the long-run case the per-result cap
+                          cannot: many individually-legal results that
+                          together overflow the context ceiling.
         workdir: Optional absolute path.  When set, the job runs as if launched
                 from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
                 that directory are injected into the system prompt, and the
@@ -1666,6 +1782,9 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        first_turn_ceiling_tokens: Optional explicit hard context ceiling for
+                the definition-time first-turn size gate. Defaults to the
+                configured ``compression.threshold_tokens`` (or 30,000).
 
     Returns:
         The created job dict
@@ -1697,6 +1816,9 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_tool_result_max_chars = _normalize_tool_result_max_chars(
         tool_result_max_chars
+    )
+    normalized_tool_result_total_max_chars = _normalize_tool_result_total_max_chars(
+        tool_result_total_max_chars
     )
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
@@ -1736,6 +1858,17 @@ def create_job(
     # covered, not just `hermes cron create`.
     from cron.lifecycle_guard import check_gateway_lifecycle
     check_gateway_lifecycle(prompt_text, normalized_script)
+
+    # Definition-time first-turn size gate. A job whose static prompt already
+    # exceeds the hard context ceiling fails EVERY fire with
+    # hard_context_ceiling_blocked, so refuse the save instead of scheduling a
+    # guaranteed failure. no_agent jobs never build a model turn, so the gate
+    # does not apply to them.
+    if not normalized_no_agent:
+        _validate_job_first_turn_size(
+            {"prompt": prompt_text},
+            ceiling_tokens=first_turn_ceiling_tokens,
+        )
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -1806,6 +1939,8 @@ def create_job(
     }
     if normalized_tool_result_max_chars is not None:
         job["tool_result_max_chars"] = normalized_tool_result_max_chars
+    if normalized_tool_result_total_max_chars is not None:
+        job["tool_result_total_max_chars"] = normalized_tool_result_total_max_chars
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1914,6 +2049,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["tool_result_max_chars"]
                 )
 
+            if "tool_result_total_max_chars" in updates:
+                updates["tool_result_total_max_chars"] = (
+                    _normalize_tool_result_total_max_chars(
+                        updates["tool_result_total_max_chars"]
+                    )
+                )
+
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
             for _mon_field in ("monitor_script", "monitor_url"):
@@ -1941,6 +2083,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
+            # Definition-time first-turn size gate on the MERGED record, but
+            # scoped to updates that actually change the estimate. Two reasons
+            # it must not run unconditionally: pause_job / resume_job /
+            # trigger_job all route through update_job, so an unscoped gate
+            # would make an oversized legacy job impossible to pause; and an
+            # edit that SHRINKS an oversized legacy job is exactly the repair
+            # the gate exists to encourage, so any strict decrease is allowed
+            # through even when the result is still over the ceiling.
+            if not updated.get("no_agent") and {"prompt"}.intersection(updates):
+                _previous_estimate = estimate_job_first_turn_tokens(job)
+                try:
+                    _validate_job_first_turn_size(updated)
+                except ValueError:
+                    if estimate_job_first_turn_tokens(updated) >= _previous_estimate:
+                        raise
+
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -2043,6 +2201,10 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
+    # A manual resume ends whatever streak paused the job — otherwise a job
+    # auto-paused at the hard context ceiling would re-pause on its very next
+    # failing tick, before the operator's fix had a chance to be exercised.
+    clear_hard_context_ceiling_streak(job["id"])
     return update_job(
         job["id"],
         {
@@ -2060,6 +2222,8 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    # Same reasoning as resume_job: an explicit trigger is a manual override.
+    clear_hard_context_ceiling_streak(job["id"])
     return update_job(
         job["id"],
         {
@@ -2141,14 +2305,85 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_preflight_alerted(job_id, False)
 
 
+# A run that dies at the hard context ceiling reports it in ``last_error`` with
+# this marker; see the gateway hard-ceiling contract.
+HARD_CONTEXT_CEILING_MARKER = "hard_context_ceiling_blocked"
+# Consecutive matching failures before the job pauses itself. Two is noise (a
+# transient oversized tool result); three means the CONFIGURATION cannot fit,
+# and every further tick is a guaranteed-failing spend.
+HARD_CONTEXT_CEILING_PAUSE_AFTER = 3
+
+
+def clear_hard_context_ceiling_streak(job_id: str) -> None:
+    """Drop the consecutive hard-ceiling failure counter for one job.
+
+    Manual resume (or an explicit trigger) is the operator saying "I changed
+    something" — the next failure must start a fresh streak instead of
+    re-tripping the auto-pause on its very first tick.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] != job_id:
+                continue
+            if job.pop("hard_context_ceiling_streak", None) is not None:
+                jobs[i] = job
+                save_jobs(jobs)
+            return
+
+
+def _update_hard_ceiling_streak(
+    job: Dict[str, Any], success: bool, error: Optional[str]
+) -> Optional[str]:
+    """Track consecutive hard-ceiling failures and auto-pause on the 3rd.
+
+    Mutates ``job`` in place under the caller's jobs lock. Returns the
+    ``paused_reason`` when THIS call is the one that pauses the job, otherwise
+    ``None``, so the caller can raise the operator alert exactly once.
+
+    Any ok run — and any failure with a different cause — resets the streak, so
+    only a job that is failing the same way every time gets paused.
+    """
+    if success or not error or HARD_CONTEXT_CEILING_MARKER not in str(error):
+        job.pop("hard_context_ceiling_streak", None)
+        return None
+
+    streak = job.get("hard_context_ceiling_streak")
+    streak = streak + 1 if type(streak) is int and streak > 0 else 1
+    job["hard_context_ceiling_streak"] = streak
+    if streak < HARD_CONTEXT_CEILING_PAUSE_AFTER:
+        return None
+    if not job.get("enabled", True) or _has_pause_marker(job):
+        # Already paused (manually or by an earlier auto-pause) — keep counting
+        # but do not re-alert on every tick.
+        return None
+
+    reason = (
+        f"auto-paused after {HARD_CONTEXT_CEILING_PAUSE_AFTER} consecutive "
+        f"hard-context-ceiling failures ({str(error).strip()})"
+    )
+    job["enabled"] = False
+    job["state"] = "paused"
+    job["paused_at"] = _hermes_now().isoformat()
+    job["paused_reason"] = reason
+    logger.error(
+        "Job '%s': %s", job.get("name", job.get("id", "?")), reason,
+    )
+    return reason
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+                 status: Optional[str] = None) -> Optional[str]:
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
+
+    Returns the ``paused_reason`` when this run tripped the consecutive
+    hard-context-ceiling auto-pause, otherwise ``None`` — the caller owns the
+    one-shot operator alert (see ``_update_hard_ceiling_streak``).
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
@@ -2167,6 +2402,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
+                # Consecutive hard-ceiling accounting runs BEFORE the
+                # repeat-limit early return below, so a finite one-shot is
+                # counted (and can auto-pause) on the same terms as a
+                # recurring job.
+                auto_pause_reason = _update_hard_ceiling_streak(job, success, error)
                 # A healthy run means the configuration validates again — drop
                 # the preflight alert-dedup marker so a FUTURE config break
                 # re-alerts instead of being silently swallowed.
@@ -2219,8 +2459,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
-                        return
-                
+                        # Terminal completion wins over the auto-pause: the job
+                        # has no further runs to protect, so alerting "paused"
+                        # would misdescribe a finished record. paused_reason
+                        # stays on it as the diagnosis of how it ended.
+                        return None
+
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
 
@@ -2254,9 +2498,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return auto_pause_reason
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+    return None
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:

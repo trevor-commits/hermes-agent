@@ -615,6 +615,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("tool_result_max_chars") is not None:
         result["tool_result_max_chars"] = job["tool_result_max_chars"]
+    if job.get("tool_result_total_max_chars") is not None:
+        result["tool_result_total_max_chars"] = job["tool_result_total_max_chars"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     return result
@@ -1071,6 +1073,7 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     tool_result_max_chars: Optional[int] = None,
+    tool_result_total_max_chars: Optional[int] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
@@ -1160,6 +1163,7 @@ def cronjob(
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     tool_result_max_chars=tool_result_max_chars,
+                    tool_result_total_max_chars=tool_result_total_max_chars,
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
@@ -1420,6 +1424,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if tool_result_max_chars is not None:
                 updates["tool_result_max_chars"] = tool_result_max_chars
+            if tool_result_total_max_chars is not None:
+                updates["tool_result_total_max_chars"] = tool_result_total_max_chars
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:

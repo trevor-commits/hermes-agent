@@ -273,6 +273,50 @@ def _resolve_cron_tool_result_max_chars(job: dict) -> int | None:
         )
     return value
 
+
+_CRON_TOOL_RESULT_TOTAL_MIN_CHARS = 4_000
+_CRON_TOOL_RESULT_TOTAL_MAX_CHARS = 400_000
+
+
+def _resolve_cron_tool_result_total_max_chars(job: dict) -> int | None:
+    """Resolve the optional per-job cumulative tool-output budget for one run."""
+    value = job.get("tool_result_total_max_chars")
+    if value is None:
+        return None
+    if (
+        type(value) is not int
+        or value < _CRON_TOOL_RESULT_TOTAL_MIN_CHARS
+        or value > _CRON_TOOL_RESULT_TOTAL_MAX_CHARS
+    ):
+        raise ValueError(
+            "cron job tool_result_total_max_chars must be an integer between "
+            f"{_CRON_TOOL_RESULT_TOTAL_MIN_CHARS} and "
+            f"{_CRON_TOOL_RESULT_TOTAL_MAX_CHARS}"
+        )
+    return value
+
+
+def _tool_output_budget_notice(agent) -> Optional[str]:
+    """Summarize run-scoped tool-output truncation for the operator, or None.
+
+    The model sees a per-result withheld-notice, but that never reaches the
+    stored output or ``last_error`` — so without this an operator reading a
+    thin cron report has no way to tell a quiet run from a truncated one.
+    """
+    try:
+        withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
+        withheld = withheld if type(withheld) is int else 0
+        budget = getattr(agent, "tool_result_total_max_chars", None)
+    except Exception:
+        return None
+    if withheld <= 0 or type(budget) is not int:
+        return None
+    return (
+        f"[tool-output budget exhausted: {withheld} tool result(s) withheld "
+        f"after this run reached its cumulative {budget:,}-char tool-output "
+        "budget]"
+    )
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -3362,6 +3406,9 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    # Set once the agent has returned; read by BOTH the success output doc and
+    # the failure error string, so it is bound before either can be reached.
+    _tool_budget_notice: Optional[str] = None
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -4260,6 +4307,11 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # Resolved before construction so a malformed record fails the run the
+        # same way an invalid per-result cap does — before any agent machinery
+        # is built.
+        _tool_result_total_cap = _resolve_cron_tool_result_total_max_chars(job)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4295,7 +4347,11 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        # Run-scoped cumulative tool-output budget. Set after construction
+        # because AIAgent's constructor owns only the per-result cap; see
+        # agent/agent_init.py.
+        agent.tool_result_total_max_chars = _tool_result_total_cap
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -4391,6 +4447,11 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        # Read the run-scoped budget counters while the agent is unambiguously
+        # in scope — the failure paths below reach the except block where it
+        # may not be.
+        _tool_budget_notice = _tool_output_budget_notice(agent)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -4520,7 +4581,9 @@ def run_job(
 
 {logged_response}
 """
-        
+        if _tool_budget_notice:
+            output += f"\n## Tool Output Budget\n\n{_tool_budget_notice}\n"
+
         logger.info("Job '%s' completed successfully", job_name)
 
         # Emit one JSONL line per fire for usage audit.
@@ -4543,6 +4606,11 @@ def run_job(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
+        # Keep run-scoped tool-output truncation visible in last_error too: a
+        # failure that followed a truncated tool loop reads very differently
+        # from one that did not.
+        if _tool_budget_notice:
+            error_msg = f"{error_msg} {_tool_budget_notice}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
@@ -4905,14 +4973,45 @@ def run_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        auto_pause_reason = None
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:
-                mark_job_run(
+                auto_pause_reason = mark_job_run(
                     job["id"], success, error, delivery_error=delivery_error,
                     status="blocked_config",
                 )
             else:
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                auto_pause_reason = mark_job_run(
+                    job["id"], success, error, delivery_error=delivery_error,
+                )
+        # mark_job_run's auto-pause contract is Optional[str]; require an
+        # actual non-empty string so a stubbed store (whose truthy default
+        # return means nothing) cannot fabricate an operator alert.
+        if isinstance(auto_pause_reason, str) and auto_pause_reason.strip():
+            # The store just paused this job after repeated identical
+            # hard-context-ceiling failures. Tell the operator through the same
+            # delivery path every other cron message uses; it fires exactly
+            # once, on the tick that paused the job. Runs after the deferred
+            # agent teardown, which is safe because _deliver_result uses the
+            # gateway adapters/loop, not the agent (#58720 touched this area).
+            try:
+                _pause_delivery_error = _deliver_result(
+                    job,
+                    f"⏸️ Cron '{job.get('name') or job['id']}' {auto_pause_reason}. "
+                    "The job stays paused until you resume it.",
+                    adapters=adapters,
+                    loop=loop,
+                )
+                if _pause_delivery_error:
+                    logger.error(
+                        "Auto-pause alert delivery failed for job %s: %s",
+                        job["id"], _pause_delivery_error,
+                    )
+            except Exception as _pause_alert_err:
+                logger.error(
+                    "Auto-pause alert delivery failed for job %s: %s",
+                    job["id"], _pause_alert_err,
+                )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
