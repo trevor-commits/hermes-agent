@@ -216,19 +216,24 @@ function readVerifiedRegularFile(
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true })
 
-    if (
-      !opened.isFile() ||
-      opened.dev !== before.dev ||
-      opened.ino !== before.ino ||
-      (uid !== null && opened.uid !== BigInt(uid)) ||
-      (mode === undefined ? Boolean(opened.mode & 0o022n) : (opened.mode & 0o777n) !== BigInt(mode))
-    ) {
+    if (!opened.isFile() || !sameFileIdentity(before, opened) || (uid !== null && opened.uid !== BigInt(uid))) {
       throw new Error(`updater runtime member changed while opening: ${file}`)
     }
 
-    const bytes = fs.readFileSync(descriptor)
+    const readLimit = Math.min(maximumSize + 1, Number(opened.size) + 1)
+    const buffer = Buffer.allocUnsafe(readLimit)
+    let bytesRead = 0
+    while (bytesRead < readLimit) {
+      const count = fs.readSync(descriptor, buffer, bytesRead, readLimit - bytesRead, null)
+      if (count === 0) break
+      bytesRead += count
+    }
+    const bytes = buffer.subarray(0, bytesRead)
     const after = fs.fstatSync(descriptor, { bigint: true })
 
+    if (bytes.byteLength > maximumSize) {
+      throw new Error(`updater runtime ${sizeLimitLabel} size limit exceeded while reading: ${file}`)
+    }
     if (!sameFileIdentity(opened, after) || BigInt(bytes.byteLength) !== opened.size) {
       throw new Error(`updater runtime member changed while reading: ${file}`)
     }
@@ -586,6 +591,7 @@ function launchPublishedAtomicMacosChecked(
           runtime_transaction_id: options.binding.transactionId
         }),
         maxBuffer: 8192,
+        killSignal: 'SIGKILL',
         timeout: timeoutMs
       }
     )

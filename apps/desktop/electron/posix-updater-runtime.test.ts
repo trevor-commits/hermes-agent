@@ -29,6 +29,62 @@ function fixture() {
   return { root, runtimeRoot, sourceRoot }
 }
 
+function growFileAfterVerifiedOpen(target: string, growthBytes: number) {
+  const targetIdentity = fs.statSync(target, { bigint: true })
+  const originalMode = fs.statSync(target).mode & 0o777
+  if ((originalMode & 0o200) === 0) fs.chmodSync(target, originalMode | 0o200)
+  const growthDescriptor = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND)
+  if ((originalMode & 0o200) === 0) fs.chmodSync(target, originalMode)
+  const realReadFileSync = fs.readFileSync.bind(fs)
+  const realReadSync = fs.readSync.bind(fs)
+  let grew = false
+  let observedBytes = 0
+
+  const matchesTarget = (descriptor: number) => {
+    const observed = fs.fstatSync(descriptor, { bigint: true })
+    return observed.dev === targetIdentity.dev && observed.ino === targetIdentity.ino
+  }
+  const grow = () => {
+    if (!grew) {
+      grew = true
+      fs.writeFileSync(growthDescriptor, Buffer.alloc(growthBytes, 0x20))
+    }
+  }
+  const readFileSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(((
+    file: fs.PathOrFileDescriptor,
+    ...argumentsList: any[]
+  ) => {
+    if (typeof file === 'number' && matchesTarget(file)) {
+      grow()
+      const result = (realReadFileSync as any)(file, ...argumentsList)
+      if (Buffer.isBuffer(result)) observedBytes += result.byteLength
+      return result
+    }
+    return (realReadFileSync as any)(file, ...argumentsList)
+  }) as typeof fs.readFileSync)
+  const readSyncSpy = vi.spyOn(fs, 'readSync').mockImplementation(((descriptor: number, ...argumentsList: any[]) => {
+    const targetDescriptor = matchesTarget(descriptor)
+    if (targetDescriptor) grow()
+    const count = (realReadSync as any)(descriptor, ...argumentsList)
+    if (targetDescriptor) observedBytes += count
+    return count
+  }) as typeof fs.readSync)
+
+  return {
+    get grew() {
+      return grew
+    },
+    get observedBytes() {
+      return observedBytes
+    },
+    restore() {
+      readSyncSpy.mockRestore()
+      readFileSpy.mockRestore()
+      fs.closeSync(growthDescriptor)
+    }
+  }
+}
+
 test('publishes the canonical runtime with an inode and manifest trust anchor', () => {
   const { runtimeRoot, sourceRoot } = fixture()
   const result = publishPosixUpdaterRuntime({
@@ -542,6 +598,25 @@ test('publisher rejects cumulative runtime bytes before creating a transaction r
   assert.equal(fs.existsSync(path.join(runtimeRoot, 'tx-publish-aggregate-limit')), false)
 })
 
+test('publisher bounds a source member that grows after its verified open', () => {
+  const { runtimeRoot, sourceRoot } = fixture()
+  const transactionId = 'tx-publish-growing-member'
+  const growth = growFileAfterVerifiedOpen(path.join(sourceRoot, 'posix.sh'), 20 * 1024 * 1024)
+
+  try {
+    assert.throws(
+      () => publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId }),
+      /changed while reading|size limit/i
+    )
+  } finally {
+    growth.restore()
+  }
+
+  assert.equal(growth.grew, true)
+  assert.equal(growth.observedBytes <= 16 * 1024 * 1024 + 1, true)
+  assert.equal(fs.existsSync(path.join(runtimeRoot, transactionId)), false)
+})
+
 test('validator rejects a published runtime whose cumulative member bytes exceed the limit', () => {
   const { runtimeRoot, sourceRoot } = fixture()
   const transactionId = 'tx-validate-aggregate-limit'
@@ -579,6 +654,31 @@ test('validator rejects a published runtime whose cumulative member bytes exceed
       }),
     /aggregate.*size limit/i
   )
+})
+
+test('validator bounds a runtime member that grows after its verified open', () => {
+  const { runtimeRoot, sourceRoot } = fixture()
+  const transactionId = 'tx-validate-growing-member'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  const growth = growFileAfterVerifiedOpen(path.join(result.directory, 'posix.sh'), 20 * 1024 * 1024)
+
+  try {
+    assert.throws(
+      () =>
+        validatePublishedUpdaterRuntime(result.directory, {
+          directoryDevice: result.directoryDevice,
+          directoryInode: result.directoryInode,
+          manifestSha256: result.manifestSha256,
+          transactionId
+        }),
+      /changed while reading|size limit/i
+    )
+  } finally {
+    growth.restore()
+  }
+
+  assert.equal(growth.grew, true)
+  assert.equal(growth.observedBytes <= 16 * 1024 * 1024 + 1, true)
 })
 
 test.each([
@@ -645,4 +745,45 @@ test('trusted launcher sanitizes a real child-process timeout error', () => {
   assert.equal(JSON.parse(launched.stdout).failure_code, 'recovery_launcher_failed')
   assert.equal(Buffer.byteLength(launched.stdout) <= 4096, true)
   assert.equal(launched.stderr, '')
+})
+
+test('trusted launcher force-kills a child that ignores SIGTERM', () => {
+  const { root, runtimeRoot, sourceRoot } = fixture()
+  const pidPath = path.join(root, 'term-ignoring-child.pid')
+  fs.writeFileSync(
+    path.join(sourceRoot, 'atomic_macos.py'),
+    [
+      'import os',
+      'import pathlib',
+      'import signal',
+      'import time',
+      'signal.signal(signal.SIGTERM, signal.SIG_IGN)',
+      `pathlib.Path(${JSON.stringify(pidPath)}).write_text(str(os.getpid()))`,
+      'time.sleep(1.5)'
+    ].join('\n')
+  )
+  const transactionId = 'tx-force-kill-timeout'
+  const result = publishPosixUpdaterRuntime({ runtimeRoot, sourceRoot, transactionId })
+  const startedAt = Date.now()
+
+  const launched = launchPublishedAtomicMacos({
+    binding: {
+      directoryDevice: result.directoryDevice,
+      directoryInode: result.directoryInode,
+      manifestSha256: result.manifestSha256,
+      transactionId
+    },
+    command: 'capabilities',
+    directory: result.directory,
+    timeoutMs: 250,
+    transactionsRoot: path.join(root, 'transactions')
+  })
+  const elapsedMs = Date.now() - startedAt
+
+  assert.equal(launched.status, 75)
+  assert.equal(JSON.parse(launched.stdout).failure_code, 'recovery_launcher_failed')
+  assert.equal(launched.stderr, '')
+  assert.equal(elapsedMs < 900, true, `launcher stayed blocked for ${elapsedMs}ms`)
+  const childPid = Number(fs.readFileSync(pidPath, 'utf8'))
+  assert.throws(() => process.kill(childPid, 0), /ESRCH/)
 })
