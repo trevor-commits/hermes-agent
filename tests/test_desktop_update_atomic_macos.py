@@ -1901,6 +1901,52 @@ print(recovered.data["status"])
                 self.assertEqual((live / "version.txt").read_text(), "old")
                 self.assertEqual((candidate / "version.txt").read_text(), "new")
 
+    def test_multi_resource_recovery_validates_complete_sequence_before_mutation(self):
+        atomic_macos = load_atomic_macos()
+        invalid_sequences = (
+            ("app", "bogus"),
+            ("source", "app"),
+            ("app", "app"),
+            ("app",),
+        )
+
+        for sequence in invalid_sequences:
+            with self.subTest(sequence=sequence), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                receipt = atomic_macos.create_transaction(
+                    root / "transactions",
+                    "txn-invalid-sequence",
+                )
+                endpoints = []
+                for resource in ("source", "app"):
+                    live = root / "{}-live".format(resource)
+                    candidate = root / "{}-candidate".format(resource)
+                    live.mkdir()
+                    candidate.mkdir()
+                    (live / "version.txt").write_text("old", encoding="utf-8")
+                    (candidate / "version.txt").write_text("new", encoding="utf-8")
+                    atomic_macos.atomic_exchange(
+                        live,
+                        candidate,
+                        receipt=receipt,
+                        resource=resource,
+                        finish_on_success=False,
+                    )
+                    endpoints.append((live, candidate))
+                receipt_before = receipt.path.read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "recovery resource sequence"):
+                    atomic_macos.recover_recorded_exchanges(
+                        receipt.transaction_dir,
+                        sequence,
+                        lock_timeout_seconds=1.0,
+                    )
+
+                self.assertEqual(receipt.path.read_bytes(), receipt_before)
+                for live, candidate in endpoints:
+                    self.assertEqual((live / "version.txt").read_text(), "new")
+                    self.assertEqual((candidate / "version.txt").read_text(), "old")
+
     def test_ambiguous_resource_recovery_preserves_other_exchange_records(self):
         atomic_macos = load_atomic_macos()
 

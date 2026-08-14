@@ -1065,12 +1065,16 @@ def recover_recorded_exchanges(
 ):
     """Recover ordered receipt resources while holding one root transaction guard."""
     if not isinstance(resources, (list, tuple)) or not resources:
-        raise ValueError("recovery resources must be a non-empty ordered sequence")
-    ordered_resources = [validate_generated_leaf(resource) for resource in resources]
+        raise ValueError("recovery resource sequence must be non-empty and ordered")
+    try:
+        ordered_resources = [validate_generated_leaf(resource) for resource in resources]
+    except (TypeError, ValueError) as error:
+        raise ValueError("recovery resource sequence contains an invalid name") from error
     if len(set(ordered_resources)) != len(ordered_resources):
-        raise ValueError("recovery resources must not contain duplicates")
+        raise ValueError("recovery resource sequence must not contain duplicates")
 
     preliminary = load_transaction(transaction_dir)
+    _validate_complete_recovery_sequence(preliminary, ordered_resources)
     lock_transaction_id = _receipt_lock_transaction_id(preliminary.data)
     current_dir = preliminary.transaction_dir
     processed = []
@@ -1080,6 +1084,10 @@ def recover_recorded_exchanges(
         lock_transaction_id,
         lock_timeout_seconds=lock_timeout_seconds,
     ) as guard:
+        receipt = load_transaction(current_dir)
+        _validate_complete_recovery_sequence(receipt, ordered_resources)
+        if receipt.is_terminal and receipt.data.get("status") != "manual_recovery_required":
+            return receipt, processed
         for index, resource in enumerate(ordered_resources):
             receipt = _recover_exchange_locked(
                 current_dir,
@@ -1096,6 +1104,20 @@ def recover_recorded_exchanges(
             if receipt.is_terminal and index != len(ordered_resources) - 1:
                 break
     return receipt, processed
+
+
+def _validate_complete_recovery_sequence(receipt, ordered_resources):
+    exchanges = receipt.data.get("exchanges")
+    if not isinstance(exchanges, dict) or not exchanges:
+        raise ValueError("recovery resource sequence has no recorded exchanges")
+    if any(
+        resource not in ("app", "source") or not isinstance(record, dict)
+        for resource, record in exchanges.items()
+    ):
+        raise ValueError("recovery resource sequence contains unsupported receipt data")
+    expected = [resource for resource in ("app", "source") if resource in exchanges]
+    if list(ordered_resources) != expected:
+        raise ValueError("recovery resource sequence must match the complete recorded order")
 
 
 def recover_exchange(

@@ -207,7 +207,9 @@ def main(engine, arguments, *, runtime_transaction_id):
         recovered, processed = _recover(engine, transaction_dir, resources)
         status = recovered.data.get("status")
         failure_code = recovered.data.get("failure_code")
-        if status in _TERMINAL_RECOVERED and len(processed) == len(resources):
+        if status in _TERMINAL_RECOVERED and (
+            len(processed) == len(resources) or not processed
+        ):
             _emit(
                 ok=True,
                 status=status,

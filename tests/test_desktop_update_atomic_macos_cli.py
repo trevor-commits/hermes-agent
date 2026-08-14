@@ -533,6 +533,99 @@ class AtomicMacosRecoveryCliTests(unittest.TestCase):
             self.assertEqual(retried.returncode, 0, retried.stderr)
             self.assertEqual(json.loads(retried.stdout)["status"], "failed_rolled_back")
 
+    def test_queued_repeat_after_another_cli_finishes_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(os.path.realpath(raw_tmp))
+            transaction_id = "tx-cli-queued-repeat"
+            runtime, binding = publish_real_runtime(root / "runtime", transaction_id)
+            transactions_root = root / "transactions"
+            resources = {}
+            exchanges = []
+            for resource in ("source", "app"):
+                live = root / "{}-live".format(resource)
+                candidate = root / "{}-candidate".format(resource)
+                live.mkdir()
+                candidate.mkdir()
+                (live / "version.txt").write_text("old", encoding="utf-8")
+                (candidate / "version.txt").write_text("new", encoding="utf-8")
+                resources[resource] = (live, candidate)
+                exchanges.append((resource, str(live), str(candidate)))
+            create_multi_resource_receipt(
+                runtime,
+                transactions_root,
+                transaction_id,
+                exchanges,
+            )
+
+            lock_path = transactions_root / transaction_id / ".transaction.lock"
+            locker = subprocess.Popen(
+                [
+                    PYTHON,
+                    "-c",
+                    "import fcntl, os, sys; fd=os.open(sys.argv[1], os.O_RDWR); "
+                    "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); "
+                    "sys.stdin.readline()",
+                    str(lock_path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(locker.stdout.readline().strip(), "locked")
+            command = [
+                PYTHON,
+                str(runtime / "atomic_macos.py"),
+                "recover",
+                "--transaction",
+                transaction_id,
+                "--runtime-device",
+                binding["runtime_device"],
+                "--runtime-inode",
+                binding["runtime_inode"],
+                "--manifest-sha256",
+                binding["manifest_sha256"],
+                "--transactions-root",
+                str(transactions_root),
+                "--allow-test-root",
+            ]
+            environment = os.environ.copy()
+            environment["HERMES_ATOMIC_TEST_ROOT"] = "1"
+            queued = [
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                )
+                for _ in range(2)
+            ]
+            time.sleep(0.4)
+            locker.stdin.write("release\n")
+            locker.stdin.flush()
+            locker.wait(timeout=2)
+            locker.stdin.close()
+            locker.stdout.close()
+            locker.stderr.close()
+            completed = []
+            for process in queued:
+                stdout, stderr = process.communicate(timeout=3)
+                completed.append((process.returncode, stdout, stderr))
+
+            self.assertEqual([returncode for returncode, _, _ in completed], [0, 0])
+            payloads = [json.loads(stdout) for _, stdout, _ in completed]
+            self.assertTrue(all(stderr == "" for _, _, stderr in completed))
+            self.assertTrue(all(payload["status"] == "failed_rolled_back" for payload in payloads))
+            self.assertTrue(all("failure_code" not in payload for payload in payloads))
+            self.assertCountEqual(
+                [tuple(payload["resources"]) for payload in payloads],
+                [("app", "source"), ()],
+            )
+            for live, candidate in resources.values():
+                self.assertEqual((live / "version.txt").read_text(), "old")
+                self.assertEqual((candidate / "version.txt").read_text(), "new")
+
     def test_recovery_processes_recorded_exchanges_app_then_source(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(os.path.realpath(raw_tmp))
