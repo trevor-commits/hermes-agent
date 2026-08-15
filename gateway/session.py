@@ -1699,6 +1699,13 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+                        # state.db is authoritative whenever its canonical
+                        # whole-index writer is available. Publishing only the
+                        # legacy mirror would create a split brain that restart
+                        # resolves back to the stale database row. Propagate
+                        # before mirror publication or generation advancement
+                        # so claims and other routing transitions can roll back.
+                        raise
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
