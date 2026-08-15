@@ -359,6 +359,72 @@ class TestCumulativeToolOutputBudget:
         assert emitted.endswith("…")
         assert agent._tool_result_total_chars_used == 12
 
+    def test_multimodal_model_bound_output_obeys_exact_run_cap(self):
+        from agent.tool_executor import (
+            _prepare_multimodal_tool_result_for_context,
+        )
+        from tools.budget_config import DEFAULT_BUDGET
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-multimodal"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(120)
+        agent._tool_result_total_chars_used = 70
+        agent._tool_result_content_for_active_model = lambda _name, value: value[
+            "content"
+        ]
+        env = RecordingEnv()
+        raw = {
+            "_multimodal": True,
+            "text_summary": "useful visual summary " * 20,
+            "content": [
+                {"type": "text", "text": "useful visual summary " * 20},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64," + "A" * 500},
+                },
+            ],
+        }
+
+        emitted = _prepare_multimodal_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="computer_use",
+            tool_use_id="visual-crossing",
+            env=env,
+            persistence_config=DEFAULT_BUDGET,
+            subdir_hints="\nHINT",
+        )
+
+        assert isinstance(emitted, str)
+        assert len(emitted) == 50
+        assert emitted.endswith("…")
+        assert agent._tool_result_total_chars_used == 120
+        assert agent.tool_result_budget_withheld_count == 1
+        assert len(env.writes) == 1
+        assert '"_multimodal":true' in env.writes[0][1]
+        assert "HINT" in env.writes[0][1]
+
+        later = _prepare_multimodal_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="computer_use",
+            tool_use_id="visual-later",
+            env=env,
+            persistence_config=DEFAULT_BUDGET,
+        )
+        assert later == ""
+        assert agent.tool_result_budget_withheld_count == 2
+        assert len(env.writes) == 2
+
     def test_no_budget_is_a_no_op(self):
         from agent.tool_executor import _apply_run_tool_output_budget
 
