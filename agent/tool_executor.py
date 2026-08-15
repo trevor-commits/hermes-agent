@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from agent.display import (
     KawaiiSpinner,
@@ -109,14 +109,15 @@ _TOOL_OUTPUT_BUDGET_FALLBACK_LOCK = threading.Lock()
 
 def _apply_run_tool_output_budget(
     agent,
-    content: str,
+    content: Any,
     *,
     full_content: Optional[str] = None,
+    truncation_text: Optional[str] = None,
     tool_name: str = "",
     tool_use_id: str = "",
     env=None,
     persistence_config: BudgetConfig = DEFAULT_BUDGET,
-) -> str:
+) -> Any:
     """Bound the SUM of tool-result chars across one whole run.
 
     ``tool_result_max_chars`` caps each result on its own, which a long run
@@ -139,12 +140,24 @@ def _apply_run_tool_output_budget(
     with lock:
         used = getattr(agent, "_tool_result_total_chars_used", 0)
         used = used if type(used) is int else 0
+        serialized_content = (
+            content
+            if isinstance(content, str)
+            else json.dumps(
+                content,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            )
+        )
+        emitted_size = len(serialized_content)
 
         def _persist_complete() -> None:
             if (
                 full_content is None
                 or env is None
-                or PERSISTED_OUTPUT_TAG in content
+                or PERSISTED_OUTPUT_TAG in serialized_content
             ):
                 return
             maybe_persist_tool_result(
@@ -170,8 +183,8 @@ def _apply_run_tool_output_budget(
             return ""
 
         remaining = budget - used
-        if len(content) <= remaining:
-            agent._tool_result_total_chars_used = used + len(content)
+        if emitted_size <= remaining:
+            agent._tool_result_total_chars_used = used + emitted_size
             return content
 
         _persist_complete()
@@ -180,12 +193,22 @@ def _apply_run_tool_output_budget(
             withheld if type(withheld) is int else 0
         ) + 1
         marker = "\n[tool result truncated: run tool-output budget exhausted]"
+        source = (
+            truncation_text
+            if isinstance(truncation_text, str) and truncation_text
+            else serialized_content
+        )
         if remaining > len(marker):
-            emitted = content[: remaining - len(marker)] + marker
+            prefix_chars = remaining - len(marker)
+            if len(source) < prefix_chars:
+                source = source + "\n" + serialized_content
+            emitted = source[:prefix_chars] + marker
         elif remaining > 0:
             # A one-character ellipsis is still one unambiguous truncation
             # marker and lets even a one-character remainder stay exact.
-            emitted = content[: remaining - 1] + "…"
+            if len(source) < remaining - 1:
+                source = source + serialized_content
+            emitted = source[: remaining - 1] + "…"
         else:
             emitted = ""
         agent._tool_result_total_chars_used = budget
@@ -220,6 +243,48 @@ def _prepare_text_tool_result_for_context(
         agent,
         emitted,
         full_content=raw_content,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        env=env,
+        persistence_config=persistence_config,
+    )
+
+
+def _prepare_multimodal_tool_result_for_context(
+    agent,
+    raw_result: Dict[str, Any],
+    *,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    persistence_config: BudgetConfig,
+    subdir_hints: str = "",
+) -> Any:
+    """Convert multimodal output, then enforce the exact emitted budget.
+
+    The model-bound representation is authoritative for capacity accounting:
+    vision models may receive a multipart list while text-only providers get a
+    summary string. If that representation crosses the run cap, persist the
+    complete multimodal envelope and emit an exactly bounded text fallback.
+    """
+    if subdir_hints:
+        _append_subdir_hint_to_multimodal(raw_result, subdir_hints)
+    model_bound = agent._tool_result_content_for_active_model(
+        tool_name,
+        raw_result,
+    )
+    full_content = json.dumps(
+        raw_result,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return _apply_run_tool_output_budget(
+        agent,
+        model_bound,
+        full_content=full_content,
+        truncation_text=_multimodal_text_summary(raw_result),
         tool_name=tool_name,
         tool_use_id=tool_use_id,
         env=env,
@@ -1615,10 +1680,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 persistence_config=_tool_budget,
                 subdir_hints=subdir_hints,
             )
-        elif subdir_hints:
-            # Append the hint to the text summary part so the model still sees
-            # it; don't touch the image blocks.
-            _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+            _tool_content = agent._tool_result_content_for_active_model(
+                name,
+                function_result,
+            )
+        else:
+            _tool_content = _prepare_multimodal_tool_result_for_context(
+                agent,
+                function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
@@ -1628,7 +1703,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Text-only servers get a string-safe fallback here so a rejected
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
-        _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         tool_message = make_tool_result_message(
             name,
             _tool_content,
@@ -2419,12 +2493,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 persistence_config=_tool_budget,
                 subdir_hints=subdir_hints,
             )
-        elif subdir_hints:
-            _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+            _tool_content = agent._tool_result_content_for_active_model(
+                function_name,
+                function_result,
+            )
+        else:
+            _tool_content = _prepare_multimodal_tool_result_for_context(
+                agent,
+                function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
-        _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
