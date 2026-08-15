@@ -70,6 +70,7 @@ class TestResetSessionStampsFreshReset:
 
         assert new_entry is not None
         assert new_entry.is_fresh_reset is True
+        assert new_entry.auto_skill_pending is True
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,66 @@ class TestVanillaBehaviorUnaffected:
         assert _is_new_session(entry) is False
 
 
+class TestAutoSkillPendingClaim:
+    def test_fresh_create_claims_once_and_persists(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+
+        assert entry.auto_skill_pending is True
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+        ) is True
+        assert entry.auto_skill_pending is False
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+        ) is False
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+        assert restored.auto_skill_pending is False
+
+    def test_claim_clears_aliases_for_same_resolved_session(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        alias = SessionEntry(
+            session_key=f"{entry.session_key}:alias",
+            session_id=entry.session_id,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+            origin=entry.origin,
+            platform=entry.platform,
+            chat_type=entry.chat_type,
+            auto_skill_pending=True,
+        )
+        with store._lock:
+            store._entries[alias.session_key] = alias
+            store._save()
+
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+        ) is True
+        assert entry.auto_skill_pending is False
+        assert alias.auto_skill_pending is False
+        assert store.claim_auto_skill_pending(
+            alias.session_key,
+            alias.session_id,
+        ) is False
+
+    def test_wrong_resolved_session_cannot_claim(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            "different-session",
+        ) is False
+        assert entry.auto_skill_pending is True
+
+
 # ---------------------------------------------------------------------------
 # Persistence through sessions.json round-trip
 # ---------------------------------------------------------------------------
@@ -130,4 +191,4 @@ class TestPersistence:
         assert new_entry.is_fresh_reset is True
         restored = SessionEntry.from_dict(new_entry.to_dict())
         assert restored.is_fresh_reset is True
-
+        assert restored.auto_skill_pending is True

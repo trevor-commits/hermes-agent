@@ -7660,7 +7660,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
-        ``end_reason = 'compression'``.  Older builds tried to distinguish
+        ``end_reason = 'compression'``. A proactive gateway rollover is also
+        followed, but only when the child carries both the explicit
+        ``_proactive_rollover`` marker and an exact ``_reset_from`` pointer to
+        that parent. This lets a stale Telegram topic binding heal forward
+        without treating an arbitrary child as the live continuation.
+
+        Older builds tried to distinguish
         continuations from branches/subagents by requiring
         ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
         gateway + compression races can insert the real continuation row before
@@ -7689,7 +7695,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
+                      AND (
+                        parent.end_reason = 'compression'
+                        OR (
+                          parent.end_reason = 'proactive_rollover'
+                          AND json_extract(
+                            COALESCE(child.model_config, '{{}}'),
+                            '$._proactive_rollover'
+                          ) = 1
+                          AND json_extract(
+                            COALESCE(child.model_config, '{{}}'),
+                            '$._reset_from'
+                          ) = parent.id
+                        )
+                      )
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'

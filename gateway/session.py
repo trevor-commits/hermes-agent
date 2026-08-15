@@ -831,6 +831,13 @@ class SessionEntry:
     # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
+
+    # Durable, at-most-once claim for channel/topic auto-skills. Freshly
+    # created and reset sessions start pending; resumed, recovered, and
+    # switched sessions do not. The gateway claims this only after acquiring
+    # the resolved session's turn lease, clearing every routing alias that
+    # points at the same session id before any skill payload is injected.
+    auto_skill_pending: bool = False
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -905,6 +912,7 @@ class SessionEntry:
                 else None
             ),
             "is_fresh_reset": self.is_fresh_reset,
+            "auto_skill_pending": self.auto_skill_pending,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -998,6 +1006,7 @@ class SessionEntry:
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
+            auto_skill_pending=data.get("auto_skill_pending", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -2735,6 +2744,7 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                auto_skill_pending=True,
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -2869,6 +2879,59 @@ class SessionStore:
             peer_origin,
             display_name=peer_display_name,
         )
+
+    def claim_auto_skill_pending(
+        self,
+        session_key: str,
+        expected_session_id: str,
+    ) -> bool:
+        """Durably claim one session's channel/topic skill injection.
+
+        The caller already owns the resolved session turn lease. Clear the
+        flag for every routing alias of that session in one routing snapshot,
+        so a second alias, restart, or resumed handler cannot inject the same
+        skill again. A route mismatch or persistence failure fails closed.
+        """
+        if not session_key or not expected_session_id:
+            return False
+
+        claimed_keys: List[str] = []
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if (
+                entry is None
+                or entry.session_id != expected_session_id
+                or not entry.auto_skill_pending
+            ):
+                return False
+            for key, candidate in self._entries.items():
+                if candidate.session_id == expected_session_id:
+                    candidate.auto_skill_pending = False
+                    claimed_keys.append(key)
+            data, generation = self._snapshot_routing_locked()
+
+        try:
+            self._persist_routing_data(data, generation)
+        except Exception as exc:
+            # No authoritative routing write landed. Restore retryability only
+            # for aliases that still resolve to the same session; a concurrent
+            # route transition must never be overwritten.
+            with self._lock:
+                for key in claimed_keys:
+                    candidate = self._entries.get(key)
+                    if (
+                        candidate is not None
+                        and candidate.session_id == expected_session_id
+                    ):
+                        candidate.auto_skill_pending = True
+            logger.warning(
+                "gateway.session: auto-skill claim persistence failed for %s: %s",
+                session_key,
+                exc,
+            )
+            return False
+        return True
 
     def get_session_metadata(
         self,
@@ -3287,6 +3350,7 @@ class SessionStore:
                     chat_type=old_entry.chat_type,
                     prev_session_id=expected_session_id,
                     is_fresh_reset=True,
+                    auto_skill_pending=True,
                     model_override=(
                         dict(old_entry.model_override)
                         if old_entry.model_override
@@ -3405,6 +3469,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                auto_skill_pending=True,
             )
 
             self._entries[session_key] = new_entry

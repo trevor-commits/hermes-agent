@@ -7495,6 +7495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry,
         *,
         reason: str,
+        raise_on_error: bool = False,
     ) -> None:
         """Update the topic binding to point at ``session_entry.session_id``.
 
@@ -7511,6 +7512,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             self._record_telegram_topic_binding(source, session_entry)
         except Exception:
+            if raise_on_error:
+                raise
             logger.debug(
                 "telegram topic binding refresh failed (%s)", reason, exc_info=True,
             )
@@ -18019,6 +18022,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _apply_claimed_auto_skill(event, task_id: str, session_key: str) -> None:
+        """Prepend one already-claimed channel/topic skill to an event."""
+        auto_skill = getattr(event, "auto_skill", None)
+        if not auto_skill:
+            return
+        skill_names = (
+            [auto_skill] if isinstance(auto_skill, str) else list(auto_skill)
+        )
+        try:
+            from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+            combined_parts: list[str] = []
+            loaded_names: list[str] = []
+            for skill_name in skill_names:
+                loaded = _load_skill_payload(skill_name, task_id=task_id)
+                if loaded:
+                    loaded_skill, skill_dir, display_name = loaded
+                    note = (
+                        f'[IMPORTANT: The "{display_name}" skill is auto-loaded. '
+                        f"Follow its instructions for this session.]"
+                    )
+                    part = _build_skill_message(loaded_skill, skill_dir, note)
+                    if part:
+                        combined_parts.append(part)
+                        loaded_names.append(skill_name)
+                else:
+                    logger.warning("[Gateway] Auto-skill '%s' not found", skill_name)
+            if combined_parts:
+                combined_parts.append(event.text)
+                event.text = "\n\n".join(combined_parts)
+                logger.info(
+                    "[Gateway] Auto-loaded skill(s) %s for session %s",
+                    loaded_names,
+                    session_key,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[Gateway] Failed to auto-load skill(s) %s: %s",
+                skill_names,
+                exc,
+            )
+
     async def _proactive_rollover_must_defer(
         self,
         source,
@@ -18034,6 +18080,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if adapter_pending and adapter_pending.get(session_key) is not None:
                 return True
             if (getattr(self, "_queued_events", None) or {}).get(session_key):
+                return True
+            if await self.async_session_store._has_active_processes_safe(
+                session_key,
+                context="proactive_rollover",
+            ):
                 return True
 
             from tools.async_delegation import has_live_for_session
@@ -18360,42 +18411,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
-        # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
-        # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
-        _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
-            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
-            try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
-                    logger.info(
-                        "[Gateway] Auto-loaded skill(s) %s for session %s",
-                        _loaded_names, session_key,
-                    )
-            except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
-
         # ── Turn lease (#64934) ────────────────────────────────────────
         # Session resolution is FINAL here (get_or_create → async-delegation
         # pinning → topic tip-walk switch_session are all above). Serialize
@@ -18432,6 +18447,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+
+        # Claim the resolved session's auto-skill only after its turn lease is
+        # held. The durable SessionEntry bit replaces timestamp heuristics and
+        # is cleared across every routing alias before the event is mutated, so
+        # resume, restart, and alias races cannot inject the payload twice.
+        _auto = getattr(event, "auto_skill", None)
+        try:
+            _auto_skill_claimed = await (
+                self.async_session_store.claim_auto_skill_pending(
+                    session_entry.session_key,
+                    session_entry.session_id,
+                )
+            )
+        except Exception as exc:
+            _auto_skill_claimed = False
+            logger.warning(
+                "[Gateway] Auto-skill claim failed for session %s: %s",
+                session_entry.session_id,
+                exc,
+            )
+        if _auto_skill_claimed and _auto:
+            self._apply_claimed_auto_skill(
+                event,
+                _quick_key,
+                session_entry.session_key,
+            )
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
@@ -20118,6 +20159,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         source,
                                         session_entry,
                                         reason="proactive-rollover",
+                                        raise_on_error=True,
                                     )
                                 except Exception:
                                     logger.exception(
