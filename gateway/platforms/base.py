@@ -2358,6 +2358,10 @@ class MessageEvent:
     # Discord channel_skill_bindings).  A single name or ordered list.
     auto_skill: Optional[str | list[str]] = None
 
+    # Trusted control-plane route declared on the exact channel-skill binding.
+    # Unlike skill text, this value is never model-authored or prompt-parsed.
+    auto_skill_route: Optional[str] = None
+
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
@@ -2875,6 +2879,40 @@ def resolve_channel_skills(
                         seen.append(nm)
                 return seen or None
             return None
+    return None
+
+
+def resolve_channel_skill_route(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> str | None:
+    """Resolve the trusted route on the winning channel-skill binding.
+
+    Candidate precedence exactly matches :func:`resolve_channel_skills`:
+    exact channel or topic first, then its parent. Configuration insertion
+    order therefore cannot let a parent route shadow an exact route.
+    """
+    bindings = config_extra.get("channel_skill_bindings") or []
+    if not isinstance(bindings, list) or not bindings:
+        return None
+    ids_to_check: list[str] = []
+    for candidate in (channel_id, parent_id):
+        if candidate:
+            normalized = str(candidate)
+            if normalized not in ids_to_check:
+                ids_to_check.append(normalized)
+    for candidate_id in ids_to_check:
+        for entry in bindings:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("id", "")) != candidate_id:
+                continue
+            route = entry.get("route")
+            if not isinstance(route, str):
+                return None
+            route = route.strip()
+            return route or None
     return None
 
 
