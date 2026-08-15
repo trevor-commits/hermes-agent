@@ -50,6 +50,8 @@ import shlex
 import threading
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Literal, overload
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -194,6 +196,14 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class ToolResultPersistence:
+    """Model-facing content plus trusted full-output persistence provenance."""
+
+    content: str
+    full_output_persisted: bool
+
+
 def _resolve_storage_dir(env) -> str:
     """Return the best temp-backed storage dir for this environment."""
     if env is not None:
@@ -290,6 +300,7 @@ def _build_persisted_message(
     return msg
 
 
+@overload
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -297,7 +308,34 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
-) -> str:
+    *,
+    return_receipt: Literal[False] = False,
+) -> str: ...
+
+
+@overload
+def maybe_persist_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    threshold: int | float | None = None,
+    *,
+    return_receipt: Literal[True],
+) -> ToolResultPersistence: ...
+
+
+def maybe_persist_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    threshold: int | float | None = None,
+    *,
+    return_receipt: bool = False,
+) -> str | ToolResultPersistence:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
     Writes via env.execute() so the file is accessible from any backend
@@ -311,17 +349,31 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        return_receipt: Return trusted persistence provenance with the content.
 
     Returns:
-        Original content if small, or <persisted-output> replacement.
+        Original content if small, or <persisted-output> replacement. When
+        ``return_receipt`` is true, wrap that content with explicit provenance
+        indicating whether the complete output was successfully written.
     """
+    def _result(
+        model_content: str,
+        *,
+        full_output_persisted: bool,
+    ) -> str | ToolResultPersistence:
+        receipt = ToolResultPersistence(
+            content=model_content,
+            full_output_persisted=full_output_persisted,
+        )
+        return receipt if return_receipt else receipt.content
+
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):
-        return content
+        return _result(content, full_output_persisted=False)
 
     if len(content) <= effective_threshold:
-        return content
+        return _result(content, full_output_persisted=False)
 
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
@@ -360,7 +412,15 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return _result(
+                    _build_persisted_message(
+                        preview,
+                        has_more,
+                        len(content),
+                        remote_path,
+                    ),
+                    full_output_persisted=True,
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
@@ -368,10 +428,13 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
-    return (
-        f"{preview}\n\n"
-        f"[Truncated: tool response was {len(content):,} chars. "
-        f"Full output could not be saved to sandbox.]"
+    return _result(
+        (
+            f"{preview}\n\n"
+            f"[Truncated: tool response was {len(content):,} chars. "
+            f"Full output could not be saved to sandbox.]"
+        ),
+        full_output_persisted=False,
     )
 
 

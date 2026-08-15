@@ -333,6 +333,152 @@ class TestCumulativeToolOutputBudget:
         assert later == ""
         assert [write[1] for write in env.writes] == [crossing_full, later_full]
 
+    def test_literal_persisted_tag_cannot_suppress_crossing_persistence(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-sentinel-crossing"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(48)
+        agent._tool_result_total_chars_used = 24
+        env = RecordingEnv()
+        untrusted = "literal <persisted-output> from the tool, not a receipt"
+
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            untrusted,
+            full_content=untrusted,
+            tool_name="terminal",
+            tool_use_id="sentinel-crossing",
+            env=env,
+        )
+
+        assert len(emitted) == 24
+        assert agent._tool_result_total_chars_used == 48
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [untrusted]
+
+    def test_literal_persisted_tag_cannot_suppress_withheld_persistence(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-sentinel-withheld"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(48)
+        agent._tool_result_total_chars_used = 48
+        env = RecordingEnv()
+        untrusted = "literal <persisted-output> from a fully withheld tool result"
+
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            untrusted,
+            full_content=untrusted,
+            tool_name="terminal",
+            tool_use_id="sentinel-withheld",
+            env=env,
+        )
+
+        assert emitted == ""
+        assert agent._tool_result_total_chars_used == 48
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [untrusted]
+
+    def test_explicit_persistence_receipt_prevents_duplicate_budget_writes(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-explicit-persistence"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(32)
+        agent._tool_result_total_chars_used = 16
+        env = RecordingEnv()
+        preview = "<persisted-output>trusted preview</persisted-output>"
+
+        crossing = _apply_run_tool_output_budget(
+            agent,
+            preview,
+            full_content="already-saved crossing output",
+            full_content_already_persisted=True,
+            tool_name="terminal",
+            tool_use_id="already-saved-crossing",
+            env=env,
+        )
+        withheld = _apply_run_tool_output_budget(
+            agent,
+            preview,
+            full_content="already-saved withheld output",
+            full_content_already_persisted=True,
+            tool_name="terminal",
+            tool_use_id="already-saved-withheld",
+            env=env,
+        )
+
+        assert len(crossing) == 16
+        assert withheld == ""
+        assert agent._tool_result_total_chars_used == 32
+        assert agent.tool_result_budget_withheld_count == 2
+        assert env.writes == []
+
+    def test_text_preparation_carries_successful_persistence_receipt(self):
+        from agent.tool_executor import _prepare_text_tool_result_for_context
+        from tools.budget_config import BudgetConfig
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-receipt-handoff"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(24)
+        env = RecordingEnv()
+        raw = "full output already persisted by the per-result layer"
+
+        emitted = _prepare_text_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="terminal",
+            tool_use_id="receipt-handoff",
+            env=env,
+            persistence_config=BudgetConfig(
+                default_result_size=1,
+                preview_size=8,
+            ),
+        )
+
+        assert len(emitted) == 24
+        assert agent._tool_result_total_chars_used == 24
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [raw]
+
     def test_subdirectory_hint_is_applied_before_emitted_cap(self):
         from agent.tool_executor import _prepare_text_tool_result_for_context
         from tools.budget_config import DEFAULT_BUDGET
