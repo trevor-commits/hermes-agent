@@ -73,6 +73,10 @@ _PERSISTED_PREVIEW_HEADER = re.compile(r"\n\nPreview \(first \d+ chars\):\n")
 _AGGREGATE_PREVIEW_TRUNCATION_MARKER = (
     "\n[Preview truncated: aggregate tool-output budget exhausted.]"
 )
+_UNTRUSTED_FRAME_OPEN = re.compile(
+    r'^<untrusted_tool_result source="([^"\n]+)">\n'
+)
+_UNTRUSTED_FRAME_CLOSE = "\n</untrusted_tool_result>"
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -206,6 +210,24 @@ class ToolResultPersistence:
 
     content: str
     full_output_persisted: bool
+
+
+def _split_untrusted_tool_frame(
+    tool_name: str,
+    content: str,
+) -> tuple[str, str, str] | None:
+    """Return a structurally exact tool-matched frame and its inner data."""
+    opening = _UNTRUSTED_FRAME_OPEN.match(content)
+    if opening is None or opening.group(1) != tool_name:
+        return None
+    if not content.endswith(_UNTRUSTED_FRAME_CLOSE):
+        return None
+    data_start = content.find("\n\n", opening.end())
+    if data_start < 0:
+        return None
+    data_start += 2
+    data_end = len(content) - len(_UNTRUSTED_FRAME_CLOSE)
+    return content[:data_start], content[data_start:data_end], content[data_end:]
 
 
 def _resolve_storage_dir(env) -> str:
@@ -556,9 +578,18 @@ def enforce_turn_budget(
         msg = tool_messages[idx]
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
+        tool_name = str(msg.get("tool_name") or msg.get("name") or "")
+        untrusted_frame = (
+            _split_untrusted_tool_frame(tool_name, content)
+            if isinstance(content, str)
+            else None
+        )
+        content_to_persist = (
+            untrusted_frame[1] if untrusted_frame is not None else content
+        )
 
         persistence = maybe_persist_tool_result(
-            content=content,
+            content=content_to_persist,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
@@ -568,12 +599,24 @@ def enforce_turn_budget(
         )
         if isinstance(persistence, ToolResultPersistence):
             replacement = persistence.content
+            if untrusted_frame is not None:
+                replacement = (
+                    untrusted_frame[0] + replacement + untrusted_frame[2]
+                )
+                persistence = ToolResultPersistence(
+                    content=replacement,
+                    full_output_persisted=persistence.full_output_persisted,
+                )
             if persistence_receipts is not None:
                 persistence_receipts[id(msg)] = persistence
         else:
             # Compatibility for extensions that replace the storage helper
             # without implementing the typed receipt contract.
             replacement = persistence
+            if untrusted_frame is not None:
+                replacement = (
+                    untrusted_frame[0] + replacement + untrusted_frame[2]
+                )
         if replacement != content:
             total_size -= size
             total_size += len(replacement)

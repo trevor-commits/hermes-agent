@@ -410,6 +410,126 @@ def agent():
 
 class TestSegmentedDispatchIntegration:
     @pytest.mark.parametrize("dispatch_path", ["sequential", "concurrent", "segmented"])
+    def test_aggregate_only_high_risk_spills_preserve_complete_frame(
+        self,
+        agent,
+        dispatch_path,
+    ):
+        """Aggregate-only spills must persist data inside its trust frame."""
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-aggregate-only-high-risk"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        calls = [
+            _tc("web_search", f'{{"query":"query-{index}"}}', call_id=f"spill-{index}")
+            for index in range(3)
+        ]
+        payloads = {
+            call.id: chr(ord("A") + index) * 700
+            for index, call in enumerate(calls)
+        }
+        preview_size = 64
+        expected_spilled = []
+        for call in calls:
+            payload = payloads[call.id]
+            preview, has_more = generate_preview(payload, max_chars=preview_size)
+            persisted = _build_persisted_message(
+                preview,
+                has_more,
+                len(payload),
+                (
+                    "/tmp/test-aggregate-only-high-risk/hermes-results/"
+                    f"{call.id}.txt"
+                ),
+            )
+            expected_spilled.append(
+                make_tool_result_message("web_search", persisted, call.id)["content"]
+            )
+        turn_budget = sum(len(content) for content in expected_spilled) - 5
+        budget = BudgetConfig(
+            default_result_size=1_000,
+            turn_budget=turn_budget,
+            preview_size=preview_size,
+        )
+        env = RecordingEnv()
+        messages = []
+        assistant_message = SimpleNamespace(content="", tool_calls=calls)
+        captured = []
+
+        def fake_handle(_name, _args, _task_id, **kwargs):
+            return payloads[kwargs["tool_call_id"]]
+
+        def enforce_and_capture(tool_messages, *args, **kwargs):
+            result = enforce_turn_budget_real(tool_messages, *args, **kwargs)
+            captured.append((list(tool_messages), kwargs["persistence_receipts"]))
+            return result
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=fake_handle),
+            patch("agent.tool_executor._budget_for_agent", return_value=budget),
+            patch("agent.tool_executor.get_active_env", return_value=env),
+            patch(
+                "agent.tool_executor.enforce_turn_budget",
+                side_effect=enforce_and_capture,
+            ),
+        ):
+            if dispatch_path == "sequential":
+                agent._execute_tool_calls_sequential(
+                    assistant_message,
+                    messages,
+                    "task-1",
+                )
+            elif dispatch_path == "concurrent":
+                agent._execute_tool_calls_concurrent(
+                    assistant_message,
+                    messages,
+                    "task-1",
+                )
+            else:
+                from agent.tool_executor import execute_tool_calls_segmented
+
+                execute_tool_calls_segmented(
+                    agent,
+                    assistant_message,
+                    messages,
+                    "task-1",
+                    segments=[
+                        ("parallel", calls[:2]),
+                        ("sequential", calls[2:]),
+                    ],
+                )
+
+        assert sum(len(message["content"]) for message in messages) == turn_budget
+        assert all(
+            message["content"].count(
+                '<untrusted_tool_result source="web_search">'
+            ) == 1
+            and message["content"].count("</untrusted_tool_result>") == 1
+            and message["content"].endswith("</untrusted_tool_result>")
+            and PERSISTED_OUTPUT_CLOSING_TAG in message["content"]
+            for message in messages
+        )
+        assert len(captured) == 1
+        captured_messages, receipts = captured[0]
+        assert all(
+            receipts[id(message)].full_output_persisted
+            and receipts[id(message)].content == message["content"]
+            for message in captured_messages
+        )
+        assert len(env.writes) == len(payloads)
+        assert sorted(stdin_data for _timeout, stdin_data in env.writes) == sorted(
+            payloads.values()
+        )
+
+    @pytest.mark.parametrize("dispatch_path", ["sequential", "concurrent", "segmented"])
     def test_high_risk_persisted_receipts_stay_framed_and_budgeted(
         self,
         agent,
