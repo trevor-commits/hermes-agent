@@ -59,6 +59,53 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_in_place_commit_marks_compacted_rows_and_prevents_duplicate_append(
+        self,
+    ):
+        """The compaction transaction must intrinsically mark every live row.
+
+        A later flush may not receive the compaction-specific history baseline.
+        The committed dictionaries therefore need their own persistence marker
+        so the append-only flush cannot insert the compacted block twice.
+        """
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260815_compaction_dedup_markers"
+            _seed(db, sid, "dedup", n=2)
+            agent = _make_agent(db, sid, in_place=True)
+            agent._persist_user_turn_identity = None
+            agent._current_turn_durability_receipt = None
+
+            compressed, _ = compress_context(
+                agent,
+                [
+                    {"role": "user", "content": "old ask"},
+                    {"role": "assistant", "content": "old answer"},
+                ],
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+            committed_ids = [row["id"] for row in db.get_messages(sid)]
+            assert len(committed_ids) == 2
+
+            assert agent._flush_messages_to_session_db(compressed, None) is True
+
+            live_rows = db.get_messages(sid)
+            assert [row["id"] for row in live_rows] == committed_ids
+            assert all(
+                message.get("_db_persisted") is True
+                for message in compressed
+            )
+            assert all(
+                isinstance(message.get("_row_id"), int)
+                and message["_row_id"] > 0
+                for message in compressed
+            )
+            assert agent._current_turn_durability_receipt is None
+
     def test_in_place_commit_binds_exact_current_turn_durability_receipt(self):
         """The compaction transaction itself can be the first durable write
         for the active user turn, so it must publish the same exact row receipt
