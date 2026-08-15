@@ -2419,8 +2419,13 @@ class AIAgent:
                 )
                 from agent.turn_context import (
                     bind_current_turn_durability_receipt,
+                    mark_committed_messages_persisted,
                 )
 
+                mark_committed_messages_persisted(
+                    _batch_msgs,
+                    _batch_rows,
+                )
                 bind_current_turn_durability_receipt(
                     self,
                     _batch_msgs,
