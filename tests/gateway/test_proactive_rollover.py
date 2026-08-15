@@ -10,6 +10,8 @@ sessions, sub-threshold usage, and the default-off config must never roll.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +21,8 @@ import pytest
 from gateway import run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource, SessionStore
-from hermes_state import SessionDB
+from gateway.turn_lease import SessionTurnLeaseRegistry
+from hermes_state import CompressionSessionClosedError, SessionDB
 from tests.gateway.test_42039_duplicate_user_message import (
     _bootstrap,
     _event,
@@ -255,6 +258,135 @@ def _carryover() -> dict:
         "display_kind": "hidden",
         "timestamp": 1234.5,
     }
+
+
+def _add_alias(store: SessionStore, entry: SessionEntry, suffix: str) -> SessionEntry:
+    alias = dataclasses.replace(
+        entry,
+        session_key=f"{entry.session_key}:{suffix}",
+    )
+    with store._lock:
+        store._entries[alias.session_key] = alias
+        store._save()
+    return alias
+
+
+@pytest.mark.asyncio
+async def test_two_alias_waiter_defers_proactive_rollover(monkeypatch, tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    alias = _add_alias(store, old_entry, "alias")
+    registry = SessionTurnLeaseRegistry()
+    holder = await registry.acquire(
+        old_entry.session_id,
+        owner_key=old_entry.session_key,
+        generation=1,
+        timeout=1,
+    )
+    waiter_task = asyncio.create_task(
+        registry.acquire(
+            old_entry.session_id,
+            owner_key=alias.session_key,
+            generation=2,
+            timeout=1,
+        )
+    )
+    await asyncio.sleep(0)
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = None
+    runner._turn_leases = registry
+    runner._queued_events = {}
+    runner._adapter_for_source = MagicMock(return_value=None)
+    monkeypatch.setattr(
+        "tools.async_delegation.has_live_for_session",
+        lambda **_kwargs: False,
+    )
+
+    try:
+        assert registry.has_waiters(old_entry.session_id) is True
+        assert await runner._proactive_rollover_must_defer(
+            old_entry.origin,
+            old_entry.session_key,
+            old_entry.session_id,
+        ) is True
+        assert store._db.get_session(old_entry.session_id)["end_reason"] is None
+    finally:
+        assert registry.release(holder) is True
+        waiter = await waiter_task
+        assert registry.release(waiter) is True
+
+
+@pytest.mark.asyncio
+async def test_two_alias_waiter_refreshes_to_committed_rollover_child(tmp_path):
+    store, old_entry = _real_store(tmp_path)
+    alias = _add_alias(store, old_entry, "alias")
+    registry = SessionTurnLeaseRegistry()
+    holder = await registry.acquire(
+        old_entry.session_id,
+        owner_key=old_entry.session_key,
+        generation=1,
+        timeout=1,
+    )
+    waiter_task = asyncio.create_task(
+        registry.acquire(
+            old_entry.session_id,
+            owner_key=alias.session_key,
+            generation=2,
+            timeout=1,
+        )
+    )
+    await asyncio.sleep(0)
+    assert registry.has_waiters(old_entry.session_id) is True
+
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+
+    assert registry.release(holder) is True
+    waiter = await waiter_task
+    try:
+        assert waiter.contended is True
+        refreshed = store.resolve_session_after_turn_lease_wait(
+            alias.session_key,
+            old_entry.session_id,
+        )
+        assert refreshed is not None
+        assert refreshed.session_id == child.session_id
+        assert registry.rebind(waiter, child.session_id) is True
+
+        with pytest.raises(CompressionSessionClosedError):
+            store._db.append_message(
+                old_entry.session_id,
+                role="user",
+                content="must not land on ended parent",
+            )
+        with pytest.raises(CompressionSessionClosedError):
+            store._db.append_messages_batch(
+                old_entry.session_id,
+                [{"role": "user", "content": "batch must not land either"}],
+            )
+        store.append_to_transcript(
+            old_entry.session_id,
+            {"role": "user", "content": "safely rerouted"},
+        )
+        assert any(
+            message["content"] == "safely rerouted"
+            for message in store._db.get_messages(child.session_id)
+        )
+
+        restarted = SessionStore(
+            tmp_path / "sessions",
+            gateway_run.GatewayConfig(),
+        )
+        restarted_alias = restarted.lookup_by_session_key(alias.session_key)
+        assert restarted_alias is not None
+        assert restarted_alias.session_id == child.session_id
+    finally:
+        assert registry.release(waiter) is True
 
 
 @pytest.mark.parametrize(
