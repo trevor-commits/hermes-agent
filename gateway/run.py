@@ -7495,6 +7495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry,
         *,
         reason: str,
+        raise_on_error: bool = False,
     ) -> None:
         """Update the topic binding to point at ``session_entry.session_id``.
 
@@ -7511,6 +7512,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             self._record_telegram_topic_binding(source, session_entry)
         except Exception:
+            if raise_on_error:
+                raise
             logger.debug(
                 "telegram topic binding refresh failed (%s)", reason, exc_info=True,
             )
@@ -16744,7 +16747,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return getattr(_blueprint_result, "text", "") or None
 
         if canonical == "retry":
-            return await self._handle_retry_command(event)
+            # /retry is a transcript mutation followed by a normal agent
+            # turn. Mark it and fall through so truncation happens only after
+            # the resolved session's TurnLease is held; recursively preparing
+            # it here used to rewrite a stale proactive-rollover parent before
+            # lease acquisition when two routing aliases raced.
+            setattr(event, "_gateway_retry_requested", True)
         
         if canonical == "undo":
             async def _do_undo():
@@ -17212,6 +17220,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            if getattr(event, "_gateway_skip_goal_continuation", False):
+                return _agent_result
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -18019,6 +18029,104 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _apply_claimed_auto_skill(event, task_id: str, session_key: str) -> bool:
+        """Load and prepend a channel/topic skill without partial mutation.
+
+        Returns ``True`` only when every configured payload loaded and the
+        event is ready for its durable claim. A loader failure leaves the
+        original event untouched so the pending bit remains safely retryable.
+        """
+        auto_skill = getattr(event, "auto_skill", None)
+        if not auto_skill:
+            return True
+        skill_names = (
+            [auto_skill] if isinstance(auto_skill, str) else list(auto_skill)
+        )
+        try:
+            from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+            combined_parts: list[str] = []
+            loaded_names: list[str] = []
+            for skill_name in skill_names:
+                loaded = _load_skill_payload(skill_name, task_id=task_id)
+                if loaded:
+                    loaded_skill, skill_dir, display_name = loaded
+                    note = (
+                        f'[IMPORTANT: The "{display_name}" skill is auto-loaded. '
+                        f"Follow its instructions for this session.]"
+                    )
+                    part = _build_skill_message(loaded_skill, skill_dir, note)
+                    if part:
+                        combined_parts.append(part)
+                        loaded_names.append(skill_name)
+                else:
+                    logger.warning("[Gateway] Auto-skill '%s' not found", skill_name)
+                    return False
+            if combined_parts:
+                combined_parts.append(event.text)
+                event.text = "\n\n".join(combined_parts)
+                logger.info(
+                    "[Gateway] Auto-loaded skill(s) %s for session %s",
+                    loaded_names,
+                    session_key,
+                )
+            return bool(combined_parts)
+        except Exception as exc:
+            logger.warning(
+                "[Gateway] Failed to auto-load skill(s) %s: %s",
+                skill_names,
+                exc,
+            )
+            return False
+
+    async def _proactive_rollover_must_defer(
+        self,
+        source,
+        session_key: str,
+        session_id: str,
+    ) -> bool:
+        """Fail closed when any current-session work could cross rollover."""
+        try:
+            lease_registry = getattr(self, "_turn_leases", None)
+            if (
+                lease_registry is not None
+                and lease_registry.has_waiters(session_id)
+            ):
+                return True
+            adapter = self._adapter_for_source(source)
+            adapter_pending = (
+                getattr(adapter, "_pending_messages", None) if adapter else None
+            )
+            if adapter_pending and adapter_pending.get(session_key) is not None:
+                return True
+            if (getattr(self, "_queued_events", None) or {}).get(session_key):
+                return True
+            if await self.async_session_store._has_active_processes_safe(
+                session_key,
+                context="proactive_rollover",
+            ):
+                return True
+
+            from tools.async_delegation import has_live_for_session
+
+            if has_live_for_session(
+                session_key=session_key,
+                parent_session_id=session_id,
+            ):
+                return True
+            if await self.async_session_store.has_dirty_transcript(session_id):
+                return True
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Proactive rollover pending-work probe failed for %s; "
+                "deferring: %s",
+                session_key,
+                exc,
+            )
+            return True
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -18157,6 +18265,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # ── Turn lease (#64934) ────────────────────────────────────────
+        # Session resolution is final for an uncontended turn. A contended
+        # alias must re-resolve after acquisition because the previous holder
+        # may have committed a proactive-rollover continuation while this turn
+        # waited. This runs before session-start flags, context construction,
+        # payload loading, or transcript I/O so none can bind to an ended
+        # parent.
+        _lease_registry = getattr(self, "_turn_leases", None)
+        if _lease_registry is not None:
+            _lease_token = await _lease_registry.acquire(
+                session_entry.session_id,
+                owner_key=_quick_key,
+                generation=run_generation,
+                timeout=_float_env(
+                    "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                ),
+            )
+            if _lease_token is not None:
+                _lease_state = self._session_state(_quick_key).turn
+                _lease_state.lease_token = _lease_token
+                _lease_state.lease_generation = run_generation
+                if getattr(_lease_token, "contended", False):
+                    waited_session_id = session_entry.session_id
+                    refreshed_entry = await (
+                        self.async_session_store
+                        .resolve_session_after_turn_lease_wait(
+                            session_entry.session_key,
+                            waited_session_id,
+                        )
+                    )
+                    if refreshed_entry is None:
+                        raise TurnLeaseTimeoutError(
+                            waited_session_id,
+                            owner_key=_quick_key,
+                            generation=run_generation,
+                            wait_seconds=0,
+                        )
+                    if refreshed_entry.session_id != waited_session_id:
+                        if not self._rebind_turn_lease(
+                            _quick_key,
+                            run_generation,
+                            refreshed_entry.session_id,
+                        ):
+                            raise TurnLeaseTimeoutError(
+                                waited_session_id,
+                                owner_key=_quick_key,
+                                generation=run_generation,
+                                wait_seconds=0,
+                            )
+                        session_entry = refreshed_entry
+                        session_key = session_entry.session_key
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -18324,84 +18485,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
-        # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
-        # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Journal the active turn before loading or consuming its auto-skill.
+        # The claim is token-bound and remains recoverable until normal turn
+        # cleanup clears this exact marker.
+        _active_turn_marked = await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+        )
+        if getattr(event, "_gateway_retry_requested", False):
+            _retry_error = await self._prepare_retry_turn(event, session_entry)
+            if _retry_error is not None:
+                # This path is command feedback, not an agent completion; the
+                # outer goal judge must not turn a safe retry no-op into a
+                # synthetic continuation.
+                setattr(event, "_gateway_skip_goal_continuation", True)
+                return _retry_error
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
-            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
+        _auto_original_text = event.text
+        _auto_payload_ready = False
+        if _active_turn_marked:
+            _auto_payload_ready = self._apply_claimed_auto_skill(
+                event,
+                _quick_key,
+                session_entry.session_key,
+            )
+        if _active_turn_marked and _auto_payload_ready:
             try:
-                from agent.skill_commands import _load_skill_payload, _build_skill_message
-                _combined_parts: list[str] = []
-                _loaded_names: list[str] = []
-                for _sname in _skill_names:
-                    _loaded = _load_skill_payload(_sname, task_id=_quick_key)
-                    if _loaded:
-                        _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
-                        _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
-                        if _part:
-                            _combined_parts.append(_part)
-                            _loaded_names.append(_sname)
-                    else:
-                        logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
-                if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
-                    logger.info(
-                        "[Gateway] Auto-loaded skill(s) %s for session %s",
-                        _loaded_names, session_key,
+                _auto_skill_claimed = await (
+                    self.async_session_store.claim_auto_skill_pending(
+                        session_entry.session_key,
+                        session_entry.session_id,
+                        active_turn_token=getattr(
+                            event,
+                            "_gateway_active_turn_token",
+                            None,
+                        ),
                     )
-            except Exception as e:
-                logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
-
-        # ── Turn lease (#64934) ────────────────────────────────────────
-        # Session resolution is FINAL here (get_or_create → async-delegation
-        # pinning → topic tip-walk switch_session are all above). Serialize
-        # the [load history → run → flush] region per resolved SESSION_ID:
-        # when a second routing key is mapped to this same session_id, its
-        # turn waits here for the previous turn's flush instead of loading a
-        # stale history base and interleaving transcript writes. Same-key
-        # messages never reach this point mid-turn (adapter + runner guards
-        # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-closed on timeout: never enter the transcript region without a
-        # lease. Outer dispatch returns a bounded rejection/resend notice rather
-        # than recreating the exact concurrent-turn corruption this lease exists
-        # to prevent. Released in _handle_message's finally via
-        # _release_turn_lease — granted per (routing key, run generation) so a
-        # stale unwind can't release a newer turn's lease.
-        _lease_registry = getattr(self, "_turn_leases", None)
-        if _lease_registry is not None:
-            try:
-                _lease_token = await _lease_registry.acquire(
-                    session_entry.session_id,
-                    owner_key=_quick_key,
-                    generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
-                    ),
                 )
-            except TurnLeaseTimeoutError:
-                # The broad session-context cleanup finally starts later in this
-                # method. Restore the tokens here before propagating the rejection
-                # to outer dispatch, or this early exit leaks task-local identity.
-                self._clear_session_env(_session_env_tokens)
-                raise
-            if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
-
-        # A turn only becomes durable recovery work after it owns (or has
-        # explicitly degraded past) the per-session lease.  Marking before the
-        # await above would falsely recover an alias-routed message that never
-        # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+            except Exception as exc:
+                _auto_skill_claimed = False
+                logger.warning(
+                    "[Gateway] Auto-skill claim failed for session %s: %s",
+                    session_entry.session_id,
+                    exc,
+                )
+            if not _auto_skill_claimed and _auto:
+                event.text = _auto_original_text
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -20015,7 +20144,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not is_context_overflow_failure
                     and session_entry
                     and session_key
-                    and not self._pending_messages.get(session_key)
                 ):
                     _pr_threshold = int(
                         getattr(
@@ -20028,50 +20156,96 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr_used = int(agent_result.get("last_prompt_tokens") or 0)
                     if _pr_threshold > 0 and _pr_used >= _pr_threshold:
                         _pr_old_id = session_entry.session_id
-                        _pr_digest = _build_proactive_rollover_carryover(
-                            agent_messages, old_session_id=_pr_old_id
-                        )
-                        new_entry = await self.async_session_store.reset_session(
-                            session_key
-                        )
-                        self._evict_cached_agent(session_key)
-                        self._clear_conversation_scope(
-                            session_key, reason="proactive_rollover"
-                        )
-                        if new_entry is not None:
-                            session_entry = new_entry
-                            await asyncio.to_thread(
-                                self._sync_telegram_topic_binding,
-                                source,
-                                session_entry,
-                                reason="proactive-rollover",
-                            )
-                            await self.async_session_store.append_to_transcript(
-                                session_entry.session_id,
-                                {
-                                    "role": "user",
-                                    "content": _pr_digest,
-                                    "_compressed_summary": True,
-                                    "display_kind": "hidden",
-                                    "timestamp": time.time(),
-                                },
-                            )
-                        logger.info(
-                            "Proactive rollover: session %s reached %d prompt "
-                            "tokens (threshold %d); rolled to fresh session %s "
-                            "with a carryover digest.",
+                        if await self._proactive_rollover_must_defer(
+                            source,
+                            session_key,
                             _pr_old_id,
-                            _pr_used,
-                            _pr_threshold,
-                            session_entry.session_id,
-                        )
-                        response = (response or "") + (
-                            f"\n\n🔄 Rolled to a fresh session — this chat "
-                            f"reached ~{_pr_used:,} prompt tokens (soft "
-                            f"threshold {_pr_threshold:,}). A compact summary "
-                            "was carried over; full history stays saved in "
-                            "the previous session."
-                        )
+                        ):
+                            logger.info(
+                                "Proactive rollover deferred for %s: pending "
+                                "or uncommitted work remains.",
+                                session_key,
+                            )
+                        else:
+                            _pr_digest = _build_proactive_rollover_carryover(
+                                agent_messages,
+                                old_session_id=_pr_old_id,
+                            )
+                            new_entry = await (
+                                self.async_session_store
+                                .rollover_session_with_carryover(
+                                    session_key,
+                                    _pr_old_id,
+                                    {
+                                        "role": "user",
+                                        "content": _pr_digest,
+                                        "_compressed_summary": True,
+                                        "display_kind": "hidden",
+                                        "timestamp": time.time(),
+                                    },
+                                )
+                            )
+                            if new_entry is None:
+                                logger.info(
+                                    "Proactive rollover CAS deferred for %s; "
+                                    "the route or transcript state changed.",
+                                    session_key,
+                                )
+                            else:
+                                session_entry = new_entry
+                                # Keep the holder's lease aliased to the child
+                                # through post-commit cleanup and delivery. A
+                                # new route cannot enter the child while the
+                                # rollover turn is still unwinding.
+                                self._rebind_turn_lease(
+                                    _quick_key,
+                                    run_generation,
+                                    new_entry.session_id,
+                                )
+                                try:
+                                    self._evict_cached_agent(session_key)
+                                    self._clear_conversation_scope(
+                                        session_key,
+                                        reason="proactive_rollover",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Post-commit proactive-rollover cache "
+                                        "cleanup failed for %s",
+                                        session_key,
+                                    )
+                                try:
+                                    await asyncio.to_thread(
+                                        self._sync_telegram_topic_binding,
+                                        source,
+                                        session_entry,
+                                        reason="proactive-rollover",
+                                        raise_on_error=True,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Post-commit Telegram topic sync failed "
+                                        "for proactive rollover %s; database "
+                                        "routing remains authoritative.",
+                                        session_key,
+                                    )
+                                logger.info(
+                                    "Proactive rollover: session %s reached %d "
+                                    "prompt tokens (threshold %d); rolled to "
+                                    "fresh session %s with a carryover digest.",
+                                    _pr_old_id,
+                                    _pr_used,
+                                    _pr_threshold,
+                                    session_entry.session_id,
+                                )
+                                response = (response or "") + (
+                                    f"\n\n🔄 Rolled to a fresh session — this "
+                                    f"chat reached ~{_pr_used:,} prompt tokens "
+                                    f"(soft threshold {_pr_threshold:,}). A "
+                                    "compact summary was carried over; full "
+                                    "history stays saved in the previous "
+                                    "session."
+                                )
             except Exception:
                 logger.exception(
                     "Proactive rollover failed for session %s — continuing "

@@ -11,6 +11,7 @@ Three independent defences, one per failure mode observed on the live fleet:
 """
 
 import contextlib
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,7 @@ from cron.jobs import (
     resolve_hard_context_ceiling_tokens,
     resume_job,
     save_jobs,
+    trigger_job,
     update_job,
 )
 
@@ -55,6 +57,19 @@ CEILING_ERROR = "hard context ceiling"
 # =========================================================================
 
 class TestFirstTurnSizeGate:
+    def test_usable_context_is_eighty_percent_of_hard_ceiling(self):
+        from cron.context_budget import evaluate_context_parts
+
+        evaluation = evaluate_context_parts(
+            ["static", "skill"],
+            hard_ceiling_tokens=30_000,
+            token_estimator=lambda text: {"static": 10_000, "skill": 14_000}[text],
+        )
+
+        assert evaluation.usable_tokens == 24_000
+        assert evaluation.estimated_tokens == 24_000
+        assert evaluation.exceeded is True
+
     def test_ceiling_defaults_to_30k_when_config_leaves_it_unset(self):
         """Stock config ships ``threshold_tokens: None`` — that must not read
         as "no ceiling", or the gate is a silent no-op everywhere."""
@@ -87,6 +102,44 @@ class TestFirstTurnSizeGate:
         job = create_job(prompt="check the build queue", schedule="every 4h")
         assert job["prompt"] == "check the build queue"
         assert get_job(job["id"]) is not None
+
+    def test_create_rejects_oversized_attached_skill(self, tmp_cron_dir):
+        payload = json.dumps(
+            {"success": True, "content": "s" * 96_000}
+        )
+        with patch("tools.skills_tool.skill_view", return_value=payload):
+            with pytest.raises(ValueError, match="usable context budget"):
+                create_job(
+                    prompt="run the attached workflow",
+                    skills=["oversized-static-skill"],
+                    schedule="every 4h",
+                )
+
+    def test_create_rejects_oversized_attached_bundle(self, tmp_cron_dir):
+        segment = ("bundle-member", "b" * 96_000)
+        payload = ("bundle invocation", ["bundle-member"], [], [segment])
+        with patch(
+            "agent.skill_bundles.resolve_bundle_command_key",
+            return_value="oversized-bundle",
+        ), patch(
+            "agent.skill_bundles.build_bundle_invocation_message",
+            return_value=payload,
+        ):
+            with pytest.raises(ValueError, match="usable context budget"):
+                create_job(
+                    prompt="run the bundle",
+                    skills=["oversized-bundle"],
+                    schedule="every 4h",
+                )
+
+    def test_update_rejects_new_oversized_skill(self, tmp_cron_dir):
+        job = create_job(prompt="small", schedule="every 4h")
+        payload = json.dumps(
+            {"success": True, "content": "u" * 96_000}
+        )
+        with patch("tools.skills_tool.skill_view", return_value=payload):
+            with pytest.raises(ValueError, match="usable context budget"):
+                update_job(job["id"], {"skills": ["oversized-update-skill"]})
 
     def test_explicit_ceiling_parameter_overrides_the_configured_one(self, tmp_cron_dir):
         with pytest.raises(ValueError, match=CEILING_ERROR):
@@ -224,13 +277,299 @@ class TestCumulativeToolOutputBudget:
 
         agent = self._budgeted_agent(10_000)
         _apply_run_tool_output_budget(agent, "a" * 6_000)
-        # Crosses the line — kept whole, because the call was already paid for.
-        assert _apply_run_tool_output_budget(agent, "b" * 6_000) == "b" * 6_000
+        # The crossing result consumes exactly the remaining 4,000 chars.
+        crossing = _apply_run_tool_output_budget(agent, "b" * 6_000)
+        assert len(crossing) == 4_000
+        assert crossing.endswith(
+            "[tool result truncated: run tool-output budget exhausted]"
+        )
+        assert agent._tool_result_total_chars_used == 10_000
+        assert agent.tool_result_budget_withheld_count == 1
 
         withheld = _apply_run_tool_output_budget(agent, "c" * 6_000)
-        assert withheld == "[tool result withheld: run tool-output budget 10,000 chars exhausted]"
-        assert _apply_run_tool_output_budget(agent, "d" * 50) == withheld
+        assert withheld == ""
+        assert _apply_run_tool_output_budget(agent, "d" * 50) == ""
+        assert agent._tool_result_total_chars_used == 10_000
+        assert agent.tool_result_budget_withheld_count == 3
+
+    def test_crossing_and_later_results_persist_complete_output_first(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-budget"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(100)
+        agent._tool_result_total_chars_used = 80
+        env = RecordingEnv()
+
+        crossing_full = "crossing-full-output" * 5
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            "x" * 50,
+            full_content=crossing_full,
+            tool_name="terminal",
+            tool_use_id="crossing",
+            env=env,
+        )
+        later_full = "later-full-output" * 5
+        later = _apply_run_tool_output_budget(
+            agent,
+            "y" * 50,
+            full_content=later_full,
+            tool_name="terminal",
+            tool_use_id="later",
+            env=env,
+        )
+
+        assert len(emitted) == 20
+        assert later == ""
+        assert [write[1] for write in env.writes] == [crossing_full, later_full]
+
+    def test_literal_persisted_tag_cannot_suppress_crossing_persistence(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-sentinel-crossing"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(48)
+        agent._tool_result_total_chars_used = 24
+        env = RecordingEnv()
+        untrusted = "literal <persisted-output> from the tool, not a receipt"
+
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            untrusted,
+            full_content=untrusted,
+            tool_name="terminal",
+            tool_use_id="sentinel-crossing",
+            env=env,
+        )
+
+        assert len(emitted) == 24
+        assert agent._tool_result_total_chars_used == 48
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [untrusted]
+
+    def test_literal_persisted_tag_cannot_suppress_withheld_persistence(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-sentinel-withheld"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(48)
+        agent._tool_result_total_chars_used = 48
+        env = RecordingEnv()
+        untrusted = "literal <persisted-output> from a fully withheld tool result"
+
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            untrusted,
+            full_content=untrusted,
+            tool_name="terminal",
+            tool_use_id="sentinel-withheld",
+            env=env,
+        )
+
+        assert emitted == ""
+        assert agent._tool_result_total_chars_used == 48
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [untrusted]
+
+    def test_explicit_persistence_receipt_prevents_duplicate_budget_writes(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-explicit-persistence"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(32)
+        agent._tool_result_total_chars_used = 16
+        env = RecordingEnv()
+        preview = "<persisted-output>trusted preview</persisted-output>"
+
+        crossing = _apply_run_tool_output_budget(
+            agent,
+            preview,
+            full_content="already-saved crossing output",
+            full_content_already_persisted=True,
+            tool_name="terminal",
+            tool_use_id="already-saved-crossing",
+            env=env,
+        )
+        withheld = _apply_run_tool_output_budget(
+            agent,
+            preview,
+            full_content="already-saved withheld output",
+            full_content_already_persisted=True,
+            tool_name="terminal",
+            tool_use_id="already-saved-withheld",
+            env=env,
+        )
+
+        assert len(crossing) == 16
+        assert withheld == ""
+        assert agent._tool_result_total_chars_used == 32
         assert agent.tool_result_budget_withheld_count == 2
+        assert env.writes == []
+
+    def test_text_preparation_carries_successful_persistence_receipt(self):
+        from agent.tool_executor import _prepare_text_tool_result_for_context
+        from tools.budget_config import BudgetConfig
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-receipt-handoff"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(24)
+        env = RecordingEnv()
+        raw = "full output already persisted by the per-result layer"
+
+        emitted = _prepare_text_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="terminal",
+            tool_use_id="receipt-handoff",
+            env=env,
+            persistence_config=BudgetConfig(
+                default_result_size=1,
+                preview_size=8,
+            ),
+        )
+
+        assert len(emitted) == 24
+        assert agent._tool_result_total_chars_used == 24
+        assert agent.tool_result_budget_withheld_count == 1
+        assert [write[1] for write in env.writes] == [raw]
+
+    def test_subdirectory_hint_is_applied_before_emitted_cap(self):
+        from agent.tool_executor import _prepare_text_tool_result_for_context
+        from tools.budget_config import DEFAULT_BUDGET
+
+        class RecordingEnv:
+            def get_temp_dir(self):
+                return "/tmp/test-cron-hints"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(12)
+        emitted = _prepare_text_tool_result_for_context(
+            agent,
+            "abcdefghij",
+            tool_name="terminal",
+            tool_use_id="hint-order",
+            env=RecordingEnv(),
+            persistence_config=DEFAULT_BUDGET,
+            subdir_hints="HINT",
+        )
+
+        assert len(emitted) == 12
+        assert emitted.endswith("…")
+        assert agent._tool_result_total_chars_used == 12
+
+    def test_multimodal_model_bound_output_obeys_exact_run_cap(self):
+        from agent.tool_executor import (
+            _prepare_multimodal_tool_result_for_context,
+        )
+        from tools.budget_config import DEFAULT_BUDGET
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-cron-multimodal"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(120)
+        agent._tool_result_total_chars_used = 70
+        agent._tool_result_content_for_active_model = lambda _name, value: value[
+            "content"
+        ]
+        env = RecordingEnv()
+        raw = {
+            "_multimodal": True,
+            "text_summary": "useful visual summary " * 20,
+            "content": [
+                {"type": "text", "text": "useful visual summary " * 20},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64," + "A" * 500},
+                },
+            ],
+        }
+
+        emitted = _prepare_multimodal_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="computer_use",
+            tool_use_id="visual-crossing",
+            env=env,
+            persistence_config=DEFAULT_BUDGET,
+            subdir_hints="\nHINT",
+        )
+
+        assert isinstance(emitted, str)
+        assert len(emitted) == 50
+        assert emitted.endswith("…")
+        assert agent._tool_result_total_chars_used == 120
+        assert agent.tool_result_budget_withheld_count == 1
+        assert len(env.writes) == 1
+        assert '"_multimodal":true' in env.writes[0][1]
+        assert "HINT" in env.writes[0][1]
+
+        later = _prepare_multimodal_tool_result_for_context(
+            agent,
+            raw,
+            tool_name="computer_use",
+            tool_use_id="visual-later",
+            env=env,
+            persistence_config=DEFAULT_BUDGET,
+        )
+        assert later == ""
+        assert agent.tool_result_budget_withheld_count == 2
+        assert len(env.writes) == 2
 
     def test_no_budget_is_a_no_op(self):
         from agent.tool_executor import _apply_run_tool_output_budget
@@ -408,6 +747,9 @@ class TestHardCeilingAutoPause:
         mark_job_run(job["id"], False, CEILING_ERROR_TEXT)
         mark_job_run(job["id"], False, CEILING_ERROR_TEXT)
         mark_job_run(job["id"], True)
+        cleared = get_job(job["id"])
+        assert cleared.get("hard_context_ceiling_streak") is None
+        assert cleared.get("hard_context_ceiling_fingerprint") is None
 
         for _ in range(2):
             assert mark_job_run(job["id"], False, CEILING_ERROR_TEXT) is None
@@ -422,6 +764,20 @@ class TestHardCeilingAutoPause:
         for _ in range(2):
             assert mark_job_run(job["id"], False, CEILING_ERROR_TEXT) is None
         assert get_job(job["id"])["state"] == "scheduled"
+
+    def test_changed_hard_ceiling_fingerprint_restarts_the_streak(self, tmp_cron_dir):
+        job = self._job()
+        other = "hard_context_ceiling_blocked:input_too_large"
+        mark_job_run(job["id"], False, CEILING_ERROR_TEXT)
+        mark_job_run(job["id"], False, CEILING_ERROR_TEXT)
+
+        assert mark_job_run(job["id"], False, other) is None
+        changed = get_job(job["id"])
+        assert changed["hard_context_ceiling_streak"] == 1
+        assert changed["hard_context_ceiling_fingerprint"] == other
+
+        assert mark_job_run(job["id"], False, other) is None
+        assert mark_job_run(job["id"], False, other) is not None
 
     def test_terminal_completion_wins_over_the_auto_pause_alert(self, tmp_cron_dir):
         """A job that also exhausts its repeat limit is finished, not paused —
@@ -445,6 +801,7 @@ class TestHardCeilingAutoPause:
         resumed = resume_job(job["id"])
         assert resumed["state"] == "scheduled"
         assert resumed.get("hard_context_ceiling_streak") is None
+        assert resumed.get("hard_context_ceiling_fingerprint") is None
 
         # A cleared streak needs three FRESH failures, not one.
         assert mark_job_run(job["id"], False, CEILING_ERROR_TEXT) is None
@@ -452,6 +809,14 @@ class TestHardCeilingAutoPause:
         assert get_job(job["id"])["state"] == "scheduled"
         assert mark_job_run(job["id"], False, CEILING_ERROR_TEXT) is not None
         assert get_job(job["id"])["state"] == "paused"
+
+    def test_manual_trigger_clears_count_and_fingerprint(self, tmp_cron_dir):
+        job = self._job()
+        mark_job_run(job["id"], False, CEILING_ERROR_TEXT)
+        triggered = trigger_job(job["id"])
+
+        assert triggered.get("hard_context_ceiling_streak") is None
+        assert triggered.get("hard_context_ceiling_fingerprint") is None
 
     def test_run_one_job_alerts_the_operator_through_the_normal_delivery_path(
         self, tmp_cron_dir
@@ -479,3 +844,26 @@ class TestHardCeilingAutoPause:
         assert len(pause_alerts) == 1
         assert "consecutive hard-context-ceiling failures" in str(pause_alerts[0].args[1])
         assert get_job(job["id"])["state"] == "paused"
+
+
+def test_oversized_runtime_context_blocks_before_agent_or_provider(
+    tmp_cron_dir, tmp_path
+):
+    from cron.scheduler import run_job
+
+    job = create_job(prompt="small stored prompt", schedule="every 4h")
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()), \
+         patch("cron.scheduler._build_job_prompt", return_value="r" * 96_000), \
+         patch("run_agent.AIAgent") as agent_cls, \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider") as provider:
+        success, output, final_response, error = run_job(job)
+
+    assert success is False
+    assert final_response == ""
+    assert "[blocked_config]" in error
+    assert "assembled runtime context" in error
+    assert "24,000-token usable context budget" in error
+    assert "BLOCKED (configuration)" in output
+    agent_cls.assert_not_called()
+    provider.assert_not_called()

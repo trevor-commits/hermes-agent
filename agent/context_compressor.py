@@ -7422,17 +7422,39 @@ def truncate_oversized_tool_results(
     preserved (no message dropped or reordered, so role alternation and
     tool_call pairing stay intact). Skips marked compaction summaries,
     non-string contents, and rows already carrying the trim marker. When
-    ``mirror`` is given, rows there whose content byte-matches a truncated
-    row are truncated identically — ``api_messages`` and the live transcript
-    list can hold separate dict copies of the same tool result.
+    ``mirror`` is given, only the corresponding tool result is shortened there,
+    matched by tool-call id plus occurrence, durable row id, or tool-row
+    ordinal. Content equality alone is never identity: two distinct calls may
+    legitimately return the same bytes.
 
     Returns the number of characters removed across ``messages`` (mirror
     reclaim is not double-counted).
     """
     if reclaim_chars <= 0:
         return 0
+    def _identified_tool_rows(rows):
+        call_occurrences: Dict[str, int] = {}
+        tool_ordinal = 0
+        identified = []
+        for candidate in rows or []:
+            if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+                continue
+            keys = []
+            call_id = candidate.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                occurrence = call_occurrences.get(call_id, 0)
+                call_occurrences[call_id] = occurrence + 1
+                keys.append(("tool_call", call_id, occurrence))
+            row_id = candidate.get("_row_id")
+            if isinstance(row_id, int) and row_id > 0:
+                keys.append(("row_id", row_id))
+            keys.append(("tool_ordinal", tool_ordinal))
+            identified.append((candidate, tuple(keys)))
+            tool_ordinal += 1
+        return identified
+
     candidates = []
-    for row in messages:
+    for row, identity_keys in _identified_tool_rows(messages):
         if not isinstance(row, dict) or row.get("role") != "tool":
             continue
         if row.get(COMPRESSED_SUMMARY_METADATA_KEY):
@@ -7444,23 +7466,40 @@ def truncate_oversized_tool_results(
             continue
         if len(content) <= keep_head_chars + len(LAST_MILE_TRIM_MARKER):
             continue
-        candidates.append(row)
-    candidates.sort(key=lambda r: len(r.get("content") or ""), reverse=True)
+        candidates.append((row, identity_keys))
+    candidates.sort(
+        key=lambda item: len(item[0].get("content") or ""), reverse=True
+    )
+
+    mirror_by_identity: Dict[tuple, List[Dict[str, Any]]] = {}
+    if mirror:
+        for twin, identity_keys in _identified_tool_rows(mirror):
+            for identity_key in identity_keys:
+                mirror_by_identity.setdefault(identity_key, []).append(twin)
+
     reclaimed = 0
-    for row in candidates:
+    marker_suffix = "\n" + LAST_MILE_TRIM_MARKER
+    for row, identity_keys in candidates:
         if reclaimed >= reclaim_chars:
             break
         original = row["content"]
-        truncated = original[:keep_head_chars] + "\n" + LAST_MILE_TRIM_MARKER
+        remaining = reclaim_chars - reclaimed
+        removable = len(original) - keep_head_chars - len(marker_suffix)
+        remove_now = min(remaining, max(0, removable))
+        if remove_now <= 0:
+            continue
+        retained_head = len(original) - remove_now - len(marker_suffix)
+        truncated = original[:retained_head] + marker_suffix
         row["content"] = truncated
-        reclaimed += len(original) - len(truncated)
-        if mirror:
-            for twin in mirror:
-                if (
-                    isinstance(twin, dict)
-                    and twin is not row
-                    and twin.get("role") == "tool"
-                    and twin.get("content") == original
-                ):
-                    twin["content"] = truncated
+        reclaimed += remove_now
+        if mirror_by_identity:
+            for identity_key in identity_keys:
+                twins = [
+                    twin
+                    for twin in mirror_by_identity.get(identity_key, [])
+                    if twin is not row and twin.get("content") == original
+                ]
+                if len(twins) == 1:
+                    twins[0]["content"] = truncated
+                    break
     return reclaimed

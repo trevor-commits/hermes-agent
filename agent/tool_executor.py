@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from agent.display import (
     KawaiiSpinner,
@@ -45,6 +45,7 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
+    ToolResultPersistence,
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
@@ -100,30 +101,51 @@ def _budget_for_agent(agent) -> BudgetConfig:
     )
 
 
-TOOL_OUTPUT_BUDGET_NOTICE_TEMPLATE = (
-    "[tool result withheld: run tool-output budget {budget:,} chars exhausted]"
-)
 # Fallback for agents built before the per-agent lock existed (and for the
 # SimpleNamespace doubles used in tests). Shared, so it is slightly more
 # contended than the per-agent lock and never wrong.
 _TOOL_OUTPUT_BUDGET_FALLBACK_LOCK = threading.Lock()
 
 
-def _apply_run_tool_output_budget(agent, content: str) -> str:
+def _apply_run_tool_output_budget(
+    agent,
+    content: Any,
+    *,
+    full_content: Optional[str] = None,
+    full_content_already_persisted: bool = False,
+    truncation_text: Optional[str] = None,
+    tool_name: str = "",
+    tool_use_id: str = "",
+    env=None,
+    persistence_config: BudgetConfig = DEFAULT_BUDGET,
+    return_receipt: bool = False,
+) -> Any:
     """Bound the SUM of tool-result chars across one whole run.
 
     ``tool_result_max_chars`` caps each result on its own, which a long run
     defeats by simply making more calls — twenty legal 40K results still blow
     past a 30K-token ceiling. When a run-scoped budget is set, results are
-    admitted until the cumulative total reaches it; every result after that is
-    replaced with a short notice rather than failing the run, so the model can
-    still finish and report.
+    admitted until the cumulative total reaches it. The crossing result is
+    shortened to the exact remaining capacity with one marker; later results
+    emit no content. Any affected complete result is persisted before its
+    emitted copy is shortened or withheld. Persistence credit comes only from
+    the explicit receipt produced by the storage layer, never from tool text.
 
     No-op when no budget is configured, so the default path is byte-identical.
     """
+    full_output_persisted = full_content_already_persisted
+
+    def _result(emitted: Any) -> Any:
+        if not return_receipt:
+            return emitted
+        return ToolResultPersistence(
+            content=emitted,
+            full_output_persisted=full_output_persisted,
+        )
+
     budget = getattr(agent, "tool_result_total_max_chars", None)
     if type(budget) is not int or budget <= 0:
-        return content
+        return _result(content)
 
     lock = getattr(agent, "_tool_result_budget_lock", None)
     if lock is None:
@@ -131,7 +153,43 @@ def _apply_run_tool_output_budget(agent, content: str) -> str:
     with lock:
         used = getattr(agent, "_tool_result_total_chars_used", 0)
         used = used if type(used) is int else 0
+        serialized_content = (
+            content
+            if isinstance(content, str)
+            else json.dumps(
+                content,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            )
+        )
+        emitted_size = len(serialized_content)
+
+        def _persist_complete() -> None:
+            nonlocal full_output_persisted
+            if (
+                full_content is None
+                or env is None
+                or full_output_persisted
+            ):
+                return
+            persistence = maybe_persist_tool_result(
+                content=full_content,
+                tool_name=tool_name or "__run_tool_output_budget__",
+                tool_use_id=tool_use_id or "run_tool_output_budget",
+                env=env,
+                config=persistence_config,
+                threshold=0,
+                return_receipt=True,
+            )
+            full_output_persisted = (
+                isinstance(persistence, ToolResultPersistence)
+                and persistence.full_output_persisted
+            )
+
         if used >= budget:
+            _persist_complete()
             withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
             agent.tool_result_budget_withheld_count = (
                 withheld if type(withheld) is int else 0
@@ -140,11 +198,154 @@ def _apply_run_tool_output_budget(agent, content: str) -> str:
                 "Run tool-output budget exhausted (%d chars) — withholding result",
                 budget,
             )
-            return TOOL_OUTPUT_BUDGET_NOTICE_TEMPLATE.format(budget=budget)
-        # The result that crosses the line is kept whole; only later ones are
-        # withheld. Truncating it here would waste the call that produced it.
-        agent._tool_result_total_chars_used = used + len(content)
-    return content
+            agent._tool_result_total_chars_used = budget
+            return _result("")
+
+        remaining = budget - used
+        if emitted_size <= remaining:
+            agent._tool_result_total_chars_used = used + emitted_size
+            return _result(content)
+
+        _persist_complete()
+        withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
+        agent.tool_result_budget_withheld_count = (
+            withheld if type(withheld) is int else 0
+        ) + 1
+        marker = "\n[tool result truncated: run tool-output budget exhausted]"
+        source = (
+            truncation_text
+            if isinstance(truncation_text, str) and truncation_text
+            else serialized_content
+        )
+        if remaining > len(marker):
+            prefix_chars = remaining - len(marker)
+            if len(source) < prefix_chars:
+                source = source + "\n" + serialized_content
+            emitted = source[:prefix_chars] + marker
+        elif remaining > 0:
+            # A one-character ellipsis is still one unambiguous truncation
+            # marker and lets even a one-character remainder stay exact.
+            if len(source) < remaining - 1:
+                source = source + serialized_content
+            emitted = source[: remaining - 1] + "…"
+        else:
+            emitted = ""
+        agent._tool_result_total_chars_used = budget
+        logger.info(
+            "Run tool-output budget reached (%d chars) — truncated crossing result",
+            budget,
+        )
+        return _result(emitted)
+
+
+def _prepare_text_tool_result_for_context(
+    agent,
+    raw_content: str,
+    *,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    persistence_config: BudgetConfig,
+    subdir_hints: str = "",
+    return_receipt: bool = False,
+) -> str | ToolResultPersistence:
+    """Persist, append path hints, then enforce the run-emission budget."""
+    persistence = maybe_persist_tool_result(
+        content=raw_content,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        env=env,
+        config=persistence_config,
+        return_receipt=True,
+    )
+    if isinstance(persistence, ToolResultPersistence):
+        emitted = persistence.content
+        full_output_already_persisted = persistence.full_output_persisted
+    else:
+        # Compatibility for test doubles or extensions that replace the
+        # legacy string-returning function without implementing receipts.
+        emitted = persistence
+        full_output_already_persisted = False
+    if subdir_hints:
+        emitted += subdir_hints
+    budget_persistence = _apply_run_tool_output_budget(
+        agent,
+        emitted,
+        full_content=raw_content,
+        full_content_already_persisted=full_output_already_persisted,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        env=env,
+        persistence_config=persistence_config,
+        return_receipt=True,
+    )
+    if isinstance(budget_persistence, ToolResultPersistence):
+        receipt = budget_persistence
+    else:
+        receipt = ToolResultPersistence(
+            content=budget_persistence,
+            full_output_persisted=full_output_already_persisted,
+        )
+    return receipt if return_receipt else receipt.content
+
+
+def _receipt_for_final_model_content(
+    receipt: ToolResultPersistence,
+    model_content: str,
+) -> ToolResultPersistence:
+    """Carry durability provenance onto the exact final tool-message text.
+
+    High-risk tools are framed by ``make_tool_result_message`` after result
+    persistence.  The aggregate budget must compare its receipt with that
+    framed content, while retaining the proof that the underlying full output
+    was already stored.
+    """
+    return ToolResultPersistence(
+        content=model_content,
+        full_output_persisted=receipt.full_output_persisted,
+    )
+
+
+def _prepare_multimodal_tool_result_for_context(
+    agent,
+    raw_result: Dict[str, Any],
+    *,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    persistence_config: BudgetConfig,
+    subdir_hints: str = "",
+) -> Any:
+    """Convert multimodal output, then enforce the exact emitted budget.
+
+    The model-bound representation is authoritative for capacity accounting:
+    vision models may receive a multipart list while text-only providers get a
+    summary string. If that representation crosses the run cap, persist the
+    complete multimodal envelope and emit an exactly bounded text fallback.
+    """
+    if subdir_hints:
+        _append_subdir_hint_to_multimodal(raw_result, subdir_hints)
+    model_bound = agent._tool_result_content_for_active_model(
+        tool_name,
+        raw_result,
+    )
+    full_content = json.dumps(
+        raw_result,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return _apply_run_tool_output_budget(
+        agent,
+        model_bound,
+        full_content=full_content,
+        truncation_text=_multimodal_text_summary(raw_result),
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        env=env,
+        persistence_config=persistence_config,
+    )
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
@@ -812,7 +1013,16 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    persistence_receipts: dict[int, ToolResultPersistence] | None = None,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -828,6 +1038,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+    if persistence_receipts is None:
+        persistence_receipts = {}
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -1524,24 +1736,40 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
+        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if not _is_multimodal_tool_result(function_result):
-            function_result = maybe_persist_tool_result(
-                content=function_result,
+            persistence = _prepare_text_tool_result_for_context(
+                agent,
+                function_result,
                 tool_name=name,
                 tool_use_id=tc.id,
                 env=get_active_env(effective_task_id),
-                config=_tool_budget,
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+                return_receipt=True,
             )
-            function_result = _apply_run_tool_output_budget(agent, function_result)
-
-        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
-                # Append the hint to the text summary part so the model
-                # still sees it; don't touch the image blocks.
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+            if isinstance(persistence, ToolResultPersistence):
+                function_result = persistence.content
             else:
-                function_result += subdir_hints
+                persistence = ToolResultPersistence(
+                    content=persistence,
+                    full_output_persisted=False,
+                )
+                function_result = persistence.content
+            _tool_content = agent._tool_result_content_for_active_model(
+                name,
+                function_result,
+            )
+        else:
+            _tool_content = _prepare_multimodal_tool_result_for_context(
+                agent,
+                function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
@@ -1551,13 +1779,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Text-only servers get a string-safe fallback here so a rejected
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
-        _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         tool_message = make_tool_result_message(
             name,
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
         )
+        if not _is_multimodal_tool_result(display_function_result):
+            persistence_receipts[id(tool_message)] = _receipt_for_final_model_content(
+                persistence,
+                tool_message["content"],
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -1628,7 +1860,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            turn_tool_msgs,
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            persistence_receipts=persistence_receipts,
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -1659,7 +1896,16 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    persistence_receipts: dict[int, ToolResultPersistence] | None = None,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1668,6 +1914,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    if persistence_receipts is None:
+        persistence_receipts = {}
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2328,28 +2576,52 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
+        subdir_hints = agent._subdirectory_hints.check_tool_call(
+            function_name,
+            function_args,
+        )
         if not _is_multimodal_tool_result(function_result):
-            function_result = maybe_persist_tool_result(
-                content=function_result,
+            persistence = _prepare_text_tool_result_for_context(
+                agent,
+                function_result,
                 tool_name=function_name,
                 tool_use_id=tool_call.id,
                 env=get_active_env(effective_task_id),
-                config=_tool_budget,
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+                return_receipt=True,
             )
-            function_result = _apply_run_tool_output_budget(agent, function_result)
-
-        # Discover subdirectory context files from tool arguments
-        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+            if isinstance(persistence, ToolResultPersistence):
+                function_result = persistence.content
             else:
-                function_result += subdir_hints
+                persistence = ToolResultPersistence(
+                    content=persistence,
+                    full_output_persisted=False,
+                )
+                function_result = persistence.content
+            _tool_content = agent._tool_result_content_for_active_model(
+                function_name,
+                function_result,
+            )
+        else:
+            _tool_content = _prepare_multimodal_tool_result_for_context(
+                agent,
+                function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                persistence_config=_tool_budget,
+                subdir_hints=subdir_hints,
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
-        _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        if not _is_multimodal_tool_result(display_function_result):
+            persistence_receipts[id(tool_message)] = _receipt_for_final_model_content(
+                persistence,
+                tool_message["content"],
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2437,7 +2709,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # be discarded when aggregate budget enforcement replaces a tool result.
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            messages[-num_tools_seq:],
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            persistence_receipts=persistence_receipts,
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -2473,6 +2750,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     """
     from types import SimpleNamespace
 
+    persistence_receipts: dict[int, ToolResultPersistence] = {}
+
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
@@ -2486,11 +2765,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                persistence_receipts=persistence_receipts,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                persistence_receipts=persistence_receipts,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
@@ -2504,6 +2785,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             messages[-total_tools:],
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            persistence_receipts=persistence_receipts,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

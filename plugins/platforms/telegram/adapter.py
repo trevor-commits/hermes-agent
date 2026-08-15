@@ -10237,9 +10237,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         reply_to_text = None
 
-        # Per-channel/topic ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt
+        # Legacy DM/group topic bindings remain the highest-precedence exact
+        # mapping.  Otherwise use the cross-platform binding contract. Telegram
+        # topic ids are chat-scoped, so the exact identifier is
+        # ``<chat_id>:<thread_id>`` and the parent is the whole chat.
+        from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills
         _chat_id_str = str(chat.id)
+        if topic_skill is None:
+            _binding_id = (
+                f"{_chat_id_str}:{thread_id_str}"
+                if thread_id_str
+                else _chat_id_str
+            )
+            topic_skill = resolve_channel_skills(
+                self.config.extra,
+                _binding_id,
+                _chat_id_str if thread_id_str else None,
+            )
         _channel_prompt = resolve_channel_prompt(
             self.config.extra,
             thread_id_str or _chat_id_str,

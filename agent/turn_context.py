@@ -25,6 +25,8 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import threading
 import time
 import uuid
@@ -51,6 +53,152 @@ logger = logging.getLogger(__name__)
 
 
 CURRENT_TURN_IDENTITY_KEY = "_current_turn_identity"
+
+
+@dataclass(frozen=True)
+class CurrentTurnDurabilityReceipt:
+    """Immutable proof binding one logical turn to one committed DB row."""
+
+    session_id: str
+    row_id: int
+    role: str
+    content_digest: str
+    turn_identity: str
+
+
+def stable_message_content_digest(content: Any) -> str:
+    """Return a type-preserving stable digest for persisted message content."""
+    payload = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def mark_committed_messages_persisted(
+    written_messages: List[Dict[str, Any]],
+    stored_messages: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Stamp intrinsic dedup state after the batch transaction commits.
+
+    This marker answers only whether the live dictionary's row was written; it
+    is not a hard-ceiling durability proof. Receipt construction below stays
+    independently fail-closed when turn identity or exact row annotations are
+    missing. SessionDB normally annotates each stored row with ``_row_id``;
+    legacy/fake stores may omit it, but a successful append must still prevent
+    the same live dictionary from being appended again.
+    """
+    stored = written_messages if stored_messages is None else stored_messages
+    for index, written in enumerate(written_messages):
+        if not isinstance(written, dict):
+            continue
+        persisted = stored[index] if index < len(stored) else None
+        if isinstance(persisted, dict):
+            row_id = persisted.get("_row_id")
+            if isinstance(row_id, int) and row_id > 0:
+                written["_row_id"] = row_id
+        written["_db_persisted"] = True
+
+
+def bind_current_turn_durability_receipt(
+    agent: Any,
+    written_messages: List[Dict[str, Any]],
+    stored_messages: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Bind the active logical turn to its exact committed message row.
+
+    Callers invoke this only after the surrounding database transaction has
+    committed. ``written_messages`` are the live conversation dictionaries;
+    ``stored_messages`` are the row-shaped dictionaries passed to SessionDB
+    when persistence rewrote content for storage. SessionDB annotates every
+    inserted dictionary with ``_row_id`` inside the transaction.
+
+    The receipt is deliberately fail-closed. A batch containing the active
+    user turn must contain exactly one matching committed row, every paired
+    row must have a valid database id, and the live/stored roles must agree.
+    Later assistant/tool-only batches preserve that already-bound row. An
+    explicit identity mismatch, a user batch without the active identity, or
+    ambiguous matching rows clear the prior receipt instead of authorizing
+    rollover from stale evidence.
+    """
+    previous_receipt = getattr(agent, "_current_turn_durability_receipt", None)
+
+    def _clear_receipt() -> bool:
+        agent._current_turn_durability_receipt = None
+        return False
+
+    stored = written_messages if stored_messages is None else stored_messages
+    if len(written_messages) != len(stored):
+        return _clear_receipt()
+
+    turn_identity = getattr(agent, "_persist_user_turn_identity", None)
+    session_id = getattr(agent, "session_id", None)
+    if (
+        not isinstance(turn_identity, str)
+        or not turn_identity
+        or session_id is None
+    ):
+        return _clear_receipt()
+
+    candidates: List[tuple[Dict[str, Any], Dict[str, Any], int]] = []
+    contains_user_row = False
+    for written, persisted in zip(written_messages, stored):
+        if not isinstance(written, dict) or not isinstance(persisted, dict):
+            return _clear_receipt()
+        row_id = persisted.get("_row_id")
+        if not isinstance(row_id, int) or row_id <= 0:
+            return _clear_receipt()
+        if written.get("role") != persisted.get("role"):
+            return _clear_receipt()
+        role = persisted.get("role")
+        written_identity = written.get(CURRENT_TURN_IDENTITY_KEY)
+        persisted_identity = persisted.get(CURRENT_TURN_IDENTITY_KEY)
+        if role == "user":
+            contains_user_row = True
+
+        supplied_identities = [
+            identity
+            for identity in (written_identity, persisted_identity)
+            if identity is not None
+        ]
+        if any(identity != turn_identity for identity in supplied_identities):
+            return _clear_receipt()
+        if supplied_identities and role != "user":
+            return _clear_receipt()
+        if role == "user" and written_identity == turn_identity:
+            candidates.append((written, persisted, row_id))
+
+    if len(candidates) > 1:
+        return _clear_receipt()
+
+    if not candidates:
+        if contains_user_row:
+            return _clear_receipt()
+        if (
+            isinstance(previous_receipt, CurrentTurnDurabilityReceipt)
+            and previous_receipt.session_id == str(session_id)
+            and previous_receipt.role == "user"
+            and previous_receipt.turn_identity == turn_identity
+            and isinstance(previous_receipt.row_id, int)
+            and previous_receipt.row_id > 0
+            and isinstance(previous_receipt.content_digest, str)
+            and len(previous_receipt.content_digest) == 64
+        ):
+            return True
+        return _clear_receipt()
+
+    _written, persisted, row_id = candidates[0]
+    agent._current_turn_durability_receipt = CurrentTurnDurabilityReceipt(
+        session_id=str(session_id),
+        row_id=row_id,
+        role="user",
+        content_digest=stable_message_content_digest(persisted.get("content")),
+        turn_identity=turn_identity,
+    )
+    return True
 
 
 def carry_current_turn_identity(
@@ -620,6 +768,7 @@ def build_turn_context(
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
+    agent._current_turn_durability_receipt = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
     # Generate unique task_id if not provided to isolate VMs between tasks.

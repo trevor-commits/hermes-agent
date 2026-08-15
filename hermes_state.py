@@ -2292,12 +2292,12 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 
 
 class CompressionSessionClosedError(RuntimeError):
-    """A durable write targeted a parent already closed by compression."""
+    """A durable write targeted a parent with a published continuation."""
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         super().__init__(
-            f"Session {session_id!r} is closed by compression; "
+            f"Session {session_id!r} is closed by a continuation; "
             "adopt its live continuation before appending messages"
         )
 
@@ -4060,6 +4060,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        _transaction_conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4229,10 +4230,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
+        if _transaction_conn is not None:
+            _do(_transaction_conn)
+            return
+
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _insert_session_row_tx(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        source: str,
+        **kwargs: Any,
+    ) -> None:
+        """Insert a session using the caller's already-open transaction.
+
+        This is the transaction-aware twin of :meth:`_insert_session_row`.
+        Keeping both paths on the same SQL implementation prevents lifecycle
+        transactions such as proactive rollover from drifting away from the
+        normal session-creation contract.
+        """
+        self._insert_session_row(
+            session_id,
+            source,
+            _transaction_conn=conn,
+            **kwargs,
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -4415,6 +4441,187 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    def _insert_gateway_rollover_carryover_tx(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        message: Dict[str, Any],
+    ) -> None:
+        """Persist the proactive-rollover carryover inside ``conn``."""
+        inserted, tool_calls = self._insert_message_rows(
+            conn,
+            session_id,
+            [dict(message)],
+        )
+        conn.execute(
+            """UPDATE sessions
+               SET message_count = message_count + ?,
+                   tool_call_count = tool_call_count + ?
+               WHERE id = ?""",
+            (inserted, tool_calls, session_id),
+        )
+
+    @staticmethod
+    def _end_gateway_rollover_parent_tx(
+        conn: sqlite3.Connection,
+        session_id: str,
+    ) -> bool:
+        """End exactly one still-live rollover parent inside ``conn``."""
+        cursor = conn.execute(
+            """UPDATE sessions
+               SET ended_at = ?, end_reason = 'proactive_rollover'
+               WHERE id = ? AND ended_at IS NULL AND end_reason IS NULL""",
+            (time.time(), session_id),
+        )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _update_gateway_rollover_route_tx(
+        conn: sqlite3.Connection,
+        *,
+        scope: str,
+        session_key: str,
+        expected_entry_json: str,
+        new_entry_json: str,
+    ) -> bool:
+        """CAS one durable gateway route inside ``conn``."""
+        cursor = conn.execute(
+            """UPDATE gateway_routing
+               SET entry_json = ?, updated_at = ?
+               WHERE scope = ? AND session_key = ? AND entry_json = ?""",
+            (
+                new_entry_json,
+                time.time(),
+                scope,
+                session_key,
+                expected_entry_json,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def atomic_gateway_rollover(
+        self,
+        *,
+        scope: str,
+        session_key: str,
+        expected_session_id: str,
+        new_entry_json: str,
+        source: str,
+        session_kwargs: Dict[str, Any],
+        carryover_message: Dict[str, Any],
+        new_entries_json: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Atomically create and publish one proactive gateway rollover.
+
+        Every durable routing alias is compare-and-swapped against the exact
+        old session. Child creation, lineage, hidden carryover, parent ending,
+        and all route publications commit together. A concurrent route or
+        lifecycle change is a safe no-op; every other exception rolls the
+        transaction back and propagates to the caller.
+        """
+        if not session_key or not expected_session_id or not new_entry_json:
+            return False
+
+        new_kwargs = dict(session_kwargs)
+        new_session_id = str(new_kwargs.pop("session_id", "") or "")
+        if not new_session_id:
+            raise ValueError("gateway rollover requires a new session_id")
+        new_kwargs["parent_session_id"] = expected_session_id
+
+        requested_entries = dict(
+            new_entries_json or {session_key: new_entry_json}
+        )
+        if session_key not in requested_entries:
+            raise ValueError("gateway rollover entries omit the triggering route")
+        for route_key, route_entry_json in requested_entries.items():
+            try:
+                decoded_new_entry = json.loads(route_entry_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "gateway rollover requires valid entry JSON"
+                ) from exc
+            if (
+                not isinstance(decoded_new_entry, dict)
+                or decoded_new_entry.get("session_key") != route_key
+                or decoded_new_entry.get("session_id") != new_session_id
+            ):
+                raise ValueError("gateway rollover entry identity mismatch")
+
+        class _RouteChanged(RuntimeError):
+            pass
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            route_rows = conn.execute(
+                """SELECT session_key, entry_json FROM gateway_routing
+                   WHERE scope = ?""",
+                (scope,),
+            ).fetchall()
+            expected_entry_jsons: Dict[str, str] = {}
+            for route_row in route_rows:
+                expected_entry_json = str(route_row["entry_json"])
+                try:
+                    current_entry = json.loads(expected_entry_json)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(current_entry, dict)
+                    and current_entry.get("session_id") == expected_session_id
+                ):
+                    expected_entry_jsons[str(route_row["session_key"])] = (
+                        expected_entry_json
+                    )
+            # The SessionStore snapshot and durable alias set must match
+            # exactly. A missing, added, or independently moved alias is a
+            # route race: roll back rather than strand a parent route.
+            if set(expected_entry_jsons) != set(requested_entries):
+                return False
+
+            parent = conn.execute(
+                """SELECT id, ended_at, end_reason FROM sessions WHERE id = ?""",
+                (expected_session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is not None
+                or parent["end_reason"] is not None
+            ):
+                return False
+
+            self._insert_session_row_tx(
+                conn,
+                new_session_id,
+                source,
+                **new_kwargs,
+            )
+            self._insert_gateway_rollover_carryover_tx(
+                conn,
+                new_session_id,
+                carryover_message,
+            )
+            if not self._end_gateway_rollover_parent_tx(
+                conn,
+                expected_session_id,
+            ):
+                raise _RouteChanged("gateway rollover parent changed")
+            for route_key, route_entry_json in requested_entries.items():
+                if not self._update_gateway_rollover_route_tx(
+                    conn,
+                    scope=scope,
+                    session_key=route_key,
+                    expected_entry_json=expected_entry_jsons[route_key],
+                    new_entry_json=route_entry_json,
+                ):
+                    raise _RouteChanged("gateway rollover route changed")
+            return True
+
+        try:
+            return self._execute_write(
+                _do,
+                patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            )
+        except _RouteChanged:
+            return False
 
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = ""
@@ -4921,11 +5128,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
+        """Return the unique live direct continuation of an ended session.
 
         A stale agent may observe that another compression path already rotated
         its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
+        exactly one live direct continuation. Proactive rollover additionally
+        requires its explicit child markers. Multiple children are treated as
         ambiguous and fail closed rather than guessing which transcript owns
         subsequent messages.
         """
@@ -4939,9 +5147,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 parent is None
                 or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
+                or parent["end_reason"]
+                not in {"compression", "proactive_rollover"}
             ):
                 return None
+            end_reason = str(parent["end_reason"])
             rows = self._conn.execute(
                 """
                 SELECT s.*,
@@ -4951,13 +5161,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
                   AND s.ended_at IS NULL
+                  AND (
+                    ? = 'compression'
+                    OR (
+                      ? = 'proactive_rollover'
+                      AND json_extract(
+                        COALESCE(s.model_config, '{}'),
+                        '$._proactive_rollover'
+                      ) = 1
+                      AND json_extract(
+                        COALESCE(s.model_config, '{}'),
+                        '$._reset_from'
+                      ) = ?
+                    )
+                  )
                 """
                 + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
                 + """
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id, parent_session_id, parent_session_id),
+                (
+                    parent_session_id,
+                    end_reason,
+                    end_reason,
+                    parent_session_id,
+                    parent_session_id,
+                    parent_session_id,
+                ),
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
@@ -7470,7 +7701,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
-        ``end_reason = 'compression'``.  Older builds tried to distinguish
+        ``end_reason = 'compression'``. A proactive gateway rollover is also
+        followed, but only when the child carries both the explicit
+        ``_proactive_rollover`` marker and an exact ``_reset_from`` pointer to
+        that parent. This lets a stale Telegram topic binding heal forward
+        without treating an arbitrary child as the live continuation.
+
+        Older builds tried to distinguish
         continuations from branches/subagents by requiring
         ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
         gateway + compression races can insert the real continuation row before
@@ -7499,7 +7736,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
+                      AND (
+                        parent.end_reason = 'compression'
+                        OR (
+                          parent.end_reason = 'proactive_rollover'
+                          AND json_extract(
+                            COALESCE(child.model_config, '{{}}'),
+                            '$._proactive_rollover'
+                          ) = 1
+                          AND json_extract(
+                            COALESCE(child.model_config, '{{}}'),
+                            '$._reset_from'
+                          ) = parent.id
+                        )
+                      )
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
@@ -8058,7 +8308,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if (
             session is not None
             and session["ended_at"] is not None
-            and session["end_reason"] == "compression"
+            and session["end_reason"] in {"compression", "proactive_rollover"}
         ):
             raise CompressionSessionClosedError(session_id)
 
@@ -8705,7 +8955,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 session is not None
                 and session["ended_at"] is not None
-                and session["end_reason"] == "compression"
+                and session["end_reason"]
+                in {"compression", "proactive_rollover"}
             ):
                 raise CompressionSessionClosedError(session_id)
             if archive_dropped:
@@ -9584,29 +9835,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         target is a no-op on row state but still bumps the counter.
         """
 
-        # 1) Validate target up-front (read-only, outside the write txn).
-        with self._lock:
-            row = self._conn.execute(
+        def _do(conn):
+            # Admission, target validation, soft-delete, counter update, and
+            # new-head selection are one transaction. A rollover that wins
+            # before this transaction makes the ended-parent guard fail
+            # closed; a rollover cannot commit between validation and rewind.
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"]
+                in {"compression", "proactive_rollover"}
+            ):
+                raise CompressionSessionClosedError(session_id)
+
+            row = conn.execute(
                 "SELECT * FROM messages WHERE id = ? AND session_id = ?",
                 (target_message_id, session_id),
             ).fetchone()
-        if row is None:
-            raise ValueError(
-                f"message {target_message_id} not found in session {session_id}"
-            )
-        target_row = dict(row)
-        if target_row.get("role") != "user":
-            raise ValueError(
-                f"rewind target must be a 'user' message (got role="
-                f"{target_row.get('role')!r}, id={target_message_id})"
-            )
+            if row is None:
+                raise ValueError(
+                    f"message {target_message_id} not found in session "
+                    f"{session_id}"
+                )
+            target_row = dict(row)
+            if target_row.get("role") != "user":
+                raise ValueError(
+                    f"rewind target must be a 'user' message (got role="
+                    f"{target_row.get('role')!r}, id={target_message_id})"
+                )
 
-        # Decode content for callers (prefill the prompt buffer).
-        target_row["content"] = self._decode_content(target_row.get("content"))
-
-        rewound: List[int] = []
-
-        def _do(conn):
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
@@ -9624,17 +9885,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ?",
                 (session_id,),
             )
-            return ids
-
-        rewound = self._execute_write(_do)
-
-        # 2) Compute new head id (largest still-active row id in session).
-        with self._lock:
-            head_row = self._conn.execute(
+            head_row = conn.execute(
                 "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
                 (session_id,),
             ).fetchone()
-        new_head_id = head_row[0] if head_row and head_row[0] is not None else None
+            new_head_id = (
+                head_row[0]
+                if head_row and head_row[0] is not None
+                else None
+            )
+            return target_row, ids, new_head_id
+
+        target_row, rewound, new_head_id = self._execute_write(_do)
+        # Decode content for callers (prefill the prompt buffer) only after
+        # the exact transactional row has been returned.
+        target_row["content"] = self._decode_content(target_row.get("content"))
 
         return {
             "rewound_count": len(rewound),

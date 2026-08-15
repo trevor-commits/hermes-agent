@@ -28,6 +28,8 @@ import os
 import re
 import shlex
 import uuid
+from dataclasses import dataclass
+from typing import Literal, overload
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -43,6 +45,40 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_PERSISTED_PREVIEW_HEADER = re.compile(r"\n\nPreview \(first \d+ chars\):\n")
+_AGGREGATE_PREVIEW_TRUNCATION_MARKER = (
+    "\n[Preview truncated: aggregate tool-output budget exhausted.]"
+)
+_UNTRUSTED_FRAME_OPEN = re.compile(
+    r'^<untrusted_tool_result source="([^"\n]+)">\n'
+)
+_UNTRUSTED_FRAME_CLOSE = "\n</untrusted_tool_result>"
+
+
+@dataclass(frozen=True)
+class ToolResultPersistence:
+    """Model-facing content plus trusted full-output persistence provenance."""
+
+    content: str
+    full_output_persisted: bool
+
+
+def _split_untrusted_tool_frame(
+    tool_name: str,
+    content: str,
+) -> tuple[str, str, str] | None:
+    """Return a structurally exact tool-matched frame and its inner data."""
+    opening = _UNTRUSTED_FRAME_OPEN.match(content)
+    if opening is None or opening.group(1) != tool_name:
+        return None
+    if not content.endswith(_UNTRUSTED_FRAME_CLOSE):
+        return None
+    data_start = content.find("\n\n", opening.end())
+    if data_start < 0:
+        return None
+    data_start += 2
+    data_end = len(content) - len(_UNTRUSTED_FRAME_CLOSE)
+    return content[:data_start], content[data_start:data_end], content[data_end:]
 
 
 def _resolve_storage_dir(env) -> str:
@@ -141,6 +177,77 @@ def _build_persisted_message(
     return msg
 
 
+def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
+    """Shorten a durable receipt's model copy without touching stored output.
+
+    The normal receipt format keeps its storage path and closing tag while the
+    inline preview absorbs the requested reduction.  Extremely small budgets
+    fall back to a compact receipt, then to an exact-length marked prefix.
+    """
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= 0:
+        return ""
+
+    persisted_closing = f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
+    header = _PERSISTED_PREVIEW_HEADER.search(content)
+    closing_at = content.rfind(persisted_closing)
+    if header is not None and closing_at >= header.end():
+        prefix = content[:header.end()]
+        preview = content[header.end():closing_at]
+        suffix = content[closing_at:]
+        fixed = prefix + _AGGREGATE_PREVIEW_TRUNCATION_MARKER + suffix
+        if len(fixed) <= max_chars:
+            keep_chars = max_chars - len(fixed)
+            return (
+                prefix
+                + preview[:keep_chars]
+                + _AGGREGATE_PREVIEW_TRUNCATION_MARKER
+                + suffix
+            )
+
+    persisted_start = content.find(PERSISTED_OUTPUT_TAG)
+    persisted_end_at = content.rfind(PERSISTED_OUTPUT_CLOSING_TAG)
+    if persisted_start >= 0 and persisted_end_at >= persisted_start:
+        persisted_end = persisted_end_at + len(PERSISTED_OUTPUT_CLOSING_TAG)
+        outer_prefix = content[:persisted_start]
+        outer_suffix = content[persisted_end:]
+    else:
+        outer_prefix = ""
+        outer_suffix = ""
+    path_match = re.search(r"^Full output saved to: .+$", content, re.MULTILINE)
+    path_line = path_match.group(0) if path_match is not None else ""
+    compact_lines = [PERSISTED_OUTPUT_TAG]
+    if path_line:
+        compact_lines.append(path_line)
+    compact_lines.extend(
+        [
+            _AGGREGATE_PREVIEW_TRUNCATION_MARKER.lstrip("\n"),
+            PERSISTED_OUTPUT_CLOSING_TAG,
+        ]
+    )
+    compact = outer_prefix + "\n".join(compact_lines) + outer_suffix
+    if len(compact) <= max_chars:
+        return compact
+
+    framed_minimum = (
+        outer_prefix
+        + _AGGREGATE_PREVIEW_TRUNCATION_MARKER.lstrip("\n")
+        + outer_suffix
+    )
+    if (outer_prefix or outer_suffix) and len(framed_minimum) <= max_chars:
+        return framed_minimum
+    if outer_prefix or outer_suffix:
+        # A partial trust boundary is unsafe. Withhold the preview when the
+        # complete frame cannot fit rather than emitting an unterminated block.
+        return ""
+
+    if max_chars == 1:
+        return "…"
+    return content[:max_chars - 1] + "…"
+
+
+@overload
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -148,7 +255,34 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
-) -> str:
+    *,
+    return_receipt: Literal[False] = False,
+) -> str: ...
+
+
+@overload
+def maybe_persist_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    threshold: int | float | None = None,
+    *,
+    return_receipt: Literal[True],
+) -> ToolResultPersistence: ...
+
+
+def maybe_persist_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    threshold: int | float | None = None,
+    *,
+    return_receipt: bool = False,
+) -> str | ToolResultPersistence:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
     Writes via env.execute() so the file is accessible from any backend
@@ -162,17 +296,31 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        return_receipt: Return trusted persistence provenance with the content.
 
     Returns:
-        Original content if small, or <persisted-output> replacement.
+        Original content if small, or <persisted-output> replacement. When
+        ``return_receipt`` is true, wrap that content with explicit provenance
+        indicating whether the complete output was successfully written.
     """
+    def _result(
+        model_content: str,
+        *,
+        full_output_persisted: bool,
+    ) -> str | ToolResultPersistence:
+        receipt = ToolResultPersistence(
+            content=model_content,
+            full_output_persisted=full_output_persisted,
+        )
+        return receipt if return_receipt else receipt.content
+
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):
-        return content
+        return _result(content, full_output_persisted=False)
 
     if len(content) <= effective_threshold:
-        return content
+        return _result(content, full_output_persisted=False)
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
@@ -185,7 +333,15 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return _result(
+                    _build_persisted_message(
+                        preview,
+                        has_more,
+                        len(content),
+                        remote_path,
+                    ),
+                    full_output_persisted=True,
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
@@ -193,10 +349,13 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
-    return (
-        f"{preview}\n\n"
-        f"[Truncated: tool response was {len(content):,} chars. "
-        f"Full output could not be saved to sandbox.]"
+    return _result(
+        (
+            f"{preview}\n\n"
+            f"[Truncated: tool response was {len(content):,} chars. "
+            f"Full output could not be saved to sandbox.]"
+        ),
+        full_output_persisted=False,
     )
 
 
@@ -204,12 +363,15 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    persistence_receipts: dict[int, ToolResultPersistence] | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
     If total chars exceed budget, persist the largest non-persisted results
-    first (via sandbox write) until under budget. Already-persisted results
-    are skipped.
+    first (via sandbox write) until under budget. A trusted receipt prevents a
+    duplicate write, but its model-facing preview remains eligible for a final
+    trim if durable receipt previews alone exceed the cap. Tool-controlled
+    marker text is never proof that a complete result reached durable storage.
 
     Mutates the list in-place and returns it.
     """
@@ -219,7 +381,15 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        receipt = (
+            persistence_receipts.get(id(msg))
+            if persistence_receipts is not None
+            else None
+        )
+        if not (
+            isinstance(receipt, ToolResultPersistence)
+            and receipt.full_output_persisted
+        ):
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:
@@ -233,15 +403,45 @@ def enforce_turn_budget(
         msg = tool_messages[idx]
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
+        tool_name = str(msg.get("tool_name") or msg.get("name") or "")
+        untrusted_frame = (
+            _split_untrusted_tool_frame(tool_name, content)
+            if isinstance(content, str)
+            else None
+        )
+        content_to_persist = (
+            untrusted_frame[1] if untrusted_frame is not None else content
+        )
 
-        replacement = maybe_persist_tool_result(
-            content=content,
+        persistence = maybe_persist_tool_result(
+            content=content_to_persist,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
+            return_receipt=True,
         )
+        if isinstance(persistence, ToolResultPersistence):
+            replacement = persistence.content
+            if untrusted_frame is not None:
+                replacement = (
+                    untrusted_frame[0] + replacement + untrusted_frame[2]
+                )
+                persistence = ToolResultPersistence(
+                    content=replacement,
+                    full_output_persisted=persistence.full_output_persisted,
+                )
+            if persistence_receipts is not None:
+                persistence_receipts[id(msg)] = persistence
+        else:
+            # Compatibility for extensions that replace the storage helper
+            # without implementing the typed receipt contract.
+            replacement = persistence
+            if untrusted_frame is not None:
+                replacement = (
+                    untrusted_frame[0] + replacement + untrusted_frame[2]
+                )
         if replacement != content:
             total_size -= size
             total_size += len(replacement)
@@ -249,6 +449,44 @@ def enforce_turn_budget(
             logger.info(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,
+            )
+
+    if total_size > config.turn_budget and persistence_receipts is not None:
+        durable_previews = []
+        for idx, msg in enumerate(tool_messages):
+            content = msg.get("content", "")
+            receipt = persistence_receipts.get(id(msg))
+            if (
+                isinstance(receipt, ToolResultPersistence)
+                and receipt.full_output_persisted
+                and receipt.content == content
+            ):
+                durable_previews.append((idx, len(content)))
+
+        durable_previews.sort(key=lambda item: item[1], reverse=True)
+        for idx, size in durable_previews:
+            if total_size <= config.turn_budget:
+                break
+            msg = tool_messages[idx]
+            content = msg.get("content", "")
+            deficit = total_size - config.turn_budget
+            replacement = _trim_persisted_model_preview(
+                content,
+                max(0, size - deficit),
+            )
+            if replacement == content:
+                continue
+            msg["content"] = replacement
+            persistence_receipts[id(msg)] = ToolResultPersistence(
+                content=replacement,
+                full_output_persisted=True,
+            )
+            total_size -= size - len(replacement)
+            logger.info(
+                "Budget enforcement: trimmed persisted preview %s (%d -> %d chars)",
+                msg.get("tool_call_id", f"budget_{idx}"),
+                size,
+                len(replacement),
             )
 
     return tool_messages

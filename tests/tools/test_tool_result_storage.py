@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
+from agent.tool_dispatch_helpers import make_tool_result_message
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -13,11 +14,13 @@ from tools.tool_result_storage import (
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
+    ToolResultPersistence,
     _build_persisted_message,
     _heredoc_marker,
     _resolve_storage_dir,
     _safe_result_filename,
     _write_to_sandbox,
+    _trim_persisted_model_preview,
     enforce_turn_budget,
     generate_preview,
     maybe_persist_tool_result,
@@ -169,6 +172,42 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def test_receipt_marks_literal_tag_as_unpersisted_below_threshold(self):
+        content = "tool said <persisted-output> but no write occurred"
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_literal",
+            env=None,
+            threshold=50_000,
+            return_receipt=True,
+        )
+
+        assert result == ToolResultPersistence(
+            content=content,
+            full_output_persisted=False,
+        )
+
+    def test_receipt_records_successful_full_output_persistence(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 100
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_receipt",
+            env=env,
+            threshold=1,
+            return_receipt=True,
+        )
+
+        assert isinstance(result, ToolResultPersistence)
+        assert result.full_output_persisted is True
+        assert PERSISTED_OUTPUT_TAG in result.content
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(
@@ -282,6 +321,105 @@ class TestEnforceTurnBudget:
             1 for m in msgs if PERSISTED_OUTPUT_TAG in m["content"]
         )
         assert persisted_count >= 2  # Need to shed at least ~52K
+
+
+    def test_all_persisted_receipts_trim_preview_without_rewriting_output(self):
+        """Durable receipts still count toward the model-facing turn cap."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        persistence_receipts = {}
+        full_outputs = ["A" * 2_000, "B" * 2_000]
+        messages = []
+
+        for index, full_output in enumerate(full_outputs):
+            receipt = maybe_persist_tool_result(
+                content=full_output,
+                tool_name="terminal",
+                tool_use_id=f"persisted-{index}",
+                env=env,
+                config=BudgetConfig(preview_size=320),
+                threshold=1,
+                return_receipt=True,
+            )
+            assert isinstance(receipt, ToolResultPersistence)
+            assert receipt.full_output_persisted is True
+            message = {
+                "role": "tool",
+                "tool_call_id": f"persisted-{index}",
+                "content": receipt.content,
+            }
+            messages.append(message)
+            persistence_receipts[id(message)] = receipt
+
+        original_total = sum(len(message["content"]) for message in messages)
+        turn_budget = original_total - 80
+        writes_before_budgeting = env.execute.call_count
+
+        with patch(
+            "tools.tool_result_storage.maybe_persist_tool_result",
+            wraps=maybe_persist_tool_result,
+        ) as persist_again:
+            enforce_turn_budget(
+                messages,
+                env=env,
+                config=BudgetConfig(turn_budget=turn_budget, preview_size=320),
+                persistence_receipts=persistence_receipts,
+            )
+
+        assert sum(len(message["content"]) for message in messages) == turn_budget
+        assert sum(
+            message["content"].count("aggregate tool-output budget")
+            for message in messages
+        ) == 1
+        assert all(
+            message["content"].endswith(PERSISTED_OUTPUT_CLOSING_TAG)
+            for message in messages
+        )
+        assert all(
+            persistence_receipts[id(message)].content == message["content"]
+            for message in messages
+        )
+        persist_again.assert_not_called()
+        assert env.execute.call_count == writes_before_budgeting
+        assert [call.kwargs["stdin_data"] for call in env.execute.call_args_list] == full_outputs
+
+
+    def test_compact_persisted_preview_preserves_untrusted_frame(self):
+        path = "/tmp/hermes-results/framed.txt"
+        persisted = _build_persisted_message(
+            preview="x" * 500,
+            has_more=True,
+            original_size=2_000,
+            file_path=path,
+        )
+        framed = make_tool_result_message(
+            "web_search",
+            persisted,
+            "framed",
+        )["content"]
+        persisted_start = framed.index(PERSISTED_OUTPUT_TAG)
+        persisted_end = (
+            framed.rindex(PERSISTED_OUTPUT_CLOSING_TAG)
+            + len(PERSISTED_OUTPUT_CLOSING_TAG)
+        )
+        outer_prefix = framed[:persisted_start]
+        outer_suffix = framed[persisted_end:]
+        compact = (
+            outer_prefix
+            + PERSISTED_OUTPUT_TAG
+            + "\n"
+            + f"Full output saved to: {path}\n"
+            + "[Preview truncated: aggregate tool-output budget exhausted.]\n"
+            + PERSISTED_OUTPUT_CLOSING_TAG
+            + outer_suffix
+        )
+
+        trimmed = _trim_persisted_model_preview(framed, len(compact))
+
+        assert trimmed == compact
+        assert trimmed.startswith('<untrusted_tool_result source="web_search">\n')
+        assert trimmed.endswith("</untrusted_tool_result>")
+        assert "Preview (first" not in trimmed
 
 
     def test_empty_messages(self):

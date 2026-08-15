@@ -1961,7 +1961,11 @@ class AIAgent:
         name why rollover authority was withheld. Pure observability — the
         fail-closed boolean behavior is unchanged.
         """
-        from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+        from agent.turn_context import (
+            CURRENT_TURN_IDENTITY_KEY,
+            CurrentTurnDurabilityReceipt,
+            stable_message_content_digest,
+        )
 
         idx = getattr(self, "_persist_user_message_idx", None)
         turn_identity = getattr(self, "_persist_user_turn_identity", None)
@@ -1987,7 +1991,47 @@ class AIAgent:
             ):
                 reason = "later_unmarked_user_row"
             else:
-                durable = True
+                receipt = getattr(
+                    self, "_current_turn_durability_receipt", None
+                )
+                if not isinstance(receipt, CurrentTurnDurabilityReceipt):
+                    reason = "receipt_missing"
+                elif receipt.session_id != str(self.session_id):
+                    reason = "receipt_session_mismatch"
+                elif receipt.role != "user":
+                    reason = "receipt_role_mismatch"
+                elif receipt.turn_identity != turn_identity:
+                    reason = "receipt_identity_mismatch"
+                elif message.get("_row_id") != receipt.row_id:
+                    reason = "receipt_row_mismatch"
+                elif (
+                    not isinstance(receipt.content_digest, str)
+                    or len(receipt.content_digest) != 64
+                ):
+                    reason = "receipt_digest_invalid"
+                else:
+                    try:
+                        rows = self._session_db.get_messages(
+                            receipt.session_id,
+                            after_id=receipt.row_id - 1,
+                            limit=1,
+                        )
+                        row = rows[0] if len(rows) == 1 else None
+                        if (
+                            not isinstance(row, dict)
+                            or row.get("id") != receipt.row_id
+                            or row.get("session_id") != receipt.session_id
+                            or row.get("role") != receipt.role
+                            or stable_message_content_digest(
+                                row.get("content")
+                            )
+                            != receipt.content_digest
+                        ):
+                            reason = "receipt_db_mismatch"
+                        else:
+                            durable = True
+                    except Exception:
+                        reason = "receipt_db_unavailable"
         self._current_turn_durability_fail_reason = reason
         return durable
 
@@ -2343,8 +2387,20 @@ class AIAgent:
                         self, "_active_compression_lock_holder", None
                     ),
                 )
-                for _written in _batch_msgs:
-                    _written[_DB_PERSISTED_MARKER] = True
+                from agent.turn_context import (
+                    bind_current_turn_durability_receipt,
+                    mark_committed_messages_persisted,
+                )
+
+                mark_committed_messages_persisted(
+                    _batch_msgs,
+                    _batch_rows,
+                )
+                bind_current_turn_durability_receipt(
+                    self,
+                    _batch_msgs,
+                    _batch_rows,
+                )
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

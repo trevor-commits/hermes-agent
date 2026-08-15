@@ -436,9 +436,9 @@ def _resolve_cron_tool_result_total_max_chars(job: dict) -> int | None:
 def _tool_output_budget_notice(agent) -> Optional[str]:
     """Summarize run-scoped tool-output truncation for the operator, or None.
 
-    The model sees a per-result withheld-notice, but that never reaches the
-    stored output or ``last_error`` — so without this an operator reading a
-    thin cron report has no way to tell a quiet run from a truncated one.
+    The model sees the crossing-result marker, while later results are omitted.
+    Neither signal necessarily reaches stored output or ``last_error`` — so an
+    operator reading a thin report needs this explicit summary.
     """
     try:
         withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
@@ -450,6 +450,7 @@ def _tool_output_budget_notice(agent) -> Optional[str]:
         return None
     return (
         f"[tool-output budget exhausted: {withheld} tool result(s) withheld "
+        "or truncated "
         f"after this run reached its cumulative {budget:,}-char tool-output "
         "budget]"
     )
@@ -3370,6 +3371,51 @@ DRIFT_SKIP_MARKER = "[drift_skip]"
 DRIFT_SKIP_SILENT_MARKER = "[drift_skip:silent]"
 
 
+def _blocked_config_result(
+    job: dict,
+    reason: str,
+    *,
+    allow_preflight_disable: bool = False,
+) -> tuple[bool, str, str, str]:
+    """Return the shared alert-once blocked-config terminal result."""
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    already_alerted = False
+    try:
+        from cron.jobs import mark_preflight_alerted
+
+        already_alerted = mark_preflight_alerted(job_id)
+    except Exception:
+        logger.debug(
+            "Job '%s': could not persist preflight alert marker",
+            job_id,
+            exc_info=True,
+        )
+    marker = (
+        BLOCKED_CONFIG_SILENT_MARKER
+        if already_alerted
+        else BLOCKED_CONFIG_MARKER
+    )
+    disable_hint = (
+        " Set `cron.preflight: false` in config.yaml to disable this "
+        "validation."
+        if allow_preflight_disable
+        else ""
+    )
+    blocked_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"**Status:** BLOCKED (configuration)\n\n"
+        "Pre-dispatch validation found a configuration problem and the "
+        "agent was NOT run (no tokens spent).\n\n"
+        f"**Reason:** {reason}\n\n"
+        "The job will stay blocked (without re-alerting) until the "
+        f"configuration is fixed; the next healthy run clears this state.{disable_hint}"
+    )
+    return False, blocked_doc, "", f"{marker} {reason}"
+
+
 def _cron_preflight_enabled(cfg: dict) -> bool:
     """Whether cron pre-dispatch configuration validation is enabled.
 
@@ -3913,6 +3959,35 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+
+    # Revalidate the actual prompt assembled for this fire. Unlike the
+    # definition gate, this includes loaded skill/bundle text, pre-run script
+    # output, context_from documents, durable notepad content, monitor/run
+    # context, and the cron execution hint. Refuse before provider resolution
+    # or AIAgent construction when no safe first turn can fit.
+    from cron.context_budget import evaluate_context_parts
+    from cron.jobs import resolve_hard_context_ceiling_tokens
+
+    _runtime_context_budget = evaluate_context_parts(
+        [prompt],
+        hard_ceiling_tokens=resolve_hard_context_ceiling_tokens(),
+    )
+    if _runtime_context_budget.exceeded:
+        _runtime_context_reason = (
+            "assembled runtime context is "
+            f"~{_runtime_context_budget.estimated_tokens:,} estimated tokens, "
+            "at or above the "
+            f"{_runtime_context_budget.usable_tokens:,}-token usable context "
+            f"budget (80% of the {_runtime_context_budget.hard_ceiling_tokens:,}-token "
+            "hard ceiling); provider construction was skipped"
+        )
+        logger.warning(
+            "Job '%s' (ID: %s): BLOCKED by runtime context budget — %s",
+            job_name,
+            job_id,
+            _runtime_context_reason,
+        )
+        return _blocked_config_result(job, _runtime_context_reason)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -4273,33 +4348,11 @@ def run_job(
                 "validation — %s (no LLM call was made)",
                 job_name, job_id, _pf_reason,
             )
-            already_alerted = False
-            try:
-                from cron.jobs import mark_preflight_alerted
-                already_alerted = mark_preflight_alerted(job_id)
-            except Exception:
-                logger.debug(
-                    "Job '%s': could not persist preflight alert marker",
-                    job_id, exc_info=True,
-                )
-            marker = (
-                BLOCKED_CONFIG_SILENT_MARKER if already_alerted
-                else BLOCKED_CONFIG_MARKER
+            return _blocked_config_result(
+                job,
+                _pf_reason,
+                allow_preflight_disable=True,
             )
-            blocked_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"**Status:** BLOCKED (configuration)\n\n"
-                "Pre-dispatch validation found a configuration problem and "
-                "the agent was NOT run (no tokens spent).\n\n"
-                f"**Reason:** {_pf_reason}\n\n"
-                "The job will stay blocked (without re-alerting) until the "
-                "configuration is fixed; the next healthy run clears this "
-                "state. Set `cron.preflight: false` in config.yaml to "
-                "disable this validation."
-            )
-            return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
         primary_model_for_drift = model
         configured_provider_for_drift = (

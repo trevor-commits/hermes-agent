@@ -1,13 +1,18 @@
 """Regression tests for /retry replacement semantics."""
 
+import asyncio
+from datetime import datetime
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionStore
+from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.turn_lease import SessionTurnLeaseRegistry
+from tests.gateway.test_42039_duplicate_user_message import _bootstrap
 
 
 @pytest.mark.asyncio
@@ -51,9 +56,13 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
 
     gw._handle_message = AsyncMock(side_effect=fake_handle_message)
 
-    result = await gw._handle_retry_command(
-        MessageEvent(text="/retry", message_type=MessageType.TEXT, source=MagicMock())
+    retry_event = MessageEvent(
+        text="/retry",
+        message_type=MessageType.TEXT,
+        source=MagicMock(),
     )
+    assert await gw._prepare_retry_turn(retry_event, session_entry) is None
+    result = await gw._handle_message(retry_event)
 
     assert result == "new answer"
     transcript_after = store.load_transcript(session_id)
@@ -127,9 +136,13 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
 
     gw._handle_message = AsyncMock(side_effect=fake_handle_message)
 
-    result = await gw._handle_retry_command(
-        MessageEvent(text="/retry", message_type=MessageType.TEXT, source=MagicMock())
+    retry_event = MessageEvent(
+        text="/retry",
+        message_type=MessageType.TEXT,
+        source=MagicMock(),
     )
+    assert await gw._prepare_retry_turn(retry_event, session_entry) is None
+    result = await gw._handle_message(retry_event)
 
     assert result == "new answer"
     archived_probe.assert_not_called()
@@ -149,3 +162,113 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
         "first question",
         "retry me",
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_retry_waits_for_alias_rollover_then_rewrites_only_child(
+    monkeypatch,
+    tmp_path,
+):
+    """The retry truncation belongs inside the resolved session turn lease."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    registry = SessionTurnLeaseRegistry()
+    runner._turn_leases = registry
+    quick_key = "agent:main:telegram:group:-1001:12345:retry-alias"
+    parent_id = "retry-rollover-parent"
+    child_id = "retry-rollover-child"
+    now = datetime.now()
+    parent = SessionEntry(
+        session_key=quick_key,
+        session_id=parent_id,
+        created_at=now,
+        updated_at=now,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    child = SessionEntry(
+        session_key=quick_key,
+        session_id=child_id,
+        created_at=now,
+        updated_at=now,
+        platform=parent.platform,
+        chat_type="group",
+        is_fresh_reset=True,
+        auto_skill_pending=True,
+    )
+    runner.session_store.get_or_create_session.return_value = parent
+    runner.session_store.resolve_session_after_turn_lease_wait.return_value = child
+    retry_history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "retry me"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    runner.session_store.load_transcript.side_effect = [
+        retry_history,
+        retry_history[:2],
+    ]
+
+    def rewrite_only_after_child_rebind(session_id, messages, active_only=False):
+        assert session_id == child_id
+        assert messages == retry_history[:2]
+        assert active_only is True
+        lease = registry._leases[child_id]
+        assert lease.holder is not None
+        assert lease.holder.owner_key == quick_key
+        return True
+
+    runner.session_store.rewrite_transcript.side_effect = rewrite_only_after_child_rebind
+
+    async def run_retried_turn(*_args, **_kwargs):
+        assert retry_event.text == "retry me"
+        return {
+            "failed": True,
+            "final_response": None,
+            "error": "stop after retry preparation",
+            "messages": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=run_retried_turn)
+    holder = await registry.acquire(
+        parent_id,
+        owner_key="rollover-alias",
+        generation=9,
+        timeout=1,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="12345",
+    )
+    retry_event = MessageEvent(
+        text="/retry",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    retry_event._gateway_retry_requested = True
+
+    retry_task = asyncio.create_task(
+        runner._handle_message_with_agent(
+            retry_event,
+            source,
+            quick_key,
+            1,
+        )
+    )
+    for _ in range(100):
+        if registry.has_waiters(parent_id) or retry_task.done():
+            break
+        await asyncio.sleep(0)
+    assert registry.has_waiters(parent_id) is True
+    assert registry.release(holder) is True
+
+    await retry_task
+    runner.session_store.resolve_session_after_turn_lease_wait.assert_called_once_with(
+        quick_key,
+        parent_id,
+    )
+    runner.session_store.rewrite_transcript.assert_called_once()
+    assert runner._release_turn_lease(quick_key, 1) is True
