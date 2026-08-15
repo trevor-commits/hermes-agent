@@ -113,6 +113,96 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_direct_source_card_completion_bypasses_parent_model_turn(isolated_registry):
+    origin = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="678",
+        user_id="42",
+    )
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(success=True)),
+        handle_message=AsyncMock(),
+    )
+    runner = _runner(
+        adapter,
+        origins={
+            "agent:main:telegram:dm:12345:678": SimpleNamespace(origin=origin),
+        },
+    )
+    runner._thread_metadata_for_source = lambda source: {
+        "message_thread_id": source.thread_id,
+    }
+    event = _async_event("deleg_direct_source")
+    event.update(
+        delivery_mode="direct",
+        work_kind="source-card-intake",
+        work_key="source-card:session:msg",
+        summary="Card landed and receipted.",
+    )
+
+    async def exercise():
+        first = await runner._deliver_completion_notification("unused", dict(event))
+        second = await runner._deliver_completion_notification("unused", dict(event))
+        return first, second
+
+    assert asyncio.run(exercise()) == (True, None)
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    call = adapter.send.await_args
+    assert call.args[0] == "12345"
+    assert "Research complete" in call.args[1]
+    assert "Card landed and receipted" in call.args[1]
+    assert call.kwargs["metadata"]["message_thread_id"] == "678"
+
+
+def test_direct_source_card_ceiling_failure_is_terminal_and_does_not_retry_text():
+    from gateway.run import _format_direct_source_card_completion
+
+    text = _format_direct_source_card_completion(
+        {
+            "work_kind": "source-card-intake",
+            "status": "error",
+            "summary": None,
+            "error": "hard_context_ceiling_blocked:compression_attempts_exhausted",
+        }
+    )
+
+    assert "stopped safely" in text.lower()
+    assert "no automatic retry" in text.lower()
+    assert "compression_attempts_exhausted" in text
+
+
+def test_distinct_direct_source_card_results_never_coalesce():
+    first = _async_event("deleg-source-1")
+    first.update(
+        delivery_mode="direct",
+        work_kind="source-card-intake",
+        work_key="source-card:message-1",
+    )
+    second = dict(first)
+    second.update(
+        delegation_id="deleg-source-2",
+        work_key="source-card:message-2",
+    )
+
+    assert GatewayRunner._async_delegation_group_key(
+        first
+    ) != GatewayRunner._async_delegation_group_key(second)
+
+    # Ordinary fan-out children still coalesce exactly as before.
+    first.pop("work_key")
+    second.pop("work_key")
+    first.pop("delivery_mode")
+    second.pop("delivery_mode")
+    first.pop("work_kind")
+    second.pop("work_kind")
+    assert GatewayRunner._async_delegation_group_key(
+        first
+    ) == GatewayRunner._async_delegation_group_key(second)
+
+
 def test_unroutable_async_event_is_not_requeued_forever(
     monkeypatch, isolated_registry,
 ):

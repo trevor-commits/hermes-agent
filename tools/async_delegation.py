@@ -178,9 +178,17 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("work_key", "TEXT"),
+        ("work_kind", "TEXT"),
+        ("delivery_mode", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_async_delegations_work_key
+           ON async_delegations(work_key)
+           WHERE work_key IS NOT NULL AND work_key != ''"""
+    )
 
 
 @contextmanager
@@ -233,7 +241,12 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _persist_dispatch(record: Dict[str, Any]) -> Optional[str]:
+    """Persist a dispatch, returning the existing id for a duplicate work key."""
+    # Expire delivered history before resolving the unique work key.  Pruning
+    # after a collision could return the old delegation id and then delete
+    # that exact row, leaving the caller with a dangling duplicate receipt.
+    _prune_durable_records()
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -247,30 +260,62 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id", "user_id", "user_name", "work_key", "work_kind",
+            "delivery_mode",
         )
         if key in record
     }
+    existing_id: Optional[str] = None
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+        statement = (
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+                owner_started_at, task_json, origin_session_id,
+                work_key, work_kind, delivery_mode)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)"""
         )
-    _prune_durable_records()
+        values = (
+            record["delegation_id"], record.get("session_key", ""),
+            record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
+            record["dispatched_at"], now, __import__("os").getpid(),
+            owner_started_at, json.dumps(task_payload),
+            record.get("origin_session_id", ""), record.get("work_key") or None,
+            record.get("work_kind") or None, record.get("delivery_mode") or None,
+        )
+        try:
+            conn.execute(statement, values)
+        except sqlite3.IntegrityError:
+            work_key = str(record.get("work_key") or "")
+            if not work_key:
+                raise
+            row = conn.execute(
+                "SELECT delegation_id FROM async_delegations WHERE work_key=?",
+                (work_key,),
+            ).fetchone()
+            if row is None:
+                raise
+            existing_id = str(row[0])
+    return existing_id
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+
+
+def find_delegation_by_work_key(work_key: str) -> str:
+    """Return the durable delegation owning an idempotent work key."""
+    normalized = str(work_key or "").strip()
+    if not normalized:
+        return ""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT delegation_id FROM async_delegations WHERE work_key=?",
+            (normalized,),
+        ).fetchone()
+    return str(row[0]) if row else ""
 
 
 def _prune_durable_records() -> None:
@@ -375,7 +420,10 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in (
+                "scope_id", "user_id", "user_name", "work_key", "work_kind",
+                "delivery_mode",
+            ):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -765,6 +813,9 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    work_key: str = "",
+    work_kind: str = "",
+    delivery_mode: str = "",
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -821,6 +872,9 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "work_key": str(work_key or ""),
+        "work_kind": str(work_kind or ""),
+        "delivery_mode": str(delivery_mode or ""),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -832,29 +886,6 @@ def dispatch_async_delegation(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    # Capacity check and record insert under ONE lock hold — checking
-    # active_count() separately would let two concurrent dispatches (e.g.
-    # from different gateway sessions) both pass the check and exceed the cap.
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background subagents."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -876,17 +907,83 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        executor = _get_executor(max_async_children)
+    except Exception as exc:  # pragma: no cover — executor creation is rare
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation: {exc}",
+            "error": f"Failed to initialize async delegation executor: {exc}",
         }
+
+    # Capacity, durable reservation, in-memory publication, and executor
+    # acceptance are one reservation boundary.  A concurrent replay cannot
+    # observe a duplicate until the original has both durable state and a
+    # scheduled worker; if either step fails, the replay is free to claim it.
+    with _records_lock:
+        if work_key:
+            for existing in _records.values():
+                if existing.get("work_key") == work_key:
+                    return {
+                        "status": "duplicate",
+                        "delegation_id": existing["delegation_id"],
+                    }
+        running = sum(
+            1 for r in _records.values()
+            if r.get("status") in ("running", "stalling")
+        )
+        if running >= max_async_children:
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Async delegation capacity reached ({max_async_children} "
+                    f"running). Wait for one to finish (its result will re-enter "
+                    f"the chat), or run this task synchronously "
+                    f"(background=false). Raise delegation.max_concurrent_children in "
+                    f"config.yaml to allow more concurrent background subagents."
+                ),
+            }
+        try:
+            existing_id = _persist_dispatch(record)
+        except Exception:
+            logger.exception(
+                "Could not persist async delegation %s before scheduling",
+                delegation_id,
+            )
+            return {
+                "status": "rejected",
+                "error": (
+                    "Durable delegation state could not be recorded; "
+                    "worker not started."
+                ),
+            }
+        if existing_id is not None:
+            return {"status": "duplicate", "delegation_id": existing_id}
+        _records[delegation_id] = record
+        try:
+            # Propagate the dispatching profile so the detached child resolves
+            # get_hermes_home() under the right profile. A real executor never
+            # runs this callable inline; finalization waits on this lock if the
+            # worker completes before the reservation boundary is released.
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover — pool submit failure is rare
+            _records.pop(delegation_id, None)
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.exception(
+                    "Could not remove unscheduled async delegation %s",
+                    delegation_id,
+                )
+                return {
+                    "status": "rejected",
+                    "error": (
+                        "Worker scheduling failed and durable cleanup was "
+                        "incomplete; no retry was started."
+                    ),
+                }
+            return {
+                "status": "rejected",
+                "error": f"Failed to schedule async delegation: {exc}",
+            }
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -985,6 +1082,9 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    for _k in ("work_key", "work_kind", "delivery_mode"):
+        if record.get(_k):
+            evt[_k] = record[_k]
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
@@ -1028,6 +1128,9 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    work_key: str = "",
+    work_kind: str = "",
+    delivery_mode: str = "",
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1068,6 +1171,9 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "work_key": str(work_key or ""),
+        "work_kind": str(work_kind or ""),
+        "delivery_mode": str(delivery_mode or ""),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1079,25 +1185,6 @@ def dispatch_async_delegation_batch(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background units."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1125,16 +1212,75 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
-        # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        executor = _get_executor(max_async_children)
+    except Exception as exc:  # pragma: no cover — executor creation is rare
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation batch: {exc}",
+            "error": f"Failed to initialize async delegation executor: {exc}",
         }
+
+    with _records_lock:
+        if work_key:
+            for existing in _records.values():
+                if existing.get("work_key") == work_key:
+                    return {
+                        "status": "duplicate",
+                        "delegation_id": existing["delegation_id"],
+                    }
+        running = sum(
+            1 for r in _records.values()
+            if r.get("status") in ("running", "stalling")
+        )
+        if running >= max_async_children:
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Async delegation capacity reached ({max_async_children} "
+                    f"running). Wait for one to finish (its result will re-enter "
+                    f"the chat), or raise delegation.max_concurrent_children in "
+                    f"config.yaml to allow more concurrent background units."
+                ),
+            }
+        try:
+            existing_id = _persist_dispatch(record)
+        except Exception:
+            logger.exception(
+                "Could not persist async delegation batch %s before scheduling",
+                delegation_id,
+            )
+            return {
+                "status": "rejected",
+                "error": (
+                    "Durable delegation state could not be recorded; "
+                    "worker not started."
+                ),
+            }
+        if existing_id is not None:
+            return {"status": "duplicate", "delegation_id": existing_id}
+        _records[delegation_id] = record
+        try:
+            # Propagate the dispatching profile to detached batch children.
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover
+            _records.pop(delegation_id, None)
+            try:
+                _delete_durable_delegation(delegation_id)
+            except Exception:
+                logger.exception(
+                    "Could not remove unscheduled async delegation batch %s",
+                    delegation_id,
+                )
+                return {
+                    "status": "rejected",
+                    "error": (
+                        "Worker scheduling failed and durable cleanup was "
+                        "incomplete; no retry was started."
+                    ),
+                }
+            return {
+                "status": "rejected",
+                "error": f"Failed to schedule async delegation batch: {exc}",
+            }
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -1202,7 +1348,10 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in (
+        "scope_id", "user_id", "user_name", "work_key", "work_kind",
+        "delivery_mode",
+    ):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on
