@@ -809,12 +809,13 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     assert worker_result["status"] == "completed"
     assert worker_result["summary"] == "card complete"
     kwargs = built["agent_kwargs"]
-    assert kwargs["max_iterations"] == 16
+    assert kwargs["max_iterations"] == 24
     assert kwargs["skip_context_files"] is True
     assert kwargs["load_soul_identity"] is False
     assert kwargs["skip_memory"] is True
     assert kwargs["skip_background_review"] is True
-    assert kwargs["tool_result_max_chars"] == 6_000
+    assert kwargs["tool_result_max_chars"] == 4_000
+    assert built["agent"].tool_result_emitted_max_chars == 4_000
     assert built["agent"].tool_result_total_max_chars == 24_000
     assert kwargs["enabled_toolsets"] == ["terminal", "file", "web"]
     worker_system = kwargs["ephemeral_system_prompt"]
@@ -842,6 +843,11 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     assert "Do not read shared context journals" in dispatched["goal"]
     assert "do not probe another tool" in dispatched["goal"]
     assert "24,000 emitted tool-result characters" in dispatched["goal"]
+    assert "4,000 emitted characters" in dispatched["goal"]
+    assert (
+        "Do not read the cards-root README or an exemplar card"
+        in dispatched["goal"]
+    )
     assert "TRUSTED WORKER ENVIRONMENT (JSON)" in dispatched["goal"]
     assert str(fixture["cards_root"].resolve()) in dispatched["goal"]
     assert str(fixture["writer"].resolve()) in dispatched["goal"]

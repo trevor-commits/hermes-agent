@@ -113,8 +113,8 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 _SOURCE_CARD_INTAKE_ROUTE = "source-card-intake"
 _SOURCE_CARD_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-_SOURCE_CARD_WORKER_MAX_ITERATIONS = 16
-_SOURCE_CARD_WORKER_TOOL_RESULT_MAX_CHARS = 6_000
+_SOURCE_CARD_WORKER_MAX_ITERATIONS = 24
+_SOURCE_CARD_WORKER_TOOL_RESULT_MAX_CHARS = 4_000
 _SOURCE_CARD_WORKER_TOOL_RESULT_TOTAL_MAX_CHARS = 24_000
 _SOURCE_CARD_WORKER_TOOLSETS = ("terminal", "file", "web")
 _SOURCE_CARD_WORKER_REFERENCES = (
@@ -18847,7 +18847,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "tokens for synthesis and receipts; stop new retrieval when that reserve "
             "would be threatened. The canonical 16,000-character result target "
             "remains; the runtime hard-stops at 24,000 emitted tool-result characters "
-            "to absorb serialization overhead. Do not read shared context journals, "
+            "to absorb serialization overhead. Keep each tool result at or below "
+            "4,000 emitted characters. Do not read the cards-root README or an "
+            "exemplar card; the attached compact schema is sufficient. Do not read "
+            "shared context journals, "
             "memory, caches, logs, or unrelated instruction files. The three normal "
             "worker references are already attached; do not read them again. Use the "
             "trusted paths below exactly. Never list Hermes home, inspect writer source, "
@@ -18972,6 +18975,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent._source_card_work_key = work_key
             agent.tool_result_total_max_chars = (
                 _SOURCE_CARD_WORKER_TOOL_RESULT_TOTAL_MAX_CHARS
+            )
+            agent.tool_result_emitted_max_chars = (
+                _SOURCE_CARD_WORKER_TOOL_RESULT_MAX_CHARS
             )
             return agent, worker_session_id, turn_route["model"]
 
