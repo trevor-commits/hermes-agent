@@ -13,6 +13,7 @@ from tools.tool_result_storage import (
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
+    ToolResultPersistence,
     _build_persisted_message,
     _heredoc_marker,
     _resolve_storage_dir,
@@ -169,6 +170,42 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def test_receipt_marks_literal_tag_as_unpersisted_below_threshold(self):
+        content = "tool said <persisted-output> but no write occurred"
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_literal",
+            env=None,
+            threshold=50_000,
+            return_receipt=True,
+        )
+
+        assert result == ToolResultPersistence(
+            content=content,
+            full_output_persisted=False,
+        )
+
+    def test_receipt_records_successful_full_output_persistence(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 100
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_receipt",
+            env=env,
+            threshold=1,
+            return_receipt=True,
+        )
+
+        assert isinstance(result, ToolResultPersistence)
+        assert result.full_output_persisted is True
+        assert PERSISTED_OUTPUT_TAG in result.content
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

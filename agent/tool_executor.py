@@ -45,7 +45,7 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
-    PERSISTED_OUTPUT_TAG,
+    ToolResultPersistence,
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
@@ -112,6 +112,7 @@ def _apply_run_tool_output_budget(
     content: Any,
     *,
     full_content: Optional[str] = None,
+    full_content_already_persisted: bool = False,
     truncation_text: Optional[str] = None,
     tool_name: str = "",
     tool_use_id: str = "",
@@ -126,7 +127,8 @@ def _apply_run_tool_output_budget(
     admitted until the cumulative total reaches it. The crossing result is
     shortened to the exact remaining capacity with one marker; later results
     emit no content. Any affected complete result is persisted before its
-    emitted copy is shortened or withheld.
+    emitted copy is shortened or withheld. Persistence credit comes only from
+    the explicit receipt produced by the storage layer, never from tool text.
 
     No-op when no budget is configured, so the default path is byte-identical.
     """
@@ -157,7 +159,7 @@ def _apply_run_tool_output_budget(
             if (
                 full_content is None
                 or env is None
-                or PERSISTED_OUTPUT_TAG in serialized_content
+                or full_content_already_persisted
             ):
                 return
             maybe_persist_tool_result(
@@ -230,19 +232,29 @@ def _prepare_text_tool_result_for_context(
     subdir_hints: str = "",
 ) -> str:
     """Persist, append path hints, then enforce the run-emission budget."""
-    emitted = maybe_persist_tool_result(
+    persistence = maybe_persist_tool_result(
         content=raw_content,
         tool_name=tool_name,
         tool_use_id=tool_use_id,
         env=env,
         config=persistence_config,
+        return_receipt=True,
     )
+    if isinstance(persistence, ToolResultPersistence):
+        emitted = persistence.content
+        full_output_already_persisted = persistence.full_output_persisted
+    else:
+        # Compatibility for test doubles or extensions that replace the
+        # legacy string-returning function without implementing receipts.
+        emitted = persistence
+        full_output_already_persisted = False
     if subdir_hints:
         emitted += subdir_hints
     return _apply_run_tool_output_budget(
         agent,
         emitted,
         full_content=raw_content,
+        full_content_already_persisted=full_output_already_persisted,
         tool_name=tool_name,
         tool_use_id=tool_use_id,
         env=env,
