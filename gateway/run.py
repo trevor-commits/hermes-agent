@@ -18023,11 +18023,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     @staticmethod
-    def _apply_claimed_auto_skill(event, task_id: str, session_key: str) -> None:
-        """Prepend one already-claimed channel/topic skill to an event."""
+    def _apply_claimed_auto_skill(event, task_id: str, session_key: str) -> bool:
+        """Load and prepend a channel/topic skill without partial mutation.
+
+        Returns ``True`` only when every configured payload loaded and the
+        event is ready for its durable claim. A loader failure leaves the
+        original event untouched so the pending bit remains safely retryable.
+        """
         auto_skill = getattr(event, "auto_skill", None)
         if not auto_skill:
-            return
+            return True
         skill_names = (
             [auto_skill] if isinstance(auto_skill, str) else list(auto_skill)
         )
@@ -18050,6 +18055,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         loaded_names.append(skill_name)
                 else:
                     logger.warning("[Gateway] Auto-skill '%s' not found", skill_name)
+                    return False
             if combined_parts:
                 combined_parts.append(event.text)
                 event.text = "\n\n".join(combined_parts)
@@ -18058,12 +18064,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     loaded_names,
                     session_key,
                 )
+            return bool(combined_parts)
         except Exception as exc:
             logger.warning(
                 "[Gateway] Failed to auto-load skill(s) %s: %s",
                 skill_names,
                 exc,
             )
+            return False
 
     async def _proactive_rollover_must_defer(
         self,
@@ -18073,6 +18081,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Fail closed when any current-session work could cross rollover."""
         try:
+            lease_registry = getattr(self, "_turn_leases", None)
+            if (
+                lease_registry is not None
+                and lease_registry.has_waiters(session_id)
+            ):
+                return True
             adapter = self._adapter_for_source(source)
             adapter_pending = (
                 getattr(adapter, "_pending_messages", None) if adapter else None
@@ -18244,6 +18258,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # ── Turn lease (#64934) ────────────────────────────────────────
+        # Session resolution is final for an uncontended turn. A contended
+        # alias must re-resolve after acquisition because the previous holder
+        # may have committed a proactive-rollover continuation while this turn
+        # waited. This runs before session-start flags, context construction,
+        # payload loading, or transcript I/O so none can bind to an ended
+        # parent.
+        _lease_registry = getattr(self, "_turn_leases", None)
+        if _lease_registry is not None:
+            _lease_token = await _lease_registry.acquire(
+                session_entry.session_id,
+                owner_key=_quick_key,
+                generation=run_generation,
+                timeout=_float_env(
+                    "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                ),
+            )
+            if _lease_token is not None:
+                _lease_state = self._session_state(_quick_key).turn
+                _lease_state.lease_token = _lease_token
+                _lease_state.lease_generation = run_generation
+                if getattr(_lease_token, "contended", False):
+                    waited_session_id = session_entry.session_id
+                    refreshed_entry = await (
+                        self.async_session_store
+                        .resolve_session_after_turn_lease_wait(
+                            session_entry.session_key,
+                            waited_session_id,
+                        )
+                    )
+                    if refreshed_entry is None:
+                        raise TurnLeaseTimeoutError(
+                            waited_session_id,
+                            owner_key=_quick_key,
+                            generation=run_generation,
+                            wait_seconds=0,
+                        )
+                    if refreshed_entry.session_id != waited_session_id:
+                        if not self._rebind_turn_lease(
+                            _quick_key,
+                            run_generation,
+                            refreshed_entry.session_id,
+                        ):
+                            raise TurnLeaseTimeoutError(
+                                waited_session_id,
+                                owner_key=_quick_key,
+                                generation=run_generation,
+                                wait_seconds=0,
+                            )
+                        session_entry = refreshed_entry
+                        session_key = session_entry.session_key
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -18411,74 +18478,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
-        # ── Turn lease (#64934) ────────────────────────────────────────
-        # Session resolution is FINAL here (get_or_create → async-delegation
-        # pinning → topic tip-walk switch_session are all above). Serialize
-        # the [load history → run → flush] region per resolved SESSION_ID:
-        # when a second routing key is mapped to this same session_id, its
-        # turn waits here for the previous turn's flush instead of loading a
-        # stale history base and interleaving transcript writes. Same-key
-        # messages never reach this point mid-turn (adapter + runner guards
-        # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-closed on timeout: never enter the transcript region without a
-        # lease. Outer dispatch returns a bounded rejection/resend notice rather
-        # than recreating the exact concurrent-turn corruption this lease exists
-        # to prevent. Released in _handle_message's finally via
-        # _release_turn_lease — granted per (routing key, run generation) so a
-        # stale unwind can't release a newer turn's lease.
-        _lease_registry = getattr(self, "_turn_leases", None)
-        if _lease_registry is not None:
-            try:
-                _lease_token = await _lease_registry.acquire(
-                    session_entry.session_id,
-                    owner_key=_quick_key,
-                    generation=run_generation,
-                    timeout=_float_env(
-                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
-                    ),
-                )
-            except TurnLeaseTimeoutError:
-                # The broad session-context cleanup finally starts later in this
-                # method. Restore the tokens here before propagating the rejection
-                # to outer dispatch, or this early exit leaks task-local identity.
-                self._clear_session_env(_session_env_tokens)
-                raise
-            if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
-
-        # Claim the resolved session's auto-skill only after its turn lease is
-        # held. The durable SessionEntry bit replaces timestamp heuristics and
-        # is cleared across every routing alias before the event is mutated, so
-        # resume, restart, and alias races cannot inject the payload twice.
+        # Journal the active turn before loading or consuming its auto-skill.
+        # The claim is token-bound and remains recoverable until normal turn
+        # cleanup clears this exact marker.
+        _active_turn_marked = await self._mark_durable_active_turn(
+            event,
+            session_entry.session_key,
+        )
         _auto = getattr(event, "auto_skill", None)
-        try:
-            _auto_skill_claimed = await (
-                self.async_session_store.claim_auto_skill_pending(
-                    session_entry.session_key,
-                    session_entry.session_id,
-                )
-            )
-        except Exception as exc:
-            _auto_skill_claimed = False
-            logger.warning(
-                "[Gateway] Auto-skill claim failed for session %s: %s",
-                session_entry.session_id,
-                exc,
-            )
-        if _auto_skill_claimed and _auto:
-            self._apply_claimed_auto_skill(
+        _auto_original_text = event.text
+        _auto_payload_ready = False
+        if _active_turn_marked:
+            _auto_payload_ready = self._apply_claimed_auto_skill(
                 event,
                 _quick_key,
                 session_entry.session_key,
             )
-
-        # A turn only becomes durable recovery work after it owns (or has
-        # explicitly degraded past) the per-session lease.  Marking before the
-        # await above would falsely recover an alias-routed message that never
-        # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        if _active_turn_marked and _auto_payload_ready:
+            try:
+                _auto_skill_claimed = await (
+                    self.async_session_store.claim_auto_skill_pending(
+                        session_entry.session_key,
+                        session_entry.session_id,
+                        active_turn_token=getattr(
+                            event,
+                            "_gateway_active_turn_token",
+                            None,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                _auto_skill_claimed = False
+                logger.warning(
+                    "[Gateway] Auto-skill claim failed for session %s: %s",
+                    session_entry.session_id,
+                    exc,
+                )
+            if not _auto_skill_claimed and _auto:
+                event.text = _auto_original_text
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -20141,6 +20178,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                             else:
                                 session_entry = new_entry
+                                # Keep the holder's lease aliased to the child
+                                # through post-commit cleanup and delivery. A
+                                # new route cannot enter the child while the
+                                # rollover turn is still unwinding.
+                                self._rebind_turn_lease(
+                                    _quick_key,
+                                    run_generation,
+                                    new_entry.session_id,
+                                )
                                 try:
                                     self._evict_cached_agent(session_key)
                                     self._clear_conversation_scope(

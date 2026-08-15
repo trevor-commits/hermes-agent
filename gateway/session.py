@@ -838,6 +838,12 @@ class SessionEntry:
     # the resolved session's turn lease, clearing every routing alias that
     # points at the same session id before any skill payload is injected.
     auto_skill_pending: bool = False
+
+    # Exact active-turn token that consumed ``auto_skill_pending``. It remains
+    # durable until that turn clears its active marker. An unclean restart can
+    # therefore re-arm the payload instead of losing the only injection in the
+    # claim-to-provider crash window. Alias entries carry the same token.
+    auto_skill_claim_token: Optional[str] = None
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -913,6 +919,7 @@ class SessionEntry:
             ),
             "is_fresh_reset": self.is_fresh_reset,
             "auto_skill_pending": self.auto_skill_pending,
+            "auto_skill_claim_token": self.auto_skill_claim_token,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -960,6 +967,12 @@ class SessionEntry:
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+        auto_skill_claim_token = data.get("auto_skill_claim_token")
+        if (
+            not isinstance(auto_skill_claim_token, str)
+            or not auto_skill_claim_token
+        ):
+            auto_skill_claim_token = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -1007,6 +1020,7 @@ class SessionEntry:
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
             auto_skill_pending=data.get("auto_skill_pending", False),
+            auto_skill_claim_token=auto_skill_claim_token,
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
@@ -2884,18 +2898,21 @@ class SessionStore:
         self,
         session_key: str,
         expected_session_id: str,
+        *,
+        active_turn_token: Optional[str],
     ) -> bool:
         """Durably claim one session's channel/topic skill injection.
 
-        The caller already owns the resolved session turn lease. Clear the
-        flag for every routing alias of that session in one routing snapshot,
-        so a second alias, restart, or resumed handler cannot inject the same
-        skill again. A route mismatch or persistence failure fails closed.
+        The caller already owns the resolved session turn lease and has loaded
+        the payload. Bind the claim to its durable active-turn token, then
+        clear every routing alias in one routing snapshot. A crash before the
+        turn clears re-arms the payload in :meth:`recover_interrupted_turns`.
+        A route, token, or persistence mismatch fails closed.
         """
-        if not session_key or not expected_session_id:
+        if not session_key or not expected_session_id or not active_turn_token:
             return False
 
-        claimed_keys: List[str] = []
+        previous: Dict[str, tuple[bool, Optional[str]]] = {}
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
@@ -2903,12 +2920,17 @@ class SessionStore:
                 entry is None
                 or entry.session_id != expected_session_id
                 or not entry.auto_skill_pending
+                or entry.active_turn_token != active_turn_token
             ):
                 return False
             for key, candidate in self._entries.items():
                 if candidate.session_id == expected_session_id:
+                    previous[key] = (
+                        candidate.auto_skill_pending,
+                        candidate.auto_skill_claim_token,
+                    )
                     candidate.auto_skill_pending = False
-                    claimed_keys.append(key)
+                    candidate.auto_skill_claim_token = active_turn_token
             data, generation = self._snapshot_routing_locked()
 
         try:
@@ -2918,13 +2940,17 @@ class SessionStore:
             # for aliases that still resolve to the same session; a concurrent
             # route transition must never be overwritten.
             with self._lock:
-                for key in claimed_keys:
+                for key, prior in previous.items():
                     candidate = self._entries.get(key)
                     if (
                         candidate is not None
                         and candidate.session_id == expected_session_id
+                        and candidate.auto_skill_claim_token == active_turn_token
                     ):
-                        candidate.auto_skill_pending = True
+                        (
+                            candidate.auto_skill_pending,
+                            candidate.auto_skill_claim_token,
+                        ) = prior
             logger.warning(
                 "gateway.session: auto-skill claim persistence failed for %s: %s",
                 session_key,
@@ -2932,6 +2958,94 @@ class SessionStore:
             )
             return False
         return True
+
+    def resolve_session_after_turn_lease_wait(
+        self,
+        session_key: str,
+        expected_session_id: str,
+    ) -> Optional[SessionEntry]:
+        """Re-resolve a contended turn before it can load or write history.
+
+        A waiter may have resolved a proactive-rollover parent before the
+        holder committed its child. Follow only the durable continuation tip,
+        update the exact stale alias transactionally, and fail closed for an
+        unrelated route transition or an ended parent without a continuation.
+        """
+        if not session_key or not expected_session_id:
+            return None
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+
+        drain_lock = getattr(self, "_transcript_drain_lock", None)
+        if drain_lock is None:
+            drain_lock = threading.RLock()
+            self._transcript_drain_lock = drain_lock
+
+        with drain_lock:
+            tip = self._compression_tip_for_session_id(expected_session_id)
+            if not tip:
+                return None
+            try:
+                expected_row = db.get_session(expected_session_id)
+            except Exception:
+                return None
+            if (
+                tip == expected_session_id
+                and expected_row is not None
+                and expected_row.get("end_reason") is not None
+            ):
+                return None
+
+            with self._lock:
+                self._ensure_loaded_locked()
+                current = self._entries.get(session_key)
+                if current is None:
+                    return None
+                if current.session_id == tip:
+                    return current
+                if current.session_id != expected_session_id:
+                    return None
+                if tip == expected_session_id:
+                    return current
+
+                template = next(
+                    (
+                        candidate
+                        for candidate in self._entries.values()
+                        if candidate.session_id == tip
+                    ),
+                    None,
+                )
+                if template is None:
+                    refreshed = replace(current, session_id=tip)
+                else:
+                    refreshed = replace(
+                        template,
+                        session_key=current.session_key,
+                        origin=current.origin,
+                        display_name=current.display_name,
+                        platform=current.platform,
+                        chat_type=current.chat_type,
+                    )
+                previous = current
+                self._entries[session_key] = refreshed
+                reroutes = getattr(self, "_transcript_reroutes", None)
+                if reroutes is None:
+                    reroutes = {}
+                    self._transcript_reroutes = reroutes
+                previous_reroute = reroutes.get(expected_session_id)
+                reroutes[expected_session_id] = tip
+                try:
+                    self._save()
+                except Exception:
+                    self._entries[session_key] = previous
+                    if previous_reroute is None:
+                        reroutes.pop(expected_session_id, None)
+                    else:
+                        reroutes[expected_session_id] = previous_reroute
+                    raise
+                return refreshed
 
     def get_session_metadata(
         self,
@@ -3052,26 +3166,52 @@ class SessionStore:
     def clear_turn_active(self, session_key: str, token: str) -> bool:
         """Compare-and-swap clear an active-turn marker.
 
-        Returns ``False`` when the entry disappeared or a newer turn owns it.
+        Also finalizes any auto-skill claim owned by this exact turn across all
+        aliases. Returns ``False`` when the entry disappeared or a newer turn
+        owns it. A persistence failure restores every in-memory marker.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or entry.active_turn_token != token:
                 return False
-            candidate = entry.to_dict()
-            candidate["active_turn_token"] = None
-            candidate["active_turn_started_at"] = None
-
-            # Keep the live token until the clear is durable.  A failed write
-            # therefore remains retryable instead of becoming a false mismatch.
-            self._save_entry(
-                session_key,
-                entry_data=candidate,
-                lock_held=True,
-            )
+            previous_claims = {
+                key: candidate.auto_skill_claim_token
+                for key, candidate in self._entries.items()
+                if candidate.auto_skill_claim_token == token
+            }
+            if not previous_claims:
+                candidate = entry.to_dict()
+                candidate["active_turn_token"] = None
+                candidate["active_turn_started_at"] = None
+                self._save_entry(
+                    session_key,
+                    entry_data=candidate,
+                    lock_held=True,
+                )
+                entry.active_turn_token = None
+                entry.active_turn_started_at = None
+                return True
+            previous_started_at = entry.active_turn_started_at
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            for key in previous_claims:
+                self._entries[key].auto_skill_claim_token = None
+            data, generation = self._snapshot_routing_locked()
+
+        try:
+            self._persist_routing_data(data, generation)
+        except Exception:
+            with self._lock:
+                current = self._entries.get(session_key)
+                if current is not None and current.active_turn_token is None:
+                    current.active_turn_token = token
+                    current.active_turn_started_at = previous_started_at
+                for key, claim_token in previous_claims.items():
+                    candidate = self._entries.get(key)
+                    if candidate is not None and candidate.auto_skill_claim_token is None:
+                        candidate.auto_skill_claim_token = claim_token
+            raise
         return True
 
     def recover_interrupted_turns(
@@ -3096,6 +3236,16 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            # Any surviving claim token means the claim-to-turn completion
+            # transaction did not finish. Re-arm it even if its owner marker is
+            # missing or malformed: failing open here would permanently skip
+            # the session's only auto-skill injection.
+            for entry in self._entries.values():
+                if entry.auto_skill_claim_token:
+                    entry.auto_skill_pending = True
+                    entry.auto_skill_claim_token = None
+                    changed = True
+
             for entry in self._entries.values():
                 if not entry.active_turn_token:
                     continue
@@ -3127,6 +3277,7 @@ class SessionStore:
 
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.auto_skill_claim_token = None
                 changed = True
 
             if changed:
@@ -3142,10 +3293,15 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
-                if not entry.active_turn_token and entry.active_turn_started_at is None:
+                if (
+                    not entry.active_turn_token
+                    and entry.active_turn_started_at is None
+                    and entry.auto_skill_claim_token is None
+                ):
                     continue
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
+                entry.auto_skill_claim_token = None
                 cleared += 1
             if cleared:
                 self._save()
@@ -3833,7 +3989,7 @@ class SessionStore:
                                 self._dirty_transcripts.pop(queue_session_id, None)
                                 self._transcript_append_failures.pop(session_id, None)
                         logger.error(
-                            "Session DB transcript append rejected for compression-ended "
+                            "Session DB transcript append rejected for continuation-ended "
                             "%s with no unique live child; not retrying",
                             session_id,
                         )

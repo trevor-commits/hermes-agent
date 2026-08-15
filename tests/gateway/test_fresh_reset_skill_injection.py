@@ -26,6 +26,9 @@ a context-note prepend into the agent's prompt — both wrong for an explicit
 /new or /reset.
 """
 
+from types import SimpleNamespace
+
+from gateway import run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
@@ -118,17 +121,21 @@ class TestAutoSkillPendingClaim:
         store = _make_store(tmp_path)
         source = _make_source()
         entry = store.get_or_create_session(source)
+        token = store.mark_turn_active(entry.session_key)
 
         assert entry.auto_skill_pending is True
         assert store.claim_auto_skill_pending(
             entry.session_key,
             entry.session_id,
+            active_turn_token=token,
         ) is True
         assert entry.auto_skill_pending is False
         assert store.claim_auto_skill_pending(
             entry.session_key,
             entry.session_id,
+            active_turn_token=token,
         ) is False
+        assert store.clear_turn_active(entry.session_key, token) is True
 
         restored = SessionEntry.from_dict(entry.to_dict())
         assert restored.auto_skill_pending is False
@@ -150,27 +157,136 @@ class TestAutoSkillPendingClaim:
         with store._lock:
             store._entries[alias.session_key] = alias
             store._save()
+        token = store.mark_turn_active(entry.session_key)
 
         assert store.claim_auto_skill_pending(
             entry.session_key,
             entry.session_id,
+            active_turn_token=token,
         ) is True
         assert entry.auto_skill_pending is False
         assert alias.auto_skill_pending is False
         assert store.claim_auto_skill_pending(
             alias.session_key,
             alias.session_id,
+            active_turn_token=token,
         ) is False
+        assert store.clear_turn_active(entry.session_key, token) is True
 
     def test_wrong_resolved_session_cannot_claim(self, tmp_path):
         store = _make_store(tmp_path)
         entry = store.get_or_create_session(_make_source())
+        token = store.mark_turn_active(entry.session_key)
 
         assert store.claim_auto_skill_pending(
             entry.session_key,
             "different-session",
+            active_turn_token=token,
         ) is False
         assert entry.auto_skill_pending is True
+
+    def test_claim_requires_exact_durable_active_turn(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        token = store.mark_turn_active(entry.session_key)
+
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+            active_turn_token="not-the-owner",
+        ) is False
+        assert entry.auto_skill_pending is True
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+            active_turn_token=token,
+        ) is True
+
+    def test_interrupted_claim_rearms_payload_across_aliases_on_restart(
+        self, tmp_path
+    ):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        alias = SessionEntry.from_dict(entry.to_dict())
+        alias.session_key = f"{entry.session_key}:alias"
+        with store._lock:
+            store._entries[alias.session_key] = alias
+            store._save()
+
+        token = store.mark_turn_active(entry.session_key)
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+            active_turn_token=token,
+        ) is True
+
+        restarted = _make_store(tmp_path)
+        assert restarted.recover_interrupted_turns() == 1
+        restored = restarted.lookup_by_session_key(entry.session_key)
+        restored_alias = restarted.lookup_by_session_key(alias.session_key)
+        assert restored is not None and restored.auto_skill_pending is True
+        assert restored_alias is not None and restored_alias.auto_skill_pending is True
+        assert restored.auto_skill_claim_token is None
+        assert restored_alias.auto_skill_claim_token is None
+
+    def test_successful_claim_stays_consumed_across_aliases_and_restart(
+        self, tmp_path
+    ):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        alias = SessionEntry.from_dict(entry.to_dict())
+        alias.session_key = f"{entry.session_key}:alias"
+        with store._lock:
+            store._entries[alias.session_key] = alias
+            store._save()
+
+        token = store.mark_turn_active(entry.session_key)
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+            active_turn_token=token,
+        ) is True
+        assert store.clear_turn_active(entry.session_key, token) is True
+
+        restarted = _make_store(tmp_path)
+        restored = restarted.lookup_by_session_key(entry.session_key)
+        restored_alias = restarted.lookup_by_session_key(alias.session_key)
+        assert restored is not None and restored.auto_skill_pending is False
+        assert restored_alias is not None and restored_alias.auto_skill_pending is False
+        assert restored.auto_skill_claim_token is None
+        assert restored_alias.auto_skill_claim_token is None
+
+    def test_orphan_claim_token_rearms_instead_of_losing_injection(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        with store._lock:
+            entry.auto_skill_pending = False
+            entry.auto_skill_claim_token = "orphaned-claim"
+            entry.active_turn_token = None
+            entry.active_turn_started_at = None
+            store._save()
+
+        restarted = _make_store(tmp_path)
+        assert restarted.recover_interrupted_turns() == 0
+        restored = restarted.lookup_by_session_key(entry.session_key)
+        assert restored is not None and restored.auto_skill_pending is True
+        assert restored.auto_skill_claim_token is None
+
+
+def test_auto_skill_loader_failure_does_not_mutate_event(monkeypatch):
+    event = SimpleNamespace(auto_skill="missing-skill", text="original request")
+
+    def fail_load(*_args, **_kwargs):
+        raise OSError("skill tree unavailable")
+
+    monkeypatch.setattr("agent.skill_commands._load_skill_payload", fail_load)
+
+    assert gateway_run.GatewayRunner._apply_claimed_auto_skill(
+        event,
+        "task-id",
+        "session-key",
+    ) is False
+    assert event.text == "original request"
 
 
 # ---------------------------------------------------------------------------
