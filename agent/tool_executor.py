@@ -290,6 +290,23 @@ def _prepare_text_tool_result_for_context(
     return receipt if return_receipt else receipt.content
 
 
+def _receipt_for_final_model_content(
+    receipt: ToolResultPersistence,
+    model_content: str,
+) -> ToolResultPersistence:
+    """Carry durability provenance onto the exact final tool-message text.
+
+    High-risk tools are framed by ``make_tool_result_message`` after result
+    persistence.  The aggregate budget must compare its receipt with that
+    framed content, while retaining the proof that the underlying full output
+    was already stored.
+    """
+    return ToolResultPersistence(
+        content=model_content,
+        full_output_persisted=receipt.full_output_persisted,
+    )
+
+
 def _prepare_multimodal_tool_result_for_context(
     agent,
     raw_result: Dict[str, Any],
@@ -2058,7 +2075,10 @@ def execute_tool_calls_concurrent(
             effect_disposition=effect_disposition,
         )
         if not _is_multimodal_tool_result(display_function_result):
-            persistence_receipts[id(tool_message)] = persistence
+            persistence_receipts[id(tool_message)] = _receipt_for_final_model_content(
+                persistence,
+                tool_message["content"],
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2905,7 +2925,10 @@ def execute_tool_calls_sequential(
             effect_disposition="unknown" if _execution_timed_out else None,
         )
         if not _is_multimodal_tool_result(display_function_result):
-            persistence_receipts[id(tool_message)] = persistence
+            persistence_receipts[id(tool_message)] = _receipt_for_final_model_content(
+                persistence,
+                tool_message["content"],
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
