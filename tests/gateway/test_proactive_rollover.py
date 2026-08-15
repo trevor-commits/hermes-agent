@@ -57,6 +57,7 @@ def _rollover_runner(monkeypatch, tmp_path, *, enabled: bool):
     )
     runner.session_store.rollover_session_with_carryover.return_value = fresh_entry
     runner.session_store.has_dirty_transcript.return_value = False
+    runner.session_store._has_active_processes_safe.return_value = False
     runner._sync_telegram_topic_binding = MagicMock()
     return runner
 
@@ -167,6 +168,21 @@ async def test_live_background_worker_defers_roll(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_registered_process_defers_roll(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._run_agent = AsyncMock(return_value=_success_result(25_000))
+    runner.session_store._has_active_processes_safe.return_value = True
+
+    await runner._handle_message_with_agent(_event(), _source(), _SESSION_KEY, 1)
+
+    runner.session_store.rollover_session_with_carryover.assert_not_called()
+    runner.session_store._has_active_processes_safe.assert_called_once_with(
+        _SESSION_KEY,
+        context="proactive_rollover",
+    )
+
+
+@pytest.mark.asyncio
 async def test_dirty_transcript_defers_roll(monkeypatch, tmp_path):
     runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
     runner._run_agent = AsyncMock(return_value=_success_result(25_000))
@@ -200,6 +216,23 @@ async def test_topic_sync_failure_keeps_committed_rollover(monkeypatch, tmp_path
 
     runner.session_store.rollover_session_with_carryover.assert_called_once()
     assert isinstance(response, str) and "🔄" in response
+
+
+def test_proactive_topic_sync_can_propagate_failure(monkeypatch, tmp_path):
+    runner = _rollover_runner(monkeypatch, tmp_path, enabled=True)
+    runner._is_telegram_topic_lane = MagicMock(return_value=True)
+    runner._record_telegram_topic_binding = MagicMock(
+        side_effect=OSError("topic sync failed")
+    )
+
+    with pytest.raises(OSError, match="topic sync failed"):
+        gateway_run.GatewayRunner._sync_telegram_topic_binding(
+            runner,
+            _source(),
+            runner.session_store.rollover_session_with_carryover.return_value,
+            reason="proactive-rollover",
+            raise_on_error=True,
+        )
 
 
 def _real_store(tmp_path: Path) -> tuple[SessionStore, SessionEntry]:
@@ -341,6 +374,31 @@ def test_successful_rollover_commits_lineage_carryover_end_and_route(tmp_path):
     assert "exact durable summary" in messages[0]["content"]
     route = store._db.load_gateway_routing_entries(scope=store._routing_scope())
     assert json.loads(route[old_entry.session_key])["session_id"] == new_entry.session_id
+    assert store._db.get_compression_tip(old_entry.session_id) == new_entry.session_id
+
+
+def test_proactive_tip_rejects_child_without_matching_marker(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("roll-parent", "telegram")
+    db.create_session(
+        "unmarked-child",
+        "telegram",
+        parent_session_id="roll-parent",
+    )
+    db.end_session("roll-parent", "proactive_rollover")
+
+    assert db.get_compression_tip("roll-parent") == "roll-parent"
+
+    db.create_session(
+        "marked-child",
+        "telegram",
+        parent_session_id="roll-parent",
+        model_config={
+            "_proactive_rollover": True,
+            "_reset_from": "roll-parent",
+        },
+    )
+    assert db.get_compression_tip("roll-parent") == "marked-child"
 
 
 def test_post_commit_mirror_failure_keeps_database_route(monkeypatch, tmp_path):
