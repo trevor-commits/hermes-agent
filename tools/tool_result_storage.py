@@ -316,22 +316,32 @@ def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
 
-    closing = f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
+    persisted_closing = f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     header = _PERSISTED_PREVIEW_HEADER.search(content)
-    closing_at = content.rfind(closing)
+    closing_at = content.rfind(persisted_closing)
     if header is not None and closing_at >= header.end():
         prefix = content[:header.end()]
         preview = content[header.end():closing_at]
-        fixed = prefix + _AGGREGATE_PREVIEW_TRUNCATION_MARKER + closing
+        suffix = content[closing_at:]
+        fixed = prefix + _AGGREGATE_PREVIEW_TRUNCATION_MARKER + suffix
         if len(fixed) <= max_chars:
             keep_chars = max_chars - len(fixed)
             return (
                 prefix
                 + preview[:keep_chars]
                 + _AGGREGATE_PREVIEW_TRUNCATION_MARKER
-                + closing
+                + suffix
             )
 
+    persisted_start = content.find(PERSISTED_OUTPUT_TAG)
+    persisted_end_at = content.rfind(PERSISTED_OUTPUT_CLOSING_TAG)
+    if persisted_start >= 0 and persisted_end_at >= persisted_start:
+        persisted_end = persisted_end_at + len(PERSISTED_OUTPUT_CLOSING_TAG)
+        outer_prefix = content[:persisted_start]
+        outer_suffix = content[persisted_end:]
+    else:
+        outer_prefix = ""
+        outer_suffix = ""
     path_match = re.search(r"^Full output saved to: .+$", content, re.MULTILINE)
     path_line = path_match.group(0) if path_match is not None else ""
     compact_lines = [PERSISTED_OUTPUT_TAG]
@@ -343,9 +353,21 @@ def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
             PERSISTED_OUTPUT_CLOSING_TAG,
         ]
     )
-    compact = "\n".join(compact_lines)
+    compact = outer_prefix + "\n".join(compact_lines) + outer_suffix
     if len(compact) <= max_chars:
         return compact
+
+    framed_minimum = (
+        outer_prefix
+        + _AGGREGATE_PREVIEW_TRUNCATION_MARKER.lstrip("\n")
+        + outer_suffix
+    )
+    if (outer_prefix or outer_suffix) and len(framed_minimum) <= max_chars:
+        return framed_minimum
+    if outer_prefix or outer_suffix:
+        # A partial trust boundary is unsafe. Withhold the preview when the
+        # complete frame cannot fit rather than emitting an unterminated block.
+        return ""
 
     if max_chars == 1:
         return "…"

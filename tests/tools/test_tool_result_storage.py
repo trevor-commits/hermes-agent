@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
+from agent.tool_dispatch_helpers import make_tool_result_message
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -20,6 +21,7 @@ from tools.tool_result_storage import (
     _safe_result_filename,
     _write_to_sandbox,
     cleanup_spillover_cache,
+    _trim_persisted_model_preview,
     enforce_turn_budget,
     generate_preview,
     get_spillover_dir,
@@ -390,6 +392,44 @@ class TestEnforceTurnBudget:
         persist_again.assert_not_called()
         assert env.execute.call_count == writes_before_budgeting
         assert [call.kwargs["stdin_data"] for call in env.execute.call_args_list] == full_outputs
+
+
+    def test_compact_persisted_preview_preserves_untrusted_frame(self):
+        path = "/tmp/hermes-results/framed.txt"
+        persisted = _build_persisted_message(
+            preview="x" * 500,
+            has_more=True,
+            original_size=2_000,
+            file_path=path,
+        )
+        framed = make_tool_result_message(
+            "web_search",
+            persisted,
+            "framed",
+        )["content"]
+        persisted_start = framed.index(PERSISTED_OUTPUT_TAG)
+        persisted_end = (
+            framed.rindex(PERSISTED_OUTPUT_CLOSING_TAG)
+            + len(PERSISTED_OUTPUT_CLOSING_TAG)
+        )
+        outer_prefix = framed[:persisted_start]
+        outer_suffix = framed[persisted_end:]
+        compact = (
+            outer_prefix
+            + PERSISTED_OUTPUT_TAG
+            + "\n"
+            + f"Full output saved to: {path}\n"
+            + "[Preview truncated: aggregate tool-output budget exhausted.]\n"
+            + PERSISTED_OUTPUT_CLOSING_TAG
+            + outer_suffix
+        )
+
+        trimmed = _trim_persisted_model_preview(framed, len(compact))
+
+        assert trimmed == compact
+        assert trimmed.startswith('<untrusted_tool_result source="web_search">\n')
+        assert trimmed.endswith("</untrusted_tool_result>")
+        assert "Preview (first" not in trimmed
 
 
     def test_empty_messages(self):
