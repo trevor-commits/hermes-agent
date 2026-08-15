@@ -3454,8 +3454,10 @@ def compress_context(
                     )
                     from agent.turn_context import (
                         bind_current_turn_durability_receipt,
+                        mark_committed_messages_persisted,
                     )
 
+                    mark_committed_messages_persisted(compressed)
                     bind_current_turn_durability_receipt(agent, compressed)
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
