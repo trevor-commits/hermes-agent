@@ -78,6 +78,31 @@ def stable_message_content_digest(content: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
+def mark_committed_messages_persisted(
+    written_messages: List[Dict[str, Any]],
+    stored_messages: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Stamp intrinsic dedup state after the batch transaction commits.
+
+    This marker answers only whether the live dictionary's row was written; it
+    is not a hard-ceiling durability proof. Receipt construction below stays
+    independently fail-closed when turn identity or exact row annotations are
+    missing. SessionDB normally annotates each stored row with ``_row_id``;
+    legacy/fake stores may omit it, but a successful append must still prevent
+    the same live dictionary from being appended again.
+    """
+    stored = written_messages if stored_messages is None else stored_messages
+    for index, written in enumerate(written_messages):
+        if not isinstance(written, dict):
+            continue
+        persisted = stored[index] if index < len(stored) else None
+        if isinstance(persisted, dict):
+            row_id = persisted.get("_row_id")
+            if isinstance(row_id, int) and row_id > 0:
+                written["_row_id"] = row_id
+        written["_db_persisted"] = True
+
+
 def bind_current_turn_durability_receipt(
     agent: Any,
     written_messages: List[Dict[str, Any]],
@@ -128,9 +153,6 @@ def bind_current_turn_durability_receipt(
             return _clear_receipt()
         if written.get("role") != persisted.get("role"):
             return _clear_receipt()
-        written["_row_id"] = row_id
-        written["_db_persisted"] = True
-
         role = persisted.get("role")
         written_identity = written.get(CURRENT_TURN_IDENTITY_KEY)
         persisted_identity = persisted.get(CURRENT_TURN_IDENTITY_KEY)

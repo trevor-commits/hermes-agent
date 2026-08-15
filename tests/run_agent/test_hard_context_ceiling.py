@@ -967,6 +967,55 @@ def test_batch_persist_captures_exact_current_turn_receipt(monkeypatch, tmp_path
     assert messages[0]["_row_id"] == row["id"]
 
 
+def test_batch_persist_marks_committed_row_without_turn_identity(
+    monkeypatch, tmp_path
+):
+    """Committed-row dedup markers must not depend on receipt eligibility."""
+    agent, db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    messages = [{"role": "user", "content": "legacy committed turn"}]
+    agent._persist_user_turn_identity = None
+    agent._current_turn_durability_receipt = None
+
+    assert agent._persist_session(messages, []) is True
+
+    row = db.get_messages(agent.session_id)[-1]
+    assert messages[0]["_db_persisted"] is True
+    assert messages[0]["_row_id"] == row["id"]
+    assert agent._current_turn_durability_receipt is None
+
+
+def test_committed_marker_without_row_id_keeps_receipt_fail_closed():
+    """A successful write can be deduplicated without fabricating proof."""
+    from agent.turn_context import (
+        CURRENT_TURN_IDENTITY_KEY,
+        bind_current_turn_durability_receipt,
+        mark_committed_messages_persisted,
+    )
+
+    turn_identity = "hard-ceiling-e2e:missing-row-id"
+    agent = SimpleNamespace(
+        session_id="hard-ceiling-e2e",
+        _persist_user_turn_identity=turn_identity,
+        _current_turn_durability_receipt=None,
+    )
+    written = [
+        {
+            "role": "user",
+            "content": "committed without annotation",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    stored = [dict(written[0])]
+
+    mark_committed_messages_persisted(written, stored)
+
+    assert written[0]["_db_persisted"] is True
+    assert "_row_id" not in written[0]
+    assert bind_current_turn_durability_receipt(agent, written, stored) is False
+    assert agent._current_turn_durability_receipt is None
+
+
 def test_later_assistant_tool_batch_preserves_exact_current_turn_receipt(
     monkeypatch, tmp_path
 ):
