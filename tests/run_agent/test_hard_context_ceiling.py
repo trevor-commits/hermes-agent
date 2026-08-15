@@ -967,6 +967,83 @@ def test_batch_persist_captures_exact_current_turn_receipt(monkeypatch, tmp_path
     assert messages[0]["_row_id"] == row["id"]
 
 
+def test_later_assistant_tool_batch_preserves_exact_current_turn_receipt(
+    monkeypatch, tmp_path
+):
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    turn_identity = "hard-ceiling-e2e:preserved-receipt"
+    messages = [
+        {
+            "role": "user",
+            "content": "persist me",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+    agent._current_turn_durability_receipt = None
+
+    assert agent._persist_session(messages, []) is True
+    receipt = agent._current_turn_durability_receipt
+
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-preserve-receipt",
+                        "type": "function",
+                        "function": {"name": "noop", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "done",
+                "tool_name": "noop",
+                "tool_call_id": "call-preserve-receipt",
+            },
+        ]
+    )
+
+    assert agent._persist_session(messages, []) is True
+    assert agent._current_turn_durability_receipt == receipt
+    assert agent._current_turn_user_is_durable(messages) is True
+
+
+def test_later_non_user_batch_clears_stale_current_turn_receipt(
+    monkeypatch, tmp_path
+):
+    from agent.turn_context import CURRENT_TURN_IDENTITY_KEY
+
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent._ensure_db_session()
+    turn_identity = "hard-ceiling-e2e:stale-receipt"
+    messages = [
+        {
+            "role": "user",
+            "content": "persist me",
+            CURRENT_TURN_IDENTITY_KEY: turn_identity,
+        }
+    ]
+    agent._persist_user_message_idx = 0
+    agent._persist_user_turn_identity = turn_identity
+    agent._current_turn_durability_receipt = None
+
+    assert agent._persist_session(messages, []) is True
+    agent._persist_user_turn_identity = "hard-ceiling-e2e:different-turn"
+    messages.append({"role": "assistant", "content": "done"})
+
+    assert agent._persist_session(messages, []) is True
+    assert agent._current_turn_durability_receipt is None
+    assert agent._current_turn_user_is_durable(messages) is False
+
+
 def test_lost_marker_without_db_row_stays_fail_closed(monkeypatch, tmp_path):
     from agent.conversation_loop import _hard_context_ceiling_result
     from agent.turn_context import CURRENT_TURN_IDENTITY_KEY

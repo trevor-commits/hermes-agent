@@ -91,16 +91,23 @@ def bind_current_turn_durability_receipt(
     when persistence rewrote content for storage. SessionDB annotates every
     inserted dictionary with ``_row_id`` inside the transaction.
 
-    The receipt is deliberately fail-closed. Exactly one committed user row
-    must carry the current turn identity, every paired row must have a valid
-    database id, and the live/stored roles must agree. A stale or ambiguous
-    identity clears the prior receipt instead of authorizing rollover from a
-    historical match.
+    The receipt is deliberately fail-closed. A batch containing the active
+    user turn must contain exactly one matching committed row, every paired
+    row must have a valid database id, and the live/stored roles must agree.
+    Later assistant/tool-only batches preserve that already-bound row. An
+    explicit identity mismatch, a user batch without the active identity, or
+    ambiguous matching rows clear the prior receipt instead of authorizing
+    rollover from stale evidence.
     """
-    agent._current_turn_durability_receipt = None
+    previous_receipt = getattr(agent, "_current_turn_durability_receipt", None)
+
+    def _clear_receipt() -> bool:
+        agent._current_turn_durability_receipt = None
+        return False
+
     stored = written_messages if stored_messages is None else stored_messages
     if len(written_messages) != len(stored):
-        return False
+        return _clear_receipt()
 
     turn_identity = getattr(agent, "_persist_user_turn_identity", None)
     session_id = getattr(agent, "session_id", None)
@@ -109,27 +116,57 @@ def bind_current_turn_durability_receipt(
         or not turn_identity
         or session_id is None
     ):
-        return False
+        return _clear_receipt()
 
     candidates: List[tuple[Dict[str, Any], Dict[str, Any], int]] = []
+    contains_user_row = False
     for written, persisted in zip(written_messages, stored):
         if not isinstance(written, dict) or not isinstance(persisted, dict):
-            return False
+            return _clear_receipt()
         row_id = persisted.get("_row_id")
         if not isinstance(row_id, int) or row_id <= 0:
-            return False
+            return _clear_receipt()
         if written.get("role") != persisted.get("role"):
-            return False
+            return _clear_receipt()
         written["_row_id"] = row_id
         written["_db_persisted"] = True
-        if (
-            persisted.get("role") == "user"
-            and written.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
-        ):
+
+        role = persisted.get("role")
+        written_identity = written.get(CURRENT_TURN_IDENTITY_KEY)
+        persisted_identity = persisted.get(CURRENT_TURN_IDENTITY_KEY)
+        if role == "user":
+            contains_user_row = True
+
+        supplied_identities = [
+            identity
+            for identity in (written_identity, persisted_identity)
+            if identity is not None
+        ]
+        if any(identity != turn_identity for identity in supplied_identities):
+            return _clear_receipt()
+        if supplied_identities and role != "user":
+            return _clear_receipt()
+        if role == "user" and written_identity == turn_identity:
             candidates.append((written, persisted, row_id))
 
-    if len(candidates) != 1:
-        return False
+    if len(candidates) > 1:
+        return _clear_receipt()
+
+    if not candidates:
+        if contains_user_row:
+            return _clear_receipt()
+        if (
+            isinstance(previous_receipt, CurrentTurnDurabilityReceipt)
+            and previous_receipt.session_id == str(session_id)
+            and previous_receipt.role == "user"
+            and previous_receipt.turn_identity == turn_identity
+            and isinstance(previous_receipt.row_id, int)
+            and previous_receipt.row_id > 0
+            and isinstance(previous_receipt.content_digest, str)
+            and len(previous_receipt.content_digest) == 64
+        ):
+            return True
+        return _clear_receipt()
 
     _written, persisted, row_id = candidates[0]
     agent._current_turn_durability_receipt = CurrentTurnDurabilityReceipt(
