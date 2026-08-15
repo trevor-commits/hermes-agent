@@ -331,6 +331,67 @@ class TestEnforceTurnBudget:
         assert persisted_count >= 2  # Need to shed at least ~52K
 
 
+    def test_all_persisted_receipts_trim_preview_without_rewriting_output(self):
+        """Durable receipts still count toward the model-facing turn cap."""
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        persistence_receipts = {}
+        full_outputs = ["A" * 2_000, "B" * 2_000]
+        messages = []
+
+        for index, full_output in enumerate(full_outputs):
+            receipt = maybe_persist_tool_result(
+                content=full_output,
+                tool_name="terminal",
+                tool_use_id=f"persisted-{index}",
+                env=env,
+                config=BudgetConfig(preview_size=320),
+                threshold=1,
+                return_receipt=True,
+            )
+            assert isinstance(receipt, ToolResultPersistence)
+            assert receipt.full_output_persisted is True
+            message = {
+                "role": "tool",
+                "tool_call_id": f"persisted-{index}",
+                "content": receipt.content,
+            }
+            messages.append(message)
+            persistence_receipts[id(message)] = receipt
+
+        original_total = sum(len(message["content"]) for message in messages)
+        turn_budget = original_total - 80
+        writes_before_budgeting = env.execute.call_count
+
+        with patch(
+            "tools.tool_result_storage.maybe_persist_tool_result",
+            wraps=maybe_persist_tool_result,
+        ) as persist_again:
+            enforce_turn_budget(
+                messages,
+                env=env,
+                config=BudgetConfig(turn_budget=turn_budget, preview_size=320),
+                persistence_receipts=persistence_receipts,
+            )
+
+        assert sum(len(message["content"]) for message in messages) == turn_budget
+        assert sum(
+            message["content"].count("aggregate tool-output budget")
+            for message in messages
+        ) == 1
+        assert all(
+            message["content"].endswith(PERSISTED_OUTPUT_CLOSING_TAG)
+            for message in messages
+        )
+        assert all(
+            persistence_receipts[id(message)].content == message["content"]
+            for message in messages
+        )
+        persist_again.assert_not_called()
+        assert env.execute.call_count == writes_before_budgeting
+        assert [call.kwargs["stdin_data"] for call in env.execute.call_args_list] == full_outputs
+
+
     def test_empty_messages(self):
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []

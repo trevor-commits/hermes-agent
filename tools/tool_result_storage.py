@@ -69,6 +69,10 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_PERSISTED_PREVIEW_HEADER = re.compile(r"\n\nPreview \(first \d+ chars\):\n")
+_AGGREGATE_PREVIEW_TRUNCATION_MARKER = (
+    "\n[Preview truncated: aggregate tool-output budget exhausted.]"
+)
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -300,6 +304,54 @@ def _build_persisted_message(
     return msg
 
 
+def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
+    """Shorten a durable receipt's model copy without touching stored output.
+
+    The normal receipt format keeps its storage path and closing tag while the
+    inline preview absorbs the requested reduction.  Extremely small budgets
+    fall back to a compact receipt, then to an exact-length marked prefix.
+    """
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= 0:
+        return ""
+
+    closing = f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
+    header = _PERSISTED_PREVIEW_HEADER.search(content)
+    closing_at = content.rfind(closing)
+    if header is not None and closing_at >= header.end():
+        prefix = content[:header.end()]
+        preview = content[header.end():closing_at]
+        fixed = prefix + _AGGREGATE_PREVIEW_TRUNCATION_MARKER + closing
+        if len(fixed) <= max_chars:
+            keep_chars = max_chars - len(fixed)
+            return (
+                prefix
+                + preview[:keep_chars]
+                + _AGGREGATE_PREVIEW_TRUNCATION_MARKER
+                + closing
+            )
+
+    path_match = re.search(r"^Full output saved to: .+$", content, re.MULTILINE)
+    path_line = path_match.group(0) if path_match is not None else ""
+    compact_lines = [PERSISTED_OUTPUT_TAG]
+    if path_line:
+        compact_lines.append(path_line)
+    compact_lines.extend(
+        [
+            _AGGREGATE_PREVIEW_TRUNCATION_MARKER.lstrip("\n"),
+            PERSISTED_OUTPUT_CLOSING_TAG,
+        ]
+    )
+    compact = "\n".join(compact_lines)
+    if len(compact) <= max_chars:
+        return compact
+
+    if max_chars == 1:
+        return "…"
+    return content[:max_chars - 1] + "…"
+
+
 @overload
 def maybe_persist_tool_result(
     content: str,
@@ -447,10 +499,10 @@ def enforce_turn_budget(
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
     If total chars exceed budget, persist the largest non-persisted results
-    first (via sandbox write) until under budget. Already-persisted results
-    are skipped only when the caller supplies the trusted typed receipt for
-    that exact message object. Tool-controlled marker text is never proof that
-    a complete result reached durable storage.
+    first (via sandbox write) until under budget. A trusted receipt prevents a
+    duplicate write, but its model-facing preview remains eligible for a final
+    trim if durable receipt previews alone exceed the cap. Tool-controlled
+    marker text is never proof that a complete result reached durable storage.
 
     Mutates the list in-place and returns it.
     """
@@ -507,6 +559,44 @@ def enforce_turn_budget(
             logger.info(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,
+            )
+
+    if total_size > config.turn_budget and persistence_receipts is not None:
+        durable_previews = []
+        for idx, msg in enumerate(tool_messages):
+            content = msg.get("content", "")
+            receipt = persistence_receipts.get(id(msg))
+            if (
+                isinstance(receipt, ToolResultPersistence)
+                and receipt.full_output_persisted
+                and receipt.content == content
+            ):
+                durable_previews.append((idx, len(content)))
+
+        durable_previews.sort(key=lambda item: item[1], reverse=True)
+        for idx, size in durable_previews:
+            if total_size <= config.turn_budget:
+                break
+            msg = tool_messages[idx]
+            content = msg.get("content", "")
+            deficit = total_size - config.turn_budget
+            replacement = _trim_persisted_model_preview(
+                content,
+                max(0, size - deficit),
+            )
+            if replacement == content:
+                continue
+            msg["content"] = replacement
+            persistence_receipts[id(msg)] = ToolResultPersistence(
+                content=replacement,
+                full_output_persisted=True,
+            )
+            total_size -= size - len(replacement)
+            logger.info(
+                "Budget enforcement: trimmed persisted preview %s (%d -> %d chars)",
+                msg.get("tool_call_id", f"budget_{idx}"),
+                size,
+                len(replacement),
             )
 
     return tool_messages
