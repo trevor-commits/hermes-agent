@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -511,6 +512,8 @@ from tools import async_delegation as ad
 r = ad.dispatch_async_delegation(
     goal="restart", context=None, toolsets=None, role="leaf", model="m",
     session_key="owner-session", parent_session_id="durable-parent",
+    work_key="source-card:restart:message",
+    work_kind="source-card-intake", delivery_mode="direct",
     runner=lambda: {"status": "completed", "summary": "after restart"},
 )
 deadline = time.time() + 5
@@ -539,6 +542,9 @@ print(json.dumps(evt, sort_keys=True))
     assert evt["session_key"] == "owner-session"
     assert evt["parent_session_id"] == "durable-parent"
     assert evt["summary"] == "after restart"
+    assert evt["work_key"] == "source-card:restart:message"
+    assert evt["work_kind"] == "source-card-intake"
+    assert evt["delivery_mode"] == "direct"
 
     acker = f'''
 from tools import async_delegation as ad
@@ -715,6 +721,255 @@ def test_concurrent_dispatch_respects_capacity():
     statuses = sorted(r["status"] for r in results)
     assert statuses == ["dispatched", "rejected"]
     gate.set()
+
+
+def test_stable_work_key_dispatches_exactly_once_and_survives_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=60)
+        return {
+            "status": "error",
+            "summary": None,
+            "error": "hard_context_ceiling_blocked:compression_attempts_exhausted",
+        }
+
+    first = ad.dispatch_async_delegation(
+        goal="source card", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:group:-1:2", runner=runner,
+        max_async_children=3, work_key="source-card:session:message-42",
+        work_kind="source-card-intake", delivery_mode="direct",
+    )
+    second = ad.dispatch_async_delegation(
+        goal="source card", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:group:-1:2", runner=runner,
+        max_async_children=3, work_key="source-card:session:message-42",
+        work_kind="source-card-intake", delivery_mode="direct",
+    )
+
+    assert first["status"] == "dispatched"
+    assert second == {"status": "duplicate", "delegation_id": first["delegation_id"]}
+    assert ad.active_count() == 1
+    gate.set()
+    evt = _drain_for(first["delegation_id"])
+    assert evt["work_kind"] == "source-card-intake"
+    assert evt["delivery_mode"] == "direct"
+    assert evt["work_key"] == "source-card:session:message-42"
+
+    third = ad.dispatch_async_delegation(
+        goal="source card", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:group:-1:2", runner=lambda: {},
+        max_async_children=3, work_key="source-card:session:message-42",
+        work_kind="source-card-intake", delivery_mode="direct",
+    )
+    assert third == {"status": "duplicate", "delegation_id": first["delegation_id"]}
+
+
+def test_expired_work_key_is_pruned_before_duplicate_resolution(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old_record = {
+        "delegation_id": "deleg_expired",
+        "session_key": "session",
+        "dispatched_at": 1.0,
+        "work_key": "source-card:session:expired-message",
+        "work_kind": "source-card-intake",
+        "delivery_mode": "direct",
+    }
+    assert ad._persist_dispatch(old_record) is None
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET state='completed', delivery_state='delivered', updated_at=0
+               WHERE delegation_id=?""",
+            (old_record["delegation_id"],),
+        )
+
+    new_record = {
+        **old_record,
+        "delegation_id": "deleg_replacement",
+        "dispatched_at": time.time(),
+    }
+
+    assert ad._persist_dispatch(new_record) is None
+    assert ad.find_delegation_by_work_key(new_record["work_key"]) == "deleg_replacement"
+
+
+def test_new_message_identity_gets_a_new_work_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    first = ad.dispatch_async_delegation(
+        goal="one", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session", runner=lambda: {"status": "completed", "summary": "one"},
+        work_key="source-card:session:message-1", work_kind="source-card-intake",
+        delivery_mode="direct",
+    )
+    second = ad.dispatch_async_delegation(
+        goal="two", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session", runner=lambda: {"status": "completed", "summary": "two"},
+        work_key="source-card:session:message-2", work_kind="source-card-intake",
+        delivery_mode="direct",
+    )
+    assert first["status"] == second["status"] == "dispatched"
+
+
+def test_durable_dispatch_failure_fails_closed_without_starting_worker(monkeypatch):
+    ran = threading.Event()
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("state db unavailable")),
+    )
+
+    result = ad.dispatch_async_delegation(
+        goal="source card",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session",
+        runner=lambda: ran.set() or {"status": "completed"},
+        work_key="source-card:session:message",
+        work_kind="source-card-intake",
+        delivery_mode="direct",
+    )
+
+    assert result["status"] == "rejected"
+    assert "durable" in result["error"].lower()
+    assert ad.active_count() == 0
+    assert not ran.is_set()
+
+
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_concurrent_duplicate_waits_for_failed_durable_reservation(
+    monkeypatch, is_batch,
+):
+    first_persist_entered = threading.Event()
+    release_first_persist = threading.Event()
+    second_finished = threading.Event()
+    runner_ran = threading.Event()
+    persist_calls = 0
+    persist_lock = threading.Lock()
+
+    def _persist(_record):
+        nonlocal persist_calls
+        with persist_lock:
+            persist_calls += 1
+            call_number = persist_calls
+        if call_number == 1:
+            first_persist_entered.set()
+            assert release_first_persist.wait(timeout=5)
+            raise RuntimeError("state db unavailable")
+        return None
+
+    scheduled = []
+
+    class _DeferredExecutor:
+        def submit(self, fn):
+            scheduled.append(fn)
+            return object()
+
+    monkeypatch.setattr(ad, "_persist_dispatch", _persist)
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: _DeferredExecutor())
+    monkeypatch.setattr(ad, "_ensure_stale_monitor", lambda: None)
+
+    results = []
+
+    def _dispatch():
+        common = dict(
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="session",
+            max_async_children=3,
+            work_key="source-card:session:message",
+        )
+        if is_batch:
+            result = ad.dispatch_async_delegation_batch(
+                goals=["source card"],
+                runner=lambda: runner_ran.set() or {
+                    "results": [{"status": "completed", "summary": "done"}],
+                    "total_duration_seconds": 0,
+                },
+                **common,
+            )
+        else:
+            result = ad.dispatch_async_delegation(
+                goal="source card",
+                runner=lambda: runner_ran.set() or {
+                    "status": "completed",
+                    "summary": "done",
+                },
+                **common,
+            )
+        results.append(result)
+
+    first = threading.Thread(target=_dispatch)
+    second = threading.Thread(target=lambda: (_dispatch(), second_finished.set()))
+    first.start()
+    assert first_persist_entered.wait(timeout=5)
+    second.start()
+    second_returned_before_reservation_finished = second_finished.wait(timeout=0.5)
+    release_first_persist.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not second_returned_before_reservation_finished
+    assert sorted(result["status"] for result in results) == [
+        "dispatched",
+        "rejected",
+    ]
+    assert persist_calls == 2
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert runner_ran.is_set()
+
+
+def test_existing_async_delegation_schema_upgrades_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute(
+        """CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            origin_ui_session_id TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT,
+            state TEXT NOT NULL,
+            dispatched_at REAL NOT NULL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            event_json TEXT,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            task_json TEXT,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            origin_session_id TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+    upgraded = ad._connect()
+    try:
+        columns = {
+            row[1]
+            for row in upgraded.execute("PRAGMA table_info(async_delegations)")
+        }
+        indexes = {
+            row[1]
+            for row in upgraded.execute("PRAGMA index_list(async_delegations)")
+        }
+    finally:
+        upgraded.close()
+
+    assert {"work_key", "work_kind", "delivery_mode"}.issubset(columns)
+    assert "idx_async_delegations_work_key" in indexes
 
 
 # ---------------------------------------------------------------------------

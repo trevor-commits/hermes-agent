@@ -499,6 +499,56 @@ def test_group_channel_skill_binding_applies_without_forum_topic():
     assert event.auto_skill == ["source-card-intake"]
 
 
+def test_group_channel_binding_carries_trusted_intake_route():
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(channel_skill_bindings=[
+        {
+            "id": "-5551733823",
+            "skill": "source-card-intake",
+            "route": "source-card-intake",
+        },
+    ])
+    msg = _make_mock_message(
+        chat_id=-5551733823,
+        chat_type=_ChatType.SUPERGROUP,
+        text="https://example.invalid/source",
+        is_forum=False,
+    )
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.auto_skill == ["source-card-intake"]
+    assert event.auto_skill_route == "source-card-intake"
+
+
+def test_exact_topic_route_beats_parent_regardless_of_config_order():
+    from gateway.platforms.base import MessageType
+
+    for bindings in (
+        [
+            {"id": "-100123:5", "skill": "topic-skill", "route": "topic"},
+            {"id": "-100123", "skill": "parent-skill", "route": "parent"},
+        ],
+        [
+            {"id": "-100123", "skill": "parent-skill", "route": "parent"},
+            {"id": "-100123:5", "skill": "topic-skill", "route": "topic"},
+        ],
+    ):
+        adapter = _make_adapter(channel_skill_bindings=bindings)
+        msg = _make_mock_message(
+            chat_id=-100123,
+            chat_type=_ChatType.SUPERGROUP,
+            thread_id=5,
+            is_topic_message=True,
+            is_forum=True,
+        )
+
+        event = adapter._build_message_event(msg, MessageType.TEXT)
+
+        assert event.auto_skill_route == "topic"
+
+
 def test_forum_exact_binding_beats_parent_regardless_of_config_order():
     from gateway.platforms.base import MessageType
 
@@ -593,4 +643,3 @@ def test_unbound_group_retains_no_auto_skill():
 
 
 # ── _build_message_event: from_user=None fallback in DMs ──
-
