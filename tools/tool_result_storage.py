@@ -267,12 +267,15 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    persistence_receipts: dict[int, ToolResultPersistence] | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
     If total chars exceed budget, persist the largest non-persisted results
     first (via sandbox write) until under budget. Already-persisted results
-    are skipped.
+    are skipped only when the caller supplies the trusted typed receipt for
+    that exact message object. Tool-controlled marker text is never proof that
+    a complete result reached durable storage.
 
     Mutates the list in-place and returns it.
     """
@@ -282,7 +285,15 @@ def enforce_turn_budget(
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        receipt = (
+            persistence_receipts.get(id(msg))
+            if persistence_receipts is not None
+            else None
+        )
+        if not (
+            isinstance(receipt, ToolResultPersistence)
+            and receipt.full_output_persisted
+        ):
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:
@@ -297,14 +308,23 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
-        replacement = maybe_persist_tool_result(
+        persistence = maybe_persist_tool_result(
             content=content,
             tool_name=_BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
+            return_receipt=True,
         )
+        if isinstance(persistence, ToolResultPersistence):
+            replacement = persistence.content
+            if persistence_receipts is not None:
+                persistence_receipts[id(msg)] = persistence
+        else:
+            # Compatibility for extensions that replace the storage helper
+            # without implementing the typed receipt contract.
+            replacement = persistence
         if replacement != content:
             total_size -= size
             total_size += len(replacement)
