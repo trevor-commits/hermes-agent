@@ -2418,39 +2418,14 @@ class AIAgent:
                     or 300.0,
                 )
                 from agent.turn_context import (
-                    CURRENT_TURN_IDENTITY_KEY,
-                    CurrentTurnDurabilityReceipt,
-                    stable_message_content_digest,
+                    bind_current_turn_durability_receipt,
                 )
 
-                _turn_identity = getattr(
-                    self, "_persist_user_turn_identity", None
+                bind_current_turn_durability_receipt(
+                    self,
+                    _batch_msgs,
+                    _batch_rows,
                 )
-                for _written, _stored in zip(_batch_msgs, _batch_rows):
-                    _written[_DB_PERSISTED_MARKER] = True
-                    _row_id = _stored.get("_row_id")
-                    if isinstance(_row_id, int) and _row_id > 0:
-                        _written["_row_id"] = _row_id
-                    if (
-                        isinstance(_row_id, int)
-                        and _row_id > 0
-                        and _stored.get("role") == "user"
-                        and isinstance(_turn_identity, str)
-                        and _turn_identity
-                        and _written.get(CURRENT_TURN_IDENTITY_KEY)
-                        == _turn_identity
-                    ):
-                        self._current_turn_durability_receipt = (
-                            CurrentTurnDurabilityReceipt(
-                                session_id=str(self.session_id),
-                                row_id=_row_id,
-                                role="user",
-                                content_digest=stable_message_content_digest(
-                                    _stored.get("content")
-                                ),
-                                turn_identity=_turn_identity,
-                            )
-                        )
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

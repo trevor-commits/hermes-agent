@@ -59,6 +59,67 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_in_place_commit_binds_exact_current_turn_durability_receipt(self):
+        """The compaction transaction itself can be the first durable write
+        for the active user turn, so it must publish the same exact row receipt
+        as the ordinary turn flush."""
+        from agent.conversation_compression import compress_context
+        from agent.turn_context import (
+            CURRENT_TURN_IDENTITY_KEY,
+            CurrentTurnDurabilityReceipt,
+            stable_message_content_digest,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_current_turn_receipt"
+            _seed(db, sid, "receipt", n=2)
+            agent = _make_agent(db, sid, in_place=True)
+            turn_identity = f"{sid}:active-turn"
+            messages = [
+                {"role": "user", "content": "old ask"},
+                {"role": "assistant", "content": "old answer"},
+                {
+                    "role": "user",
+                    "content": "active ask",
+                    CURRENT_TURN_IDENTITY_KEY: turn_identity,
+                },
+            ]
+            agent._persist_user_message_idx = 2
+            agent._persist_user_turn_identity = turn_identity
+            agent._current_turn_durability_receipt = None
+
+            def _keep_active_turn(*_args, **_kwargs):
+                return [
+                    {"role": "user", "content": "compacted history"},
+                    {"role": "assistant", "content": "recent reply"},
+                    dict(messages[-1]),
+                ]
+
+            agent.context_compressor.compress = _keep_active_turn
+            compressed, _ = compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            receipt = agent._current_turn_durability_receipt
+            assert isinstance(receipt, CurrentTurnDurabilityReceipt)
+            assert receipt.session_id == sid
+            assert receipt.role == "user"
+            assert receipt.turn_identity == turn_identity
+            assert receipt.content_digest == stable_message_content_digest(
+                "active ask"
+            )
+            active = db.get_messages(sid, after_id=receipt.row_id - 1, limit=1)
+            assert len(active) == 1
+            assert active[0]["id"] == receipt.row_id
+            assert active[0]["content"] == "active ask"
+            assert compressed[2]["_row_id"] == receipt.row_id
+            assert compressed[2]["_db_persisted"] is True
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

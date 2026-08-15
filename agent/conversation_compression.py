@@ -3452,6 +3452,11 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                     )
+                    from agent.turn_context import (
+                        bind_current_turn_durability_receipt,
+                    )
+
+                    bind_current_turn_durability_receipt(agent, compressed)
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
