@@ -333,6 +333,44 @@ class TestCumulativeToolOutputBudget:
         assert later == ""
         assert [write[1] for write in env.writes] == [crossing_full, later_full]
 
+    def test_per_result_emitted_cap_preserves_run_capacity_and_full_output(self):
+        from agent.tool_executor import _apply_run_tool_output_budget
+
+        class RecordingEnv:
+            def __init__(self):
+                self.writes = []
+
+            def get_temp_dir(self):
+                return "/tmp/test-per-result-emitted-cap"
+
+            def execute(self, _cmd, timeout, stdin_data):
+                self.writes.append((timeout, stdin_data))
+                return {"returncode": 0}
+
+        agent = self._budgeted_agent(200)
+        agent.tool_result_emitted_max_chars = 80
+        env = RecordingEnv()
+        full = "oversized-read-result-" * 10
+
+        emitted = _apply_run_tool_output_budget(
+            agent,
+            full,
+            full_content=full,
+            tool_name="read_file",
+            tool_use_id="bounded-read",
+            env=env,
+        )
+        later = _apply_run_tool_output_budget(agent, "z" * 50)
+
+        assert len(emitted) == 80
+        assert emitted.endswith(
+            "[tool result truncated: per-result emitted limit]"
+        )
+        assert later == "z" * 50
+        assert agent._tool_result_total_chars_used == 130
+        assert agent.tool_result_budget_withheld_count == 0
+        assert [write[1] for write in env.writes] == [full]
+
     def test_literal_persisted_tag_cannot_suppress_crossing_persistence(self):
         from agent.tool_executor import _apply_run_tool_output_budget
 
