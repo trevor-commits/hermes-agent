@@ -78,6 +78,70 @@ def stable_message_content_digest(content: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
+def bind_current_turn_durability_receipt(
+    agent: Any,
+    written_messages: List[Dict[str, Any]],
+    stored_messages: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Bind the active logical turn to its exact committed message row.
+
+    Callers invoke this only after the surrounding database transaction has
+    committed. ``written_messages`` are the live conversation dictionaries;
+    ``stored_messages`` are the row-shaped dictionaries passed to SessionDB
+    when persistence rewrote content for storage. SessionDB annotates every
+    inserted dictionary with ``_row_id`` inside the transaction.
+
+    The receipt is deliberately fail-closed. Exactly one committed user row
+    must carry the current turn identity, every paired row must have a valid
+    database id, and the live/stored roles must agree. A stale or ambiguous
+    identity clears the prior receipt instead of authorizing rollover from a
+    historical match.
+    """
+    agent._current_turn_durability_receipt = None
+    stored = written_messages if stored_messages is None else stored_messages
+    if len(written_messages) != len(stored):
+        return False
+
+    turn_identity = getattr(agent, "_persist_user_turn_identity", None)
+    session_id = getattr(agent, "session_id", None)
+    if (
+        not isinstance(turn_identity, str)
+        or not turn_identity
+        or session_id is None
+    ):
+        return False
+
+    candidates: List[tuple[Dict[str, Any], Dict[str, Any], int]] = []
+    for written, persisted in zip(written_messages, stored):
+        if not isinstance(written, dict) or not isinstance(persisted, dict):
+            return False
+        row_id = persisted.get("_row_id")
+        if not isinstance(row_id, int) or row_id <= 0:
+            return False
+        if written.get("role") != persisted.get("role"):
+            return False
+        written["_row_id"] = row_id
+        written["_db_persisted"] = True
+        if (
+            persisted.get("role") == "user"
+            and written.get(CURRENT_TURN_IDENTITY_KEY) == turn_identity
+        ):
+            candidates.append((written, persisted, row_id))
+
+    if len(candidates) != 1:
+        return False
+
+    _written, persisted, row_id = candidates[0]
+    agent._current_turn_durability_receipt = CurrentTurnDurabilityReceipt(
+        session_id=str(session_id),
+        row_id=row_id,
+        role="user",
+        content_digest=stable_message_content_digest(persisted.get("content")),
+        turn_identity=turn_identity,
+    )
+    return True
+
+
 def carry_current_turn_identity(
     target: Dict[str, Any], source: Mapping[str, Any]
 ) -> None:
