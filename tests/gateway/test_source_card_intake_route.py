@@ -67,6 +67,37 @@ def test_worker_context_ceiling_and_iteration_limit_cannot_be_reported_as_succes
     assert normalized["exit_reason"] == "max_iterations_reached(16/16)"
 
 
+def test_worker_tool_output_exhaustion_cannot_be_reported_as_success():
+    from gateway.run import _normalize_source_card_worker_result
+
+    normalized = _normalize_source_card_worker_result(
+        {
+            "final_response": "Card complete.",
+            "tool_result_budget_withheld_count": 2,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "api_calls": 8,
+            "model": "glm-5.2",
+        },
+        duration_seconds=42.0,
+        worker_model="glm-5.2",
+    )
+
+    assert normalized["status"] == "error"
+    assert normalized["summary"] is None
+    assert normalized["error"] == "source_card_tool_output_budget_exhausted:2"
+    assert normalized["tool_results_withheld"] == 2
+
+
+def test_worker_tool_surface_is_minimal_and_fails_closed_when_required_tools_are_off():
+    from gateway.run import _source_card_worker_toolsets
+
+    assert _source_card_worker_toolsets(
+        ["browser", "file", "memory", "terminal", "web"]
+    ) == ["terminal", "file", "web"]
+    with pytest.raises(RuntimeError, match="file"):
+        _source_card_worker_toolsets(["terminal", "web"])
+
+
 @pytest.mark.asyncio
 async def test_bound_url_dispatches_once_without_parent_model_or_skill_loader(
     monkeypatch, tmp_path,
@@ -205,6 +236,7 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
             built["agent_kwargs"] = kwargs
             built["agent"] = self
             self.api_call_count = 0
+            self.tool_result_budget_withheld_count = 0
 
         def run_conversation(self, goal, *, task_id):
             built["run"] = (goal, task_id)
@@ -253,7 +285,7 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
         }
     )
     runner._resolve_enabled_toolsets_for_source = MagicMock(
-        return_value=["web", "terminal"]
+        return_value=["browser", "file", "memory", "terminal", "web"]
     )
     runner._resolve_session_reasoning_config = MagicMock(return_value=None)
     runner._resolve_session_service_tier = MagicMock(return_value=None)
@@ -282,7 +314,8 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     assert kwargs["skip_memory"] is True
     assert kwargs["skip_background_review"] is True
     assert kwargs["tool_result_max_chars"] == 6_000
-    assert built["agent"].tool_result_total_max_chars == 16_000
+    assert built["agent"].tool_result_total_max_chars == 24_000
+    assert kwargs["enabled_toolsets"] == ["terminal", "file", "web"]
     assert kwargs["ephemeral_system_prompt"] == "bounded canonical worker contract"
     assert {"delegation", "skills"}.issubset(kwargs["disabled_toolsets"])
     assert dispatched["delivery_mode"] == "direct"
@@ -296,6 +329,9 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     assert "Do not delegate" in dispatched["goal"]
     assert "Do not restart" in dispatched["goal"]
     assert "8,000 tokens" in dispatched["goal"]
+    assert "Do not read shared context journals" in dispatched["goal"]
+    assert "do not probe another tool" in dispatched["goal"]
+    assert "24,000 emitted tool-result characters" in dispatched["goal"]
     assert "Never call skill_view or delegate_task" in built["skill_args"][2]
 
 
