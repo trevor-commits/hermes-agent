@@ -3459,12 +3459,14 @@ class SessionStore:
         expected_session_id: str,
         carryover_message: Dict[str, Any],
     ) -> Optional[SessionEntry]:
-        """Atomically roll one route after a successful high-context turn.
+        """Atomically roll every alias after a successful high-context turn.
 
         The transcript-drain lock prevents an old-session append from crossing
-        the database transition. The in-memory route and legacy JSON mirror are
-        published only after the database commits; state.db remains
-        authoritative if the optional mirror write then fails.
+        the database transition. Every routing key bound to the parent moves in
+        the same database transaction, so a sibling alias cannot retain the
+        ended parent or lose the fresh child's one-shot auto-skill state. The
+        in-memory routes and legacy JSON mirror publish only after commit;
+        state.db remains authoritative if the optional mirror write then fails.
         """
         db = getattr(self, "_db", None)
         if not db or not session_key or not expected_session_id:
@@ -3491,29 +3493,53 @@ class SessionStore:
                 ):
                     return None
 
+                old_aliases = {
+                    key: entry
+                    for key, entry in self._entries.items()
+                    if entry.session_id == expected_session_id
+                }
+                if session_key not in old_aliases:
+                    return None
+
                 now = _now()
                 new_session_id = (
                     f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
                 )
-                new_entry = SessionEntry(
-                    session_key=session_key,
-                    session_id=new_session_id,
-                    created_at=now,
-                    updated_at=now,
-                    origin=old_entry.origin,
-                    display_name=old_entry.display_name,
-                    platform=old_entry.platform,
-                    chat_type=old_entry.chat_type,
-                    prev_session_id=expected_session_id,
-                    is_fresh_reset=True,
-                    auto_skill_pending=True,
-                    model_override=(
-                        dict(old_entry.model_override)
-                        if old_entry.model_override
-                        else None
-                    ),
-                )
-                new_entry_json = json.dumps(new_entry.to_dict())
+                new_entries: Dict[str, SessionEntry] = {}
+                for alias_key, alias_entry in old_aliases.items():
+                    new_entries[alias_key] = SessionEntry(
+                        session_key=alias_key,
+                        session_id=new_session_id,
+                        created_at=now,
+                        updated_at=now,
+                        origin=alias_entry.origin,
+                        display_name=alias_entry.display_name,
+                        platform=alias_entry.platform,
+                        chat_type=alias_entry.chat_type,
+                        prev_session_id=expected_session_id,
+                        is_fresh_reset=True,
+                        auto_skill_pending=True,
+                        # The parent turn still owns the exact route until its
+                        # normal finally block. Carry that journal marker onto
+                        # the child route so clean completion can clear it and
+                        # an intervening crash remains recoverable. The fresh
+                        # child skill itself is deliberately unclaimed.
+                        active_turn_token=alias_entry.active_turn_token,
+                        active_turn_started_at=(
+                            alias_entry.active_turn_started_at
+                        ),
+                        model_override=(
+                            dict(alias_entry.model_override)
+                            if alias_entry.model_override
+                            else None
+                        ),
+                    )
+                new_entry = new_entries[session_key]
+                new_entries_json = {
+                    key: json.dumps(entry.to_dict())
+                    for key, entry in new_entries.items()
+                }
+                new_entry_json = new_entries_json[session_key]
                 origin_json = None
                 if old_entry.origin is not None:
                     origin_json = json.dumps(old_entry.origin.to_dict())
@@ -3556,12 +3582,13 @@ class SessionStore:
                         source=source_name,
                         session_kwargs=session_kwargs,
                         carryover_message=carryover_message,
+                        new_entries_json=new_entries_json,
                     )
                     if not committed:
                         return None
 
                     # Publish process-local state only after the commit.
-                    self._entries[session_key] = new_entry
+                    self._entries.update(new_entries)
                     reroutes = getattr(self, "_transcript_reroutes", None)
                     if reroutes is None:
                         reroutes = {}
@@ -3579,7 +3606,8 @@ class SessionStore:
                     if fast_entries is None:
                         fast_entries = {}
                         self._fast_persisted_entries = fast_entries
-                    fast_entries[session_key] = (revision, new_entry_json)
+                    for alias_key, alias_entry_json in new_entries_json.items():
+                        fast_entries[alias_key] = (revision, alias_entry_json)
                     mirror_data = {
                         key: entry.to_dict()
                         for key, entry in self._entries.items()
@@ -4137,6 +4165,111 @@ class SessionStore:
             )
         return rebuilt > 0
 
+    def _resolve_transcript_mutation_target_serialized(
+        self,
+        session_id: str,
+    ) -> str:
+        """Resolve and publish the live continuation for a transcript mutation.
+
+        Caller holds ``_transcript_drain_lock``. Walk only unique durable
+        compression/proactive-rollover continuations, then rebind every stale
+        in-process routing alias before any destructive write. An ended parent
+        without one unambiguous live child fails closed.
+        """
+        if not self._db or not session_id:
+            return session_id
+
+        from hermes_state import CompressionSessionClosedError
+
+        reroutes = getattr(self, "_transcript_reroutes", None)
+        if reroutes is None:
+            reroutes = {}
+            self._transcript_reroutes = reroutes
+
+        lineage: List[str] = []
+        current = session_id
+        seen: set[str] = set()
+        while current in reroutes and current not in seen:
+            seen.add(current)
+            lineage.append(current)
+            current = reroutes[current]
+
+        for _ in range(100):
+            if current in seen:
+                raise CompressionSessionClosedError(current)
+            seen.add(current)
+            lineage.append(current)
+            row = self._db.get_session(current)
+            if (
+                row is None
+                or row.get("ended_at") is None
+                or row.get("end_reason")
+                not in {"compression", "proactive_rollover"}
+            ):
+                break
+            child = self._db.find_live_compression_child(current)
+            child_id = str(child.get("id") or "") if child else ""
+            if not child_id:
+                raise CompressionSessionClosedError(current)
+            current = child_id
+        else:
+            raise CompressionSessionClosedError(current)
+
+        target_session_id = current
+        stale_ids = set(lineage)
+        stale_ids.discard(target_session_id)
+        if not stale_ids:
+            return target_session_id
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            template = next(
+                (
+                    candidate
+                    for candidate in self._entries.values()
+                    if candidate.session_id == target_session_id
+                ),
+                None,
+            )
+            previous_entries: Dict[str, SessionEntry] = {}
+            previous_reroutes = dict(reroutes)
+            for key, candidate in list(self._entries.items()):
+                if candidate.session_id not in stale_ids:
+                    continue
+                previous_entries[key] = candidate
+                if template is None:
+                    refreshed = replace(
+                        candidate,
+                        session_id=target_session_id,
+                    )
+                else:
+                    refreshed = replace(
+                        template,
+                        session_key=candidate.session_key,
+                        origin=candidate.origin,
+                        display_name=candidate.display_name,
+                        platform=candidate.platform,
+                        chat_type=candidate.chat_type,
+                        active_turn_token=candidate.active_turn_token,
+                        active_turn_started_at=(
+                            candidate.active_turn_started_at
+                        ),
+                    )
+                self._entries[key] = refreshed
+            for stale_id in stale_ids:
+                reroutes[stale_id] = target_session_id
+            if not previous_entries:
+                return target_session_id
+            try:
+                self._save()
+            except Exception:
+                self._entries.update(previous_entries)
+                reroutes.clear()
+                reroutes.update(previous_reroutes)
+                raise
+
+        return target_session_id
+
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages for a session.
 
@@ -4196,13 +4329,47 @@ class SessionStore:
         """
         if not self._db:
             return True
-        self._clear_dirty_transcript(session_id)
-        try:
-            self._db.replace_messages(session_id, messages, active_only=active_only)
-            return True
-        except Exception as e:
-            logger.debug("Failed to rewrite transcript in DB: %s", e)
-            return False
+        drain_lock = getattr(self, "_transcript_drain_lock", None)
+        if drain_lock is None:
+            drain_lock = threading.RLock()
+            self._transcript_drain_lock = drain_lock
+
+        from hermes_state import CompressionSessionClosedError
+
+        with drain_lock:
+            candidate_session_id = session_id
+            for attempt in range(2):
+                try:
+                    target_session_id = (
+                        self._resolve_transcript_mutation_target_serialized(
+                            candidate_session_id
+                        )
+                    )
+                    self._clear_dirty_transcript(session_id)
+                    if target_session_id != session_id:
+                        self._clear_dirty_transcript(target_session_id)
+                    self._db.replace_messages(
+                        target_session_id,
+                        messages,
+                        active_only=active_only,
+                    )
+                    return True
+                except CompressionSessionClosedError as exc:
+                    # A different process can publish a continuation after our
+                    # first resolution. Re-resolve the exact rejected target
+                    # once; a second rejection fails closed.
+                    candidate_session_id = exc.session_id
+                    if attempt == 0:
+                        continue
+                    logger.warning(
+                        "Failed to rewrite continuation-ended transcript %s",
+                        exc.session_id,
+                    )
+                    return False
+                except Exception as exc:
+                    logger.debug("Failed to rewrite transcript in DB: %s", exc)
+                    return False
+        return False
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript.
@@ -4268,26 +4435,62 @@ class SessionStore:
         """
         if not self._db:
             return None
-        self._clear_dirty_transcript(session_id)
         if n < 1:
             n = 1
-        try:
-            recents = self._db.list_recent_user_messages(session_id, limit=max(n, 10))
-        except Exception as e:
-            logger.debug("rewind_session: failed to list user messages: %s", e)
-            return None
-        if not recents:
-            return None
-        target_idx = min(n - 1, len(recents) - 1)
-        target_id = recents[target_idx]["id"]
-        try:
-            result = self._db.rewind_to_message(session_id, target_id)
-        except ValueError as e:
-            logger.debug("rewind_session: %s", e)
-            return None
-        except Exception as e:
-            logger.debug("rewind_session: rewind_to_message failed: %s", e)
-            return None
+        drain_lock = getattr(self, "_transcript_drain_lock", None)
+        if drain_lock is None:
+            drain_lock = threading.RLock()
+            self._transcript_drain_lock = drain_lock
+
+        from hermes_state import CompressionSessionClosedError
+
+        with drain_lock:
+            candidate_session_id = session_id
+            result = None
+            target_idx = 0
+            for attempt in range(2):
+                try:
+                    target_session_id = (
+                        self._resolve_transcript_mutation_target_serialized(
+                            candidate_session_id
+                        )
+                    )
+                    self._clear_dirty_transcript(session_id)
+                    if target_session_id != session_id:
+                        self._clear_dirty_transcript(target_session_id)
+                    recents = self._db.list_recent_user_messages(
+                        target_session_id,
+                        limit=max(n, 10),
+                    )
+                    if not recents:
+                        return None
+                    target_idx = min(n - 1, len(recents) - 1)
+                    target_id = recents[target_idx]["id"]
+                    result = self._db.rewind_to_message(
+                        target_session_id,
+                        target_id,
+                    )
+                    break
+                except CompressionSessionClosedError as exc:
+                    candidate_session_id = exc.session_id
+                    if attempt == 0:
+                        continue
+                    logger.warning(
+                        "rewind_session: continuation-ended target %s",
+                        exc.session_id,
+                    )
+                    return None
+                except ValueError as exc:
+                    logger.debug("rewind_session: %s", exc)
+                    return None
+                except Exception as exc:
+                    logger.debug(
+                        "rewind_session: rewind_to_message failed: %s",
+                        exc,
+                    )
+                    return None
+            if result is None:
+                return None
         target_msg = result.get("target_message") or {}
         content = target_msg.get("content") or ""
         if isinstance(content, list):

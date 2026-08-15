@@ -2589,10 +2589,17 @@ class GatewaySlashCommandsMixin:
         self._ephemeral_system_prompt = new_prompt
         return t("gateway.personality.set_to", name=name)
 
-    async def _handle_retry_command(self, event: MessageEvent) -> str:
-        """Handle /retry command - re-send the last user message."""
-        source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+    async def _prepare_retry_turn(
+        self,
+        event: MessageEvent,
+        session_entry,
+    ) -> Optional[str]:
+        """Prepare /retry after the resolved session turn lease is held.
+
+        Returns a user-facing error when retry cannot proceed, otherwise
+        rewrites ``event.text`` to the prior user turn and returns ``None``.
+        The caller keeps the same turn lease through the ensuing agent run.
+        """
         history = await self.async_session_store.load_transcript(session_entry.session_id)
         
         # Find the last *real* user message. Timeline bookkeeping rows carry
@@ -2625,23 +2632,29 @@ class GatewaySlashCommandsMixin:
         # #61145). /retry never intends to purge archived history, so avoid a
         # separate existence probe: it could fail open or race with the write.
         truncated = history[:last_user_idx]
-        await self.async_session_store.rewrite_transcript(
+        rewritten = await self.async_session_store.rewrite_transcript(
             session_entry.session_id, truncated, active_only=True
         )
+        if not rewritten:
+            return (
+                "❌ Could not safely prepare the retry because the active "
+                "session changed. Please try /retry again."
+            )
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
 
-        # Re-send by creating a fake text event with the old message
-        retry_event = MessageEvent(
-            text=last_user_msg,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=event.raw_message,
-            channel_prompt=event.channel_prompt,
-        )
-        
-        # Let the normal message handler process it
-        return await self._handle_message(retry_event)
+        event.text = last_user_msg
+        return None
+
+    async def _handle_retry_command(self, event: MessageEvent) -> str:
+        """Compatibility entry point that routes /retry through a real turn.
+
+        Production dispatch marks the event directly and falls through to the
+        normal agent path. Keeping this wrapper for direct callers preserves
+        the same ordering: resolution, turn lease, journal, rewrite, and run.
+        """
+        setattr(event, "_gateway_retry_requested", True)
+        return await self._handle_message(event)
 
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
@@ -3007,7 +3020,90 @@ class GatewaySlashCommandsMixin:
                 n = 1
 
         session_entry = await self.async_session_store.get_or_create_session(source)
-        result = await self.async_session_store.rewind_session(session_entry.session_id, n)
+
+        # /undo mutates the durable transcript, so it must share the same
+        # session-id lease as normal turns and proactive rollover.  A routing
+        # alias can resolve the parent immediately before another alias rolls
+        # it over; re-resolve after acquisition and move the held lease to the
+        # child before touching any rows.  SessionStore's drain lock and DB
+        # ended-parent guard remain the cross-process/final fail-closed layer.
+        lease_registry = getattr(self, "_turn_leases", None)
+        lease_token = None
+        if lease_registry is not None:
+            from gateway.turn_lease import (
+                DEFAULT_LEASE_WAIT,
+                TurnLeaseTimeoutError,
+            )
+            from gateway.run import _float_env
+
+            session_key = session_entry.session_key
+            begin_generation = getattr(
+                self,
+                "_begin_session_run_generation",
+                None,
+            )
+            run_generation = (
+                begin_generation(session_key)
+                if callable(begin_generation)
+                else 0
+            )
+            try:
+                lease_token = await lease_registry.acquire(
+                    session_entry.session_id,
+                    owner_key=session_key,
+                    generation=run_generation,
+                    timeout=_float_env(
+                        "HERMES_TURN_LEASE_TIMEOUT",
+                        DEFAULT_LEASE_WAIT,
+                    ),
+                )
+            except TurnLeaseTimeoutError as exc:
+                logger.warning(
+                    "undo: turn lease timed out for session %s",
+                    exc.session_id,
+                )
+                return (
+                    "⏳ Another turn is still running on this session. "
+                    "To protect the transcript, /undo was not applied. "
+                    "Wait for the active turn to finish, then retry."
+                )
+
+        try:
+            if lease_token is not None:
+                waited_session_id = session_entry.session_id
+                refreshed_entry = await (
+                    self.async_session_store
+                    .resolve_session_after_turn_lease_wait(
+                        session_entry.session_key,
+                        waited_session_id,
+                    )
+                )
+                if refreshed_entry is None:
+                    logger.warning(
+                        "undo: session %s could not be resolved after lease wait",
+                        waited_session_id,
+                    )
+                    return t("gateway.undo.nothing")
+                if refreshed_entry.session_id != waited_session_id:
+                    if not lease_registry.rebind(
+                        lease_token,
+                        refreshed_entry.session_id,
+                    ):
+                        logger.warning(
+                            "undo: failed to rebind turn lease from %s to %s",
+                            waited_session_id,
+                            refreshed_entry.session_id,
+                        )
+                        return t("gateway.undo.nothing")
+                    session_entry = refreshed_entry
+
+            result = await self.async_session_store.rewind_session(
+                session_entry.session_id,
+                n,
+            )
+        finally:
+            if lease_token is not None:
+                lease_registry.release(lease_token)
 
         if result is None:
             return t("gateway.undo.nothing")

@@ -4510,14 +4510,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source: str,
         session_kwargs: Dict[str, Any],
         carryover_message: Dict[str, Any],
+        new_entries_json: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Atomically create and publish one proactive gateway rollover.
 
-        The durable routing row is compare-and-swapped against the exact old
-        session. Child creation, lineage, hidden carryover, parent ending, and
-        route publication commit together. A concurrent route or lifecycle
-        change is a safe no-op; every other exception rolls the transaction
-        back and propagates to the caller.
+        Every durable routing alias is compare-and-swapped against the exact
+        old session. Child creation, lineage, hidden carryover, parent ending,
+        and all route publications commit together. A concurrent route or
+        lifecycle change is a safe no-op; every other exception rolls the
+        transaction back and propagates to the caller.
         """
         if not session_key or not expected_session_id or not new_entry_json:
             return False
@@ -4528,37 +4529,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError("gateway rollover requires a new session_id")
         new_kwargs["parent_session_id"] = expected_session_id
 
-        try:
-            decoded_new_entry = json.loads(new_entry_json)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("gateway rollover requires valid entry JSON") from exc
-        if (
-            not isinstance(decoded_new_entry, dict)
-            or decoded_new_entry.get("session_key") != session_key
-            or decoded_new_entry.get("session_id") != new_session_id
-        ):
-            raise ValueError("gateway rollover entry identity mismatch")
+        requested_entries = dict(
+            new_entries_json or {session_key: new_entry_json}
+        )
+        if session_key not in requested_entries:
+            raise ValueError("gateway rollover entries omit the triggering route")
+        for route_key, route_entry_json in requested_entries.items():
+            try:
+                decoded_new_entry = json.loads(route_entry_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "gateway rollover requires valid entry JSON"
+                ) from exc
+            if (
+                not isinstance(decoded_new_entry, dict)
+                or decoded_new_entry.get("session_key") != route_key
+                or decoded_new_entry.get("session_id") != new_session_id
+            ):
+                raise ValueError("gateway rollover entry identity mismatch")
 
         class _RouteChanged(RuntimeError):
             pass
 
         def _do(conn: sqlite3.Connection) -> bool:
-            route_row = conn.execute(
-                """SELECT entry_json FROM gateway_routing
-                   WHERE scope = ? AND session_key = ?""",
-                (scope, session_key),
-            ).fetchone()
-            if route_row is None:
-                return False
-            expected_entry_json = str(route_row["entry_json"])
-            try:
-                current_entry = json.loads(expected_entry_json)
-            except (TypeError, ValueError):
-                return False
-            if (
-                not isinstance(current_entry, dict)
-                or current_entry.get("session_id") != expected_session_id
-            ):
+            route_rows = conn.execute(
+                """SELECT session_key, entry_json FROM gateway_routing
+                   WHERE scope = ?""",
+                (scope,),
+            ).fetchall()
+            expected_entry_jsons: Dict[str, str] = {}
+            for route_row in route_rows:
+                expected_entry_json = str(route_row["entry_json"])
+                try:
+                    current_entry = json.loads(expected_entry_json)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(current_entry, dict)
+                    and current_entry.get("session_id") == expected_session_id
+                ):
+                    expected_entry_jsons[str(route_row["session_key"])] = (
+                        expected_entry_json
+                    )
+            # The SessionStore snapshot and durable alias set must match
+            # exactly. A missing, added, or independently moved alias is a
+            # route race: roll back rather than strand a parent route.
+            if set(expected_entry_jsons) != set(requested_entries):
                 return False
 
             parent = conn.execute(
@@ -4588,14 +4604,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 expected_session_id,
             ):
                 raise _RouteChanged("gateway rollover parent changed")
-            if not self._update_gateway_rollover_route_tx(
-                conn,
-                scope=scope,
-                session_key=session_key,
-                expected_entry_json=expected_entry_json,
-                new_entry_json=new_entry_json,
-            ):
-                raise _RouteChanged("gateway rollover route changed")
+            for route_key, route_entry_json in requested_entries.items():
+                if not self._update_gateway_rollover_route_tx(
+                    conn,
+                    scope=scope,
+                    session_key=route_key,
+                    expected_entry_json=expected_entry_jsons[route_key],
+                    new_entry_json=route_entry_json,
+                ):
+                    raise _RouteChanged("gateway rollover route changed")
             return True
 
         try:
@@ -8938,7 +8955,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 session is not None
                 and session["ended_at"] is not None
-                and session["end_reason"] == "compression"
+                and session["end_reason"]
+                in {"compression", "proactive_rollover"}
             ):
                 raise CompressionSessionClosedError(session_id)
             if archive_dropped:
@@ -9817,29 +9835,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         target is a no-op on row state but still bumps the counter.
         """
 
-        # 1) Validate target up-front (read-only, outside the write txn).
-        with self._lock:
-            row = self._conn.execute(
+        def _do(conn):
+            # Admission, target validation, soft-delete, counter update, and
+            # new-head selection are one transaction. A rollover that wins
+            # before this transaction makes the ended-parent guard fail
+            # closed; a rollover cannot commit between validation and rewind.
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"]
+                in {"compression", "proactive_rollover"}
+            ):
+                raise CompressionSessionClosedError(session_id)
+
+            row = conn.execute(
                 "SELECT * FROM messages WHERE id = ? AND session_id = ?",
                 (target_message_id, session_id),
             ).fetchone()
-        if row is None:
-            raise ValueError(
-                f"message {target_message_id} not found in session {session_id}"
-            )
-        target_row = dict(row)
-        if target_row.get("role") != "user":
-            raise ValueError(
-                f"rewind target must be a 'user' message (got role="
-                f"{target_row.get('role')!r}, id={target_message_id})"
-            )
+            if row is None:
+                raise ValueError(
+                    f"message {target_message_id} not found in session "
+                    f"{session_id}"
+                )
+            target_row = dict(row)
+            if target_row.get("role") != "user":
+                raise ValueError(
+                    f"rewind target must be a 'user' message (got role="
+                    f"{target_row.get('role')!r}, id={target_message_id})"
+                )
 
-        # Decode content for callers (prefill the prompt buffer).
-        target_row["content"] = self._decode_content(target_row.get("content"))
-
-        rewound: List[int] = []
-
-        def _do(conn):
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
@@ -9857,17 +9885,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ?",
                 (session_id,),
             )
-            return ids
-
-        rewound = self._execute_write(_do)
-
-        # 2) Compute new head id (largest still-active row id in session).
-        with self._lock:
-            head_row = self._conn.execute(
+            head_row = conn.execute(
                 "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
                 (session_id,),
             ).fetchone()
-        new_head_id = head_row[0] if head_row and head_row[0] is not None else None
+            new_head_id = (
+                head_row[0]
+                if head_row and head_row[0] is not None
+                else None
+            )
+            return target_row, ids, new_head_id
+
+        target_row, rewound, new_head_id = self._execute_write(_do)
+        # Decode content for callers (prefill the prompt buffer) only after
+        # the exact transactional row has been returned.
+        target_row["content"] = self._decode_content(target_row.get("content"))
 
         return {
             "rewound_count": len(rewound),

@@ -16747,7 +16747,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return getattr(_blueprint_result, "text", "") or None
 
         if canonical == "retry":
-            return await self._handle_retry_command(event)
+            # /retry is a transcript mutation followed by a normal agent
+            # turn. Mark it and fall through so truncation happens only after
+            # the resolved session's TurnLease is held; recursively preparing
+            # it here used to rewrite a stale proactive-rollover parent before
+            # lease acquisition when two routing aliases raced.
+            setattr(event, "_gateway_retry_requested", True)
         
         if canonical == "undo":
             async def _do_undo():
@@ -17215,6 +17220,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            if getattr(event, "_gateway_skip_goal_continuation", False):
+                return _agent_result
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -18485,6 +18492,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event,
             session_entry.session_key,
         )
+        if getattr(event, "_gateway_retry_requested", False):
+            _retry_error = await self._prepare_retry_turn(event, session_entry)
+            if _retry_error is not None:
+                # This path is command feedback, not an agent completion; the
+                # outer goal judge must not turn a safe retry no-op into a
+                # synthetic continuation.
+                setattr(event, "_gateway_skip_goal_continuation", True)
+                return _retry_error
         _auto = getattr(event, "auto_skill", None)
         _auto_original_text = event.text
         _auto_payload_ready = False
