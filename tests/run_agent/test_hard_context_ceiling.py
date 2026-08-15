@@ -1210,3 +1210,29 @@ def test_multiple_trim_candidates_stop_at_cumulative_target():
 
     assert reclaimed == 600
     assert sum(2_000 - len(row["content"]) for row in rows) == 600
+
+
+def test_trim_mirror_uses_tool_identity_not_shared_content():
+    from agent.context_compressor import truncate_oversized_tool_results
+
+    shared = "same-result" * 500
+    api_rows = [
+        {"role": "tool", "tool_call_id": "first", "content": shared},
+        {"role": "tool", "tool_call_id": "second", "content": shared},
+    ]
+    live_rows = [
+        {"role": "tool", "tool_call_id": "first", "content": shared},
+        {"role": "tool", "tool_call_id": "second", "content": shared},
+    ]
+
+    reclaimed = truncate_oversized_tool_results(
+        api_rows,
+        reclaim_chars=200,
+        mirror=live_rows,
+        keep_head_chars=100,
+    )
+
+    assert reclaimed == 200
+    assert api_rows[0]["content"] == live_rows[0]["content"]
+    assert api_rows[1]["content"] == shared
+    assert live_rows[1]["content"] == shared
