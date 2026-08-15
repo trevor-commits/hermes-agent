@@ -26,6 +26,7 @@ a context-note prepend into the agent's prompt — both wrong for an explicit
 /new or /reset.
 """
 
+import json
 from types import SimpleNamespace
 
 from gateway import run as gateway_run
@@ -117,6 +118,63 @@ class TestVanillaBehaviorUnaffected:
 
 
 class TestAutoSkillPendingClaim:
+    def test_canonical_db_failure_keeps_claim_retryable_across_restart(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A mirror-only claim can never masquerade as durable consumption."""
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        token = store.mark_turn_active(entry.session_key)
+        persisted_generation = store._persisted_routing_generation
+
+        def fail_canonical_write(*_args, **_kwargs):
+            raise OSError("canonical routing unavailable")
+
+        monkeypatch.setattr(
+            store._db,
+            "replace_gateway_routing_entries",
+            fail_canonical_write,
+        )
+
+        assert store.claim_auto_skill_pending(
+            entry.session_key,
+            entry.session_id,
+            active_turn_token=token,
+        ) is False
+        assert store._persisted_routing_generation == persisted_generation
+        assert entry.auto_skill_pending is True
+        assert entry.auto_skill_claim_token is None
+
+        mirror = json.loads(
+            (tmp_path / "sessions.json").read_text(encoding="utf-8")
+        )
+        assert mirror[entry.session_key]["auto_skill_pending"] is True
+
+        restarted = _make_store(tmp_path)
+        restored = restarted.lookup_by_session_key(entry.session_key)
+        assert restored is not None
+        assert restored.auto_skill_pending is True
+        assert restored.auto_skill_claim_token is None
+
+        retry_token = restarted.mark_turn_active(restored.session_key)
+        assert restarted.claim_auto_skill_pending(
+            restored.session_key,
+            restored.session_id,
+            active_turn_token=retry_token,
+        ) is True
+        assert restarted.clear_turn_active(
+            restored.session_key,
+            retry_token,
+        ) is True
+
+        clean_restart = _make_store(tmp_path)
+        consumed = clean_restart.lookup_by_session_key(entry.session_key)
+        assert consumed is not None
+        assert consumed.auto_skill_pending is False
+        assert consumed.auto_skill_claim_token is None
+
     def test_fresh_create_claims_once_and_persists(self, tmp_path):
         store = _make_store(tmp_path)
         source = _make_source()
