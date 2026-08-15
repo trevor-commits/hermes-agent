@@ -509,6 +509,218 @@ def test_successful_rollover_commits_lineage_carryover_end_and_route(tmp_path):
     assert store._db.get_compression_tip(old_entry.session_id) == new_entry.session_id
 
 
+def test_state_replacement_rejects_proactive_rollover_parent(tmp_path):
+    """A stale low-level replace must not erase the durable parent."""
+    store, old_entry = _real_store(tmp_path)
+    store._db.append_message(old_entry.session_id, "user", "parent question")
+    store._db.append_message(old_entry.session_id, "assistant", "parent answer")
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+
+    with pytest.raises(CompressionSessionClosedError):
+        store._db.replace_messages(
+            old_entry.session_id,
+            [{"role": "user", "content": "must not replace parent"}],
+            active_only=True,
+        )
+
+    assert [
+        message["content"]
+        for message in store._db.get_messages(old_entry.session_id)
+    ] == ["parent question", "parent answer"]
+
+
+def test_state_rewind_rejects_proactive_rollover_parent(tmp_path):
+    """A stale low-level rewind must not archive rows on the durable parent."""
+    store, old_entry = _real_store(tmp_path)
+    store._db.append_message(old_entry.session_id, "user", "parent question")
+    store._db.append_message(old_entry.session_id, "assistant", "parent answer")
+    target_id = store._db.get_messages(old_entry.session_id)[0]["id"]
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+
+    with pytest.raises(CompressionSessionClosedError):
+        store._db.rewind_to_message(old_entry.session_id, target_id)
+
+    parent = store._db.get_messages(
+        old_entry.session_id,
+        include_inactive=True,
+    )
+    assert [(message["content"], message["active"]) for message in parent] == [
+        ("parent question", 1),
+        ("parent answer", 1),
+    ]
+
+
+def test_store_rewrite_rebinds_stale_rollover_alias_and_preserves_parent(tmp_path):
+    """Gateway /retry-style rewrites follow the child without touching history."""
+    store, old_entry = _real_store(tmp_path)
+    store._db.append_message(old_entry.session_id, "user", "parent question")
+    store._db.append_message(old_entry.session_id, "assistant", "parent answer")
+    alias = _add_alias(store, old_entry, "retry-alias")
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+
+    assert store.rewrite_transcript(
+        old_entry.session_id,
+        [{"role": "user", "content": "rewritten child"}],
+        active_only=True,
+    ) is True
+
+    assert [
+        message["content"]
+        for message in store._db.get_messages(old_entry.session_id)
+    ] == ["parent question", "parent answer"]
+    assert [
+        message["content"]
+        for message in store._db.get_messages(child.session_id)
+    ] == ["rewritten child"]
+    assert store.lookup_by_session_key(alias.session_key).session_id == child.session_id
+
+    restarted = SessionStore(tmp_path / "sessions", gateway_run.GatewayConfig())
+    assert (
+        restarted.lookup_by_session_key(alias.session_key).session_id
+        == child.session_id
+    )
+
+
+def test_store_rewind_rebinds_stale_rollover_alias_and_rewinds_child(tmp_path):
+    """Gateway /undo follows the live child and leaves the parent immutable."""
+    store, old_entry = _real_store(tmp_path)
+    store._db.append_message(old_entry.session_id, "user", "parent question")
+    store._db.append_message(old_entry.session_id, "assistant", "parent answer")
+    alias = _add_alias(store, old_entry, "undo-alias")
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+    store._db.append_message(child.session_id, "user", "child question")
+    store._db.append_message(child.session_id, "assistant", "child answer")
+
+    result = store.rewind_session(old_entry.session_id)
+
+    assert result is not None
+    assert result["target_text"] == "child question"
+    assert [
+        message["content"]
+        for message in store._db.get_messages(old_entry.session_id)
+    ] == ["parent question", "parent answer"]
+    child_rows = store._db.get_messages(
+        child.session_id,
+        include_inactive=True,
+    )
+    assert [
+        (message["content"], message["active"])
+        for message in child_rows
+        if message["content"] in {"child question", "child answer"}
+    ] == [("child question", 0), ("child answer", 0)]
+    assert store.lookup_by_session_key(alias.session_key).session_id == child.session_id
+
+
+def test_rollover_child_skill_claim_completes_once_across_aliases_and_restart(
+    tmp_path,
+):
+    """Every alias shares the fresh child's one durable auto-skill claim."""
+    store, old_entry = _real_store(tmp_path)
+    alias = _add_alias(store, old_entry, "skill-alias")
+    with store._lock:
+        old_entry.auto_skill_pending = False
+        alias.auto_skill_pending = False
+        store._save()
+
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+    child_alias = store.lookup_by_session_key(alias.session_key)
+    assert child_alias is not None
+    assert child_alias.session_id == child.session_id
+    assert child.auto_skill_pending is True
+    assert child_alias.auto_skill_pending is True
+
+    restarted = SessionStore(tmp_path / "sessions", gateway_run.GatewayConfig())
+    restored = restarted.lookup_by_session_key(old_entry.session_key)
+    restored_alias = restarted.lookup_by_session_key(alias.session_key)
+    assert restored is not None and restored_alias is not None
+    assert restored.session_id == restored_alias.session_id == child.session_id
+    assert restored.auto_skill_pending is True
+    assert restored_alias.auto_skill_pending is True
+
+    token = restarted.mark_turn_active(alias.session_key)
+    assert restarted.claim_auto_skill_pending(
+        alias.session_key,
+        child.session_id,
+        active_turn_token=token,
+    ) is True
+    assert restored.auto_skill_pending is False
+    assert restored_alias.auto_skill_pending is False
+    assert restarted.clear_turn_active(alias.session_key, token) is True
+
+    clean_restart = SessionStore(
+        tmp_path / "sessions",
+        gateway_run.GatewayConfig(),
+    )
+    assert (
+        clean_restart.lookup_by_session_key(old_entry.session_key)
+        .auto_skill_pending
+        is False
+    )
+    assert (
+        clean_restart.lookup_by_session_key(alias.session_key).auto_skill_pending
+        is False
+    )
+
+
+def test_rollover_child_interrupted_skill_claim_rearms_every_alias(tmp_path):
+    """A crash during the first child turn cannot lose or duplicate injection."""
+    store, old_entry = _real_store(tmp_path)
+    alias = _add_alias(store, old_entry, "interrupted-skill-alias")
+    with store._lock:
+        old_entry.auto_skill_pending = False
+        alias.auto_skill_pending = False
+        store._save()
+    child = store.rollover_session_with_carryover(
+        old_entry.session_key,
+        old_entry.session_id,
+        _carryover(),
+    )
+    assert child is not None
+
+    token = store.mark_turn_active(alias.session_key)
+    assert store.claim_auto_skill_pending(
+        alias.session_key,
+        child.session_id,
+        active_turn_token=token,
+    ) is True
+
+    restarted = SessionStore(tmp_path / "sessions", gateway_run.GatewayConfig())
+    assert restarted.recover_interrupted_turns() == 1
+    restored = restarted.lookup_by_session_key(old_entry.session_key)
+    restored_alias = restarted.lookup_by_session_key(alias.session_key)
+    assert restored is not None and restored_alias is not None
+    assert restored.session_id == restored_alias.session_id == child.session_id
+    assert restored.auto_skill_pending is True
+    assert restored_alias.auto_skill_pending is True
+    assert restored.auto_skill_claim_token is None
+    assert restored_alias.auto_skill_claim_token is None
+
+
 def test_proactive_tip_rejects_child_without_matching_marker(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("roll-parent", "telegram")
