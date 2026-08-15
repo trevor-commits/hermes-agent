@@ -122,14 +122,12 @@ def _apply_run_tool_output_budget(
 ) -> Any:
     """Bound the SUM of tool-result chars across one whole run.
 
-    ``tool_result_max_chars`` caps each result on its own, which a long run
-    defeats by simply making more calls — twenty legal 40K results still blow
-    past a 30K-token ceiling. When a run-scoped budget is set, results are
-    admitted until the cumulative total reaches it. The crossing result is
-    shortened to the exact remaining capacity with one marker; later results
-    emit no content. Any affected complete result is persisted before its
-    emitted copy is shortened or withheld. Persistence credit comes only from
-    the explicit receipt produced by the storage layer, never from tool text.
+    ``tool_result_emitted_max_chars`` optionally bounds each model-facing
+    result even when persistence is disabled for that tool (notably
+    ``read_file``). ``tool_result_total_max_chars`` then bounds the whole run.
+    Affected complete results are persisted before their emitted copy is
+    shortened or withheld. Persistence credit comes only from the explicit
+    receipt produced by the storage layer, never from tool text.
 
     No-op when no budget is configured, so the default path is byte-identical.
     """
@@ -188,6 +186,18 @@ def _apply_run_tool_output_budget(
                 and persistence.full_output_persisted
             )
 
+        def _shorten_to_limit(source: str, limit: int, marker: str) -> str:
+            if limit > len(marker):
+                prefix_chars = limit - len(marker)
+                if len(source) < prefix_chars:
+                    source = source + "\n" + serialized_content
+                return source[:prefix_chars] + marker
+            if limit > 0:
+                if len(source) < limit - 1:
+                    source = source + serialized_content
+                return source[: limit - 1] + "…"
+            return ""
+
         if used >= budget:
             _persist_complete()
             withheld = getattr(agent, "tool_result_budget_withheld_count", 0)
@@ -200,6 +210,31 @@ def _apply_run_tool_output_budget(
             )
             agent._tool_result_total_chars_used = budget
             return _result("")
+
+        per_result_budget = getattr(agent, "tool_result_emitted_max_chars", None)
+        if (
+            type(per_result_budget) is int
+            and per_result_budget > 0
+            and emitted_size > per_result_budget
+        ):
+            _persist_complete()
+            source = (
+                truncation_text
+                if isinstance(truncation_text, str) and truncation_text
+                else serialized_content
+            )
+            content = _shorten_to_limit(
+                source,
+                per_result_budget,
+                "\n[tool result truncated: per-result emitted limit]",
+            )
+            serialized_content = content
+            emitted_size = len(content)
+            logger.info(
+                "Tool result exceeded per-result emitted limit (%d chars) — "
+                "persisted full output and truncated model copy",
+                per_result_budget,
+            )
 
         remaining = budget - used
         if emitted_size <= remaining:
@@ -217,19 +252,7 @@ def _apply_run_tool_output_budget(
             if isinstance(truncation_text, str) and truncation_text
             else serialized_content
         )
-        if remaining > len(marker):
-            prefix_chars = remaining - len(marker)
-            if len(source) < prefix_chars:
-                source = source + "\n" + serialized_content
-            emitted = source[:prefix_chars] + marker
-        elif remaining > 0:
-            # A one-character ellipsis is still one unambiguous truncation
-            # marker and lets even a one-character remainder stay exact.
-            if len(source) < remaining - 1:
-                source = source + serialized_content
-            emitted = source[: remaining - 1] + "…"
-        else:
-            emitted = ""
+        emitted = _shorten_to_limit(source, remaining, marker)
         agent._tool_result_total_chars_used = budget
         logger.info(
             "Run tool-output budget reached (%d chars) — truncated crossing result",
