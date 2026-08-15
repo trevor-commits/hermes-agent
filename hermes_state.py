@@ -2642,12 +2642,12 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 
 
 class CompressionSessionClosedError(RuntimeError):
-    """A durable write targeted a parent already closed by compression."""
+    """A durable write targeted a parent with a published continuation."""
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         super().__init__(
-            f"Session {session_id!r} is closed by compression; "
+            f"Session {session_id!r} is closed by a continuation; "
             "adopt its live continuation before appending messages"
         )
 
@@ -5705,11 +5705,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
+        """Return the unique live direct continuation of an ended session.
 
         A stale agent may observe that another compression path already rotated
         its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
+        exactly one live direct continuation. Proactive rollover additionally
+        requires its explicit child markers. Multiple children are treated as
         ambiguous and fail closed rather than guessing which transcript owns
         subsequent messages.
         """
@@ -5723,9 +5724,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 parent is None
                 or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
+                or parent["end_reason"]
+                not in {"compression", "proactive_rollover"}
             ):
                 return None
+            end_reason = str(parent["end_reason"])
             rows = self._conn.execute(
                 """
                 SELECT s.*,
@@ -5735,13 +5738,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
                   AND s.ended_at IS NULL
+                  AND (
+                    ? = 'compression'
+                    OR (
+                      ? = 'proactive_rollover'
+                      AND json_extract(
+                        COALESCE(s.model_config, '{}'),
+                        '$._proactive_rollover'
+                      ) = 1
+                      AND json_extract(
+                        COALESCE(s.model_config, '{}'),
+                        '$._reset_from'
+                      ) = ?
+                    )
+                  )
                 """
                 + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
                 + """
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id, parent_session_id, parent_session_id),
+                (
+                    parent_session_id,
+                    end_reason,
+                    end_reason,
+                    parent_session_id,
+                    parent_session_id,
+                    parent_session_id,
+                ),
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
@@ -9424,7 +9448,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if (
             session is not None
             and session["ended_at"] is not None
-            and session["end_reason"] == "compression"
+            and session["end_reason"] in {"compression", "proactive_rollover"}
         ):
             raise CompressionSessionClosedError(session_id)
 

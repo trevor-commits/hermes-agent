@@ -102,7 +102,13 @@ class TurnLeaseToken:
     release idempotent.
     """
 
-    __slots__ = ("session_id", "owner_key", "generation", "released")
+    __slots__ = (
+        "session_id",
+        "owner_key",
+        "generation",
+        "released",
+        "contended",
+    )
 
     def __init__(
         self,
@@ -114,6 +120,7 @@ class TurnLeaseToken:
         self.owner_key = owner_key
         self.generation = generation
         self.released = False
+        self.contended = False
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
@@ -188,6 +195,16 @@ class SessionTurnLeaseRegistry:
         for sid in idle_ids[:overflow]:
             self._leases.pop(sid, None)
 
+    def has_waiters(self, session_id: str) -> bool:
+        """Return whether another turn is waiting on ``session_id``.
+
+        The current holder is not a waiter. Proactive rollover calls this
+        while it owns the lease so it cannot retire a transcript underneath a
+        second routing alias that already resolved to the same session.
+        """
+        lease = self._leases.get(session_id)
+        return bool(lease is not None and lease.pending_acquires > 0)
+
     async def acquire(
         self,
         session_id: str,
@@ -210,6 +227,7 @@ class SessionTurnLeaseRegistry:
         lease = self._get_or_create(session_id)
 
         if lease.lock.locked():
+            token.contended = True
             holder = lease.holder
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) "
