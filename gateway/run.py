@@ -2748,6 +2748,48 @@ def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
     return {"provider": provider, "model": model}
 
 
+_SOURCE_CARD_PUSH_MAX_ATTEMPTS = 4
+_SOURCE_CARD_PUSH_REJECT_RE = re.compile(
+    r"^\[rejected\] \((stale info|fetch first|non-fast-forward)\)$"
+)
+
+
+def _source_card_push_rejected_authenticated(
+    porcelain_output: str,
+    destination_ref: str,
+) -> bool:
+    """Report an authenticated concurrent-writer rejection for this exact ref.
+
+    Ported from ``scripts/source-card-commit-push`` in the cards repo, which
+    encodes the distinction after analysing 103 capture sessions: only Git's
+    machine-readable status for this exact destination proves the server
+    refused the push. A generic nonzero may mean the server accepted it before
+    the client lost its acknowledgement, so treating that as a safe retry could
+    duplicate work.
+
+    Only the parser is reused. The helper itself is not a drop-in here: it
+    acquires a GLOBAL checkout mutex and presumes a staged card plus a staged
+    ``todo.md``, while this route deliberately lands from an isolated clone
+    that stages only the card.
+    """
+    statuses = 0
+    proved = 0
+    exact = f"{destination_ref}:refs/heads/main"
+    for line in str(porcelain_output or "").splitlines():
+        if "\t" not in line:
+            continue
+        fields = line.split("\t")
+        statuses += 1
+        if (
+            len(fields) >= 3
+            and fields[0] == "!"
+            and fields[1] == exact
+            and _SOURCE_CARD_PUSH_REJECT_RE.fullmatch(fields[2].strip())
+        ):
+            proved += 1
+    return statuses == 1 and proved == 1
+
+
 def _source_card_attestation_error(
     receipt: list[dict],
     *,
@@ -5860,22 +5902,122 @@ def _land_source_card(
                 cwd=landing_repository,
             ).stdout.strip()
             push_error: Optional[_SourceCardLandingError] = None
-            try:
+            # Sync onto the current origin/main BEFORE pushing. The starred-repo
+            # drain pushes card commits to this same branch every ~5 minutes, so
+            # origin routinely advances inside the clone->validate->commit->push
+            # window. Two things then break: the push is stale, and — because the
+            # landing clone is `--depth 1` — the machine's global pre-push
+            # credential gate cannot resolve `remote_sha..local_sha` and fails
+            # the push with a generic error carrying no porcelain status at all.
+            # Unshallowing first keeps that gate working rather than bypassing it.
+            _source_card_run_step(
+                "git_push_sync",
+                ["git", "-C", str(landing_repository), "fetch", "--unshallow", "origin", "main"],
+                cwd=landing_repository,
+                timeout=120,
+                accepted_returncodes=(0, 128),
+            )
+            _source_card_run_step(
+                "git_push_sync",
+                ["git", "-C", str(landing_repository), "fetch", "origin", "main"],
+                cwd=landing_repository,
+                timeout=120,
+            )
+            rebase = _source_card_run_step(
+                "git_push_sync",
+                ["git", "-C", str(landing_repository), "rebase", "origin/main"],
+                cwd=landing_repository,
+                timeout=120,
+                accepted_returncodes=(0, 1, 128),
+            )
+            if rebase.returncode != 0:
                 _source_card_run_step(
-                    "git_push",
-                    [
-                        "git",
-                        "-C",
-                        str(landing_repository),
-                        "push",
-                        "origin",
-                        "HEAD:refs/heads/main",
-                    ],
+                    "git_push_sync",
+                    ["git", "-C", str(landing_repository), "rebase", "--abort"],
                     cwd=landing_repository,
-                    timeout=120,
+                    timeout=60,
+                    accepted_returncodes=(0, 1, 128),
                 )
-            except _SourceCardLandingError as exc:
-                push_error = exc
+                raise _SourceCardLandingError(
+                    "git_push_sync",
+                    "could not rebase the card commit onto current origin/main",
+                )
+            commit = _source_card_run_step(
+                "git_commit",
+                ["git", "-C", str(landing_repository), "rev-parse", "HEAD"],
+                cwd=landing_repository,
+            ).stdout.strip()
+            # Only an AUTHENTICATED rejection for this exact destination is safe
+            # to retry: a generic nonzero may mean the server accepted the push
+            # before the client lost its acknowledgement.
+            for attempt in range(_SOURCE_CARD_PUSH_MAX_ATTEMPTS):
+                push_error = None
+                try:
+                    push_result = _source_card_run_step(
+                        "git_push",
+                        [
+                            "git",
+                            "-C",
+                            str(landing_repository),
+                            "push",
+                            "--porcelain",
+                            "origin",
+                            "HEAD:refs/heads/main",
+                        ],
+                        cwd=landing_repository,
+                        timeout=120,
+                        accepted_returncodes=(0, 1),
+                    )
+                except _SourceCardLandingError as exc:
+                    # A timeout or launch failure is precisely the ambiguous
+                    # case: the server may have accepted the push before the
+                    # client lost its acknowledgement. Never retry it.
+                    push_error = exc
+                    break
+                if push_result.returncode == 0:
+                    break
+                combined = f"{push_result.stdout or ''}\n{push_result.stderr or ''}"
+                push_error = _SourceCardLandingError(
+                    "git_push",
+                    _source_card_safe_landing_detail(combined) or "push rejected",
+                )
+                if attempt == _SOURCE_CARD_PUSH_MAX_ATTEMPTS - 1:
+                    break
+                if not _source_card_push_rejected_authenticated(
+                    push_result.stdout or "", "HEAD"
+                ):
+                    break
+                logger.info(
+                    "Source-card push rejected by a concurrent writer; "
+                    "rebasing onto origin/main (attempt %d)",
+                    attempt + 1,
+                )
+                try:
+                    _source_card_run_step(
+                        "git_push_retry",
+                        ["git", "-C", str(landing_repository), "fetch", "origin", "main"],
+                        cwd=landing_repository,
+                        timeout=120,
+                    )
+                    _source_card_run_step(
+                        "git_push_retry",
+                        [
+                            "git",
+                            "-C",
+                            str(landing_repository),
+                            "rebase",
+                            "origin/main",
+                        ],
+                        cwd=landing_repository,
+                        timeout=120,
+                    )
+                except _SourceCardLandingError:
+                    break
+                commit = _source_card_run_step(
+                    "git_commit",
+                    ["git", "-C", str(landing_repository), "rev-parse", "HEAD"],
+                    cwd=landing_repository,
+                ).stdout.strip()
 
             try:
                 _source_card_run_step(
