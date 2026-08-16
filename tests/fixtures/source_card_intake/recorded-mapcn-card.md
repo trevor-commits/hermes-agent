@@ -82,4 +82,4 @@
 
 ## Decision manifest (ER-278)
 
-- decision-key: card:anmolsaini16-mapcn#adopt-on-first-map-ui-need
+- decision-key: card:anmolsaini16-mapcn.md#adopt-on-first-map-ui-need
