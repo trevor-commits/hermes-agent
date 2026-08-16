@@ -1258,6 +1258,77 @@ def test_receipt_failure_reports_the_already_contained_card(tmp_path):
     ) == summary
 
 
+def test_receipt_preflight_rejects_a_decision_key_without_exact_card_filename(
+    tmp_path,
+):
+    from gateway.run import _SourceCardLandingError, _source_card_fields_and_manifest
+
+    card = tmp_path / "example-card.md"
+    card.write_text(
+        "# Example\n\n"
+        "- url: https://example.com\n"
+        "- owner/name: example/card\n\n"
+        "## Decision manifest (ER-278)\n\n"
+        "- decision-key: card:example-card#adopt\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        _SourceCardLandingError,
+        match="must match card:<flat-card.md>#<choice>",
+    ):
+        _source_card_fields_and_manifest(card)
+
+
+def test_landing_rejects_an_invalid_decision_key_before_push(tmp_path):
+    from gateway.run import _SourceCardLandingError, _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "example-card.md"
+    card.write_text(
+        "# Example\n\n"
+        "- url: https://example.com\n"
+        "- owner/name: example/card\n"
+        "- specific conclusion for this lookup: watch only\n"
+        "- disposition: watch-until: evidence changes\n"
+        "- latest source signal: fixture evidence\n\n"
+        "## Decision manifest (ER-278)\n\n"
+        "- decision-key: card:example-card#adopt\n",
+        encoding="utf-8",
+    )
+    _write_executable(
+        fixture["repo"] / "scripts" / "validate-touched-source-cards",
+        "#!/bin/sh\nexit 0\n",
+    )
+    before = _git(fixture["repo"], "rev-parse", "origin/main")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    with pytest.raises(
+        _SourceCardLandingError,
+        match="must match card:<flat-card.md>#<choice>",
+    ):
+        _land_source_card(
+            card_path=card,
+            intake_text="https://example.com",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    assert _git(fixture["repo"], "rev-parse", "origin/main") == before
+    assert not fixture["decision_log"].exists()
+
+
 def test_landing_rejects_a_dirty_tracked_duplicate_without_absorbing_it(tmp_path):
     from gateway.run import _SourceCardLandingError, _land_source_card
 

@@ -75,4 +75,4 @@
 
 ## Decision manifest (ER-278)
 
-- decision-key: card:igorwarzocha-howaboua-pi-stuff#evaluate-pi-shepherdr-after-source-review
+- decision-key: card:igorwarzocha-howaboua-pi-stuff.md#evaluate-pi-shepherdr-after-source-review
