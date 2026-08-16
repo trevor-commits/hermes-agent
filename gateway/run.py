@@ -5426,11 +5426,13 @@ def _land_source_card(
                         "git_verify",
                         "origin/main card bytes do not match the validated card",
                     )
+                receipt_environment = dict(environment)
+                receipt_environment["cards_root"] = str(landing_cards_root)
                 receipt_commands = _source_card_receipt_commands(
                     card_path=landing_card,
                     commit=commit,
                     intake_text=intake_text,
-                    environment=environment,
+                    environment=receipt_environment,
                     source_message_row_id=source_message_row_id,
                 )
                 receipt_results: list[dict[str, Any]] = []
@@ -5438,7 +5440,7 @@ def _land_source_card(
                     result = _source_card_run_step(
                         "receipt",
                         command,
-                        cwd=repository,
+                        cwd=landing_repository,
                         timeout=180,
                         extra_env={"HERMES_HOME": writer_home},
                     )

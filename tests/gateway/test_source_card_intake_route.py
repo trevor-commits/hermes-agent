@@ -1367,6 +1367,33 @@ def test_landing_uses_isolated_origin_main_when_shared_checkout_is_behind_and_di
     unrelated.write_text("operator-owned pending card\n", encoding="utf-8")
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
     card.write_text(_REPLAY_CARD, encoding="utf-8")
+    _write_executable(
+        fixture["decision_writer"],
+        f"""
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        import subprocess
+        import sys
+
+        args = sys.argv[1:]
+        if args[0] == "receipt-intake":
+            cards_root = pathlib.Path(args[args.index("--cards-root") + 1])
+            commit = args[args.index("--commit") + 1]
+            resolved = subprocess.run(
+                ["git", "-C", str(cards_root), "rev-parse", "--verify", f"{{commit}}^{{{{commit}}}}"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if resolved.returncode:
+                print("receipt commit is absent from cards repository", file=sys.stderr)
+                raise SystemExit(12)
+        with pathlib.Path({str(fixture["decision_log"])!r}).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(args) + "\\n")
+        print(json.dumps({{"ok": True, "command": args[0]}}))
+        """,
+    )
     environment = {
         "cards_root": str(fixture["cards_root"]),
         "source_card_validator": str(
