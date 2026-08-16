@@ -790,6 +790,11 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
                 ),
                 "api_calls": 1,
                 "model": "test-model",
+                # A turn that ran must carry provider attestation; the gateway
+                # fails the landing closed without it.
+                "served_models": [
+                    {"call": 1, "requested": "test-model", "served": "test-model"}
+                ],
                 "turn_exit_reason": "text_response(finish_reason=stop)",
             }
 
@@ -2122,7 +2127,10 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     )
     provider_response = SimpleNamespace(
         choices=[SimpleNamespace(message=provider_message, finish_reason="stop")],
-        model="offline-replay",
+        # A healthy provider reports back the model it was asked for. The
+        # attestation gate fails the landing closed when it does not, so this
+        # must match the model the runtime resolver hands the worker.
+        model="openai/gpt-4o-mini",
         usage=None,
     )
     provider_client = MagicMock()
@@ -2736,3 +2744,106 @@ def test_absent_worker_pin_leaves_the_session_runtime_untouched():
         "session-model", runtime, {"agent": {}}
     )
     assert (model, resolved, pin) == ("session-model", runtime, None)
+
+
+# --- served-model attestation gate -------------------------------------------
+#
+# Four gaps had to close before "fail closed on mismatch" meant anything:
+#   (a) the predicate is judged per call against the route AS OF that call,
+#       because `agent.model` is legitimately reassigned on a provider switch;
+#   (b) the duplicate short-circuit runs NO turn at all, so it must be exempt
+#       or every duplicate fails closed;
+#   (c) the success and error paths disagreed about which model to report, and
+#       the error path (post-fallback) was the accurate one;
+#   (d) a receipt is a SET, not a scalar - live rows show 16-20 calls per turn.
+
+
+def test_attestation_gate_passes_a_fully_attested_turn():
+    from gateway.run import _source_card_attestation_error
+
+    assert (
+        _source_card_attestation_error(
+            [
+                {"call": 1, "requested": "glm-5.3", "served": "glm-5.3"},
+                {"call": 2, "requested": "glm-5.3", "served": "zai/glm-5.3"},
+            ],
+            ran_turn=True,
+        )
+        is None
+    )
+
+
+def test_attestation_gate_fails_closed_on_a_substitution():
+    from gateway.run import _source_card_attestation_error
+
+    error = _source_card_attestation_error(
+        [{"call": 1, "requested": "glm-5.2", "served": "glm-5.3"}],
+        ran_turn=True,
+    )
+    assert error is not None
+    assert error.startswith("source_card_model_attestation_failed:")
+    assert "glm-5.2" in error and "glm-5.3" in error
+
+
+def test_attestation_gate_fails_closed_when_nothing_was_attested():
+    """A turn that ran but reported no served model is unattested, not clean."""
+    from gateway.run import _source_card_attestation_error
+
+    assert _source_card_attestation_error([], ran_turn=True) is not None
+    assert (
+        _source_card_attestation_error(
+            [{"call": 1, "requested": "glm-5.3", "served": None}], ran_turn=True
+        )
+        is not None
+    )
+
+
+def test_attestation_gate_exempts_the_duplicate_path():
+    """The duplicate short-circuit runs no model turn, so there is nothing to attest."""
+    from gateway.run import _source_card_attestation_error
+
+    assert _source_card_attestation_error([], ran_turn=False) is None
+
+
+def test_attestation_gate_reports_every_mismatched_call_not_just_the_last():
+    from gateway.run import _source_card_attestation_error
+
+    error = _source_card_attestation_error(
+        [
+            {"call": 1, "requested": "glm-5.3", "served": "glm-5.3"},
+            {"call": 2, "requested": "glm-5.3", "served": "glm-5.4"},
+            {"call": 3, "requested": "glm-5.3", "served": None},
+        ],
+        ran_turn=True,
+    )
+    assert "call 2" in error and "call 3" in error
+    assert "call 1" not in error
+
+
+def test_attestation_receipt_flows_from_the_real_conversation_loop():
+    """The loop records what the provider said, with no lifecycle hook present.
+
+    The only pre-existing read of `response.model` sat behind `has_hook`, so
+    with no hook registered nothing carried the served model out of the loop.
+    """
+    from types import SimpleNamespace as NS
+
+    from agent.served_model import (
+        record_served_model,
+        reset_served_models,
+        served_model_receipt,
+    )
+
+    agent = NS(model="glm-5.3")
+    reset_served_models(agent)
+    for served in ("glm-5.3", "zai/glm-5.3", "glm-5.4"):
+        record_served_model(agent, requested=agent.model, response=NS(model=served))
+
+    receipt = served_model_receipt(agent)
+    assert len(receipt) == 3
+    from gateway.run import _source_card_attestation_error
+
+    error = _source_card_attestation_error(receipt, ran_turn=True)
+    assert error is not None
+    assert "call 3" in error and "glm-5.4" in error
+    assert "call 1" not in error and "call 2" not in error
