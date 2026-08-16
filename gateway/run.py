@@ -46,6 +46,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -2745,6 +2746,47 @@ def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
             "auxiliary.source_card_worker requires both provider and model"
         )
     return {"provider": provider, "model": model}
+
+
+def _source_card_attestation_error(
+    receipt: list[dict],
+    *,
+    ran_turn: bool,
+) -> Optional[str]:
+    """Return a fail-closed error when the served model was not what was asked.
+
+    ``ran_turn`` is False for the duplicate short-circuit, which lands a
+    pre-existing card with no model turn at all: there is nothing to attest, so
+    requiring a receipt there would fail closed on every duplicate.
+
+    A turn that ran but produced no receipt is *unattested*, which is a
+    failure — never a clean pass by omission. Each call is judged against the
+    model requested for THAT call, because ``agent.model`` is legitimately
+    reassigned on a provider switch and a turn-level scalar comparison would
+    flag every legitimate fallback.
+    """
+    if not ran_turn:
+        return None
+    try:
+        from agent.served_model import served_model_mismatches
+    except Exception:
+        return "source_card_model_attestation_failed:attestation unavailable"
+    if not receipt:
+        return (
+            "source_card_model_attestation_failed:"
+            "no provider-attested model was recorded for this turn"
+        )
+    mismatches = served_model_mismatches(
+        types.SimpleNamespace(_served_model_receipt=list(receipt))
+    )
+    if not mismatches:
+        return None
+    detail = "; ".join(
+        f"call {row.get('call')} requested {row.get('requested')!r} "
+        f"served {row.get('served')!r}"
+        for row in mismatches
+    )
+    return f"source_card_model_attestation_failed:{detail}"
 
 
 def _apply_source_card_worker_pin(
@@ -20921,6 +20963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             card_path = duplicate_matches[0] if duplicate_matches else None
             worker_result_chars = 0
             worker_result_bytes = 0
+            served_receipt: list[dict] = []
             worker_effective_system = worker_system
             api_calls = 0
             generated_card_draft = False
@@ -20999,6 +21042,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result["tool_result_budget_withheld_count"] = int(
                         getattr(agent, "tool_result_budget_withheld_count", 0) or 0
                     )
+                    # Gap (c): the success path reported the BUILD-time model
+                    # while the error path reported the post-fallback
+                    # `agent.model`. The error path was the accurate one, so
+                    # both now report what the agent actually ended up on.
+                    served_receipt = list(result.get("served_models") or [])
+                    worker_model = (
+                        result.get("model")
+                        or getattr(agent, "model", None)
+                        or worker_model
+                    )
+                    attestation_error = _source_card_attestation_error(
+                        served_receipt, ran_turn=True
+                    )
+                    if attestation_error:
+                        logger.error(
+                            "Source-card worker attestation failed: %s",
+                            attestation_error,
+                        )
+                        return {
+                            "status": "error",
+                            "summary": None,
+                            "error": attestation_error,
+                            "api_calls": int(result.get("api_calls") or 0),
+                            "duration_seconds": round(
+                                time.monotonic() - started, 2
+                            ),
+                            "model": worker_model,
+                            "served_models": served_receipt,
+                            **_metrics(),
+                        }
                     final_response = str(result.get("final_response") or "").strip()
                     worker_result_chars = len(final_response)
                     worker_result_bytes = len(final_response.encode("utf-8"))
@@ -21041,6 +21114,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "api_calls": api_calls,
                     "duration_seconds": round(time.monotonic() - started, 2),
                     "model": worker_model,
+                    "served_models": served_receipt,
                     "card_path": landing["path"],
                     "commit": landing["commit"],
                     "tool_results_withheld": 0,
