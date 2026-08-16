@@ -4679,6 +4679,79 @@ def _source_card_candidate_path(cards_root: Path, raw_path: str) -> Path:
     return candidate
 
 
+def _source_card_typed_analysis(raw: Any) -> Optional[dict[str, Any]]:
+    """Validate the worker's typed routing decision, or reject it outright.
+
+    Rendering can only salvage a readable leading token from prose. A value
+    such as `probably worth a look someday` has none, so the routing decision
+    is taken as typed data instead: an enum and a slug list, checked here
+    against the validator's grammar and never guessed at.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "hermes_relevance",
+        "downstream_learning_targets",
+    }:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "analysis must contain only hermes_relevance and "
+            "downstream_learning_targets",
+        )
+    relevance = raw.get("hermes_relevance")
+    if not isinstance(relevance, str):
+        raise _SourceCardLandingError(
+            "worker_output", "analysis.hermes_relevance must be a string"
+        )
+    relevance = relevance.strip()
+    none_match = _SOURCE_CARD_NONE_PREFIX_RE.fullmatch(relevance)
+    if not none_match and relevance not in _SOURCE_CARD_HERMES_RELEVANCE_VALUES:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "analysis.hermes_relevance must be direct, adjacent, "
+            "upgrade-candidate, or none: <reason>",
+        )
+    targets = raw.get("downstream_learning_targets")
+    if not isinstance(targets, list) or not targets or len(targets) > 16:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "analysis.downstream_learning_targets must be a list of 1-16 slugs",
+        )
+    slugs: list[str] = []
+    for item in targets:
+        if not isinstance(item, str) or not _SOURCE_CARD_DOWNSTREAM_TARGET_RE.fullmatch(
+            item.strip()
+        ):
+            raise _SourceCardLandingError(
+                "worker_output",
+                "analysis.downstream_learning_targets contains an invalid slug",
+            )
+        if item.strip() not in slugs:
+            slugs.append(item.strip())
+    return {"hermes relevance": relevance, "downstream learning targets": slugs}
+
+
+def _source_card_apply_typed_analysis(
+    content: str,
+    analysis: dict[str, Any],
+) -> str:
+    """Overwrite the card's routing field lines from the typed decision."""
+    rendered = {
+        "hermes relevance": str(analysis["hermes relevance"]),
+        "downstream learning targets": ", ".join(
+            analysis["downstream learning targets"]
+        ),
+    }
+    field_re = re.compile(
+        r"(?im)^(-\s*(hermes relevance|downstream learning targets)\s*:\s*)(.*)$"
+    )
+
+    def _substitute(match: "re.Match[str]") -> str:
+        return match.group(1) + rendered[match.group(2).strip().lower()]
+
+    return field_re.sub(_substitute, content)
+
+
 def _parse_source_card_worker_draft(
     final_response: str,
     cards_root: Path,
@@ -4696,11 +4769,14 @@ def _parse_source_card_worker_draft(
             "worker_output",
             "worker did not return valid JSON",
         ) from exc
-    if not isinstance(payload, dict) or set(payload) != {"card_path", "card_content"}:
+    if not isinstance(payload, dict) or not {"card_path", "card_content"} <= set(
+        payload
+    ) or set(payload) - {"card_path", "card_content", "analysis"}:
         raise _SourceCardLandingError(
             "worker_output",
-            "worker JSON must contain only card_path and card_content",
+            "worker JSON must contain only card_path, card_content and analysis",
         )
+    analysis = _source_card_typed_analysis(payload.get("analysis"))
     path = _source_card_candidate_path(cards_root, payload.get("card_path"))
     content = payload.get("card_content")
     if (
@@ -4723,6 +4799,8 @@ def _parse_source_card_worker_draft(
             "write",
             "worker attempted to overwrite an existing card",
         )
+    if analysis is not None:
+        content = _source_card_apply_typed_analysis(content, analysis)
     return path, content
 
 
@@ -4918,35 +4996,114 @@ def _source_card_selected_x_post(
     return matches
 
 
-def _source_card_normalize_routing_field(field_name: str, value: str) -> str:
-    """Strip explanatory prose from the validator's token-only routing fields."""
-    separator = r"(?:\s*:\s*|\s+[\u2013\u2014-]\s+|\.\s+)"
-    if field_name == "hermes relevance":
-        for token in ("direct", "adjacent", "upgrade-candidate"):
-            if re.fullmatch(
-                rf"{re.escape(token)}{separator}\S.*",
-                value,
+_SOURCE_CARD_HERMES_RELEVANCE_VALUES = ("upgrade-candidate", "adjacent", "direct")
+_SOURCE_CARD_DOWNSTREAM_TARGET_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SOURCE_CARD_NONE_PREFIX_RE = re.compile(r"(?i)^none\s*:\s*(\S.*)$")
+
+
+def _source_card_render_routing_fields(
+    relevance: str,
+    targets: str,
+) -> tuple[str, str]:
+    """Render the two token-only routing fields into the validator's grammar.
+
+    The grammar is closed: `hermes relevance` is `direct`, `adjacent`,
+    `upgrade-candidate`, or `none: <reason>`, and every downstream target is a
+    ``[a-z0-9][a-z0-9-]*`` slug unless the whole value is `none: <reason>`.
+
+    Prose is removed by reading the LEADING token of each value, not by
+    matching a separator. The previous separator-shaped form only stripped
+    text after `:`, ` - `, or `. `, so `adjacent because ...`,
+    `adjacent (...)`, and `Adjacent, ...` all reached the validator intact and
+    each cost one live intake. Anything with no readable leading token is
+    returned untouched so the validator reports it, rather than being guessed.
+
+    The cross-field rule is enforced here as well: an enum relevance requires
+    the bare `hermes` target, and a `none:` relevance forbids it.
+    """
+    rendered_relevance = str(relevance or "").strip()
+    none_match = _SOURCE_CARD_NONE_PREFIX_RE.fullmatch(rendered_relevance)
+    if none_match:
+        rendered_relevance = f"none: {none_match.group(1).strip()}"
+    else:
+        for token in _SOURCE_CARD_HERMES_RELEVANCE_VALUES:
+            if re.match(
+                rf"{re.escape(token)}(?![a-z0-9-])",
+                rendered_relevance,
                 flags=re.IGNORECASE,
             ):
-                return token
-        return value
-    if field_name != "downstream learning targets":
-        return value
+                rendered_relevance = token
+                break
 
-    normalized_targets: list[str] = []
-    changed = False
-    for target in value.split(","):
-        stripped = target.strip()
-        if re.fullmatch(
-            rf"hermes{separator}\S.*",
-            stripped,
-            flags=re.IGNORECASE,
-        ):
-            normalized_targets.append("hermes")
-            changed = True
-        else:
-            normalized_targets.append(stripped)
-    return ", ".join(normalized_targets) if changed else value
+    raw_targets = str(targets or "").strip()
+    targets_none = _SOURCE_CARD_NONE_PREFIX_RE.fullmatch(raw_targets)
+    slugs: list[str] = []
+    if not targets_none:
+        for chunk in raw_targets.split(","):
+            match = _SOURCE_CARD_DOWNSTREAM_TARGET_RE.match(chunk.strip().lower())
+            if match and match.group(0) not in slugs:
+                slugs.append(match.group(0))
+
+    is_enum = rendered_relevance in _SOURCE_CARD_HERMES_RELEVANCE_VALUES
+    is_none = rendered_relevance.lower().startswith("none:")
+    if is_enum:
+        if "hermes" in slugs:
+            slugs.remove("hermes")
+        slugs.insert(0, "hermes")
+    elif is_none and "hermes" in slugs:
+        slugs.remove("hermes")
+
+    if targets_none and not is_enum:
+        rendered_targets = f"none: {targets_none.group(1).strip()}"
+    elif slugs:
+        rendered_targets = ", ".join(slugs)
+    elif is_none:
+        reason = rendered_relevance.split(":", 1)[1].strip() or "no downstream target"
+        rendered_targets = f"none: {reason}"
+    else:
+        rendered_targets = raw_targets
+    return rendered_relevance, rendered_targets
+
+
+def _source_card_render_card_routing(content: str) -> str:
+    """Apply :func:`_source_card_render_routing_fields` to one card's text.
+
+    Called on every landing path \u2014 generated draft and pre-existing duplicate
+    alike \u2014 so a card can never reach the validator with prose in a token-only
+    field just because no model turn ran for it.
+    """
+    field_re = re.compile(r"(?im)^(-\s*(hermes relevance|downstream learning targets)\s*:\s*)(.*)$")
+    found: dict[str, str] = {}
+    for match in field_re.finditer(content):
+        found.setdefault(match.group(2).strip().lower(), match.group(3).strip())
+    if not found:
+        return content
+    rendered_relevance, rendered_targets = _source_card_render_routing_fields(
+        found.get("hermes relevance", ""),
+        found.get("downstream learning targets", ""),
+    )
+    rendered = {
+        "hermes relevance": rendered_relevance,
+        "downstream learning targets": rendered_targets,
+    }
+
+    def _substitute(match: "re.Match[str]") -> str:
+        name = match.group(2).strip().lower()
+        value = rendered.get(name)
+        if value is None or name not in found:
+            return match.group(0)
+        return match.group(1) + value
+
+    return field_re.sub(_substitute, content)
+
+
+def _source_card_normalize_routing_field(field_name: str, value: str) -> str:
+    """Render one routing field in isolation, preserving the other."""
+    if field_name == "hermes relevance":
+        return _source_card_render_routing_fields(value, "hermes")[0]
+    if field_name == "downstream learning targets":
+        return _source_card_render_routing_fields("adjacent", value)[1]
+    return value
 
 
 def _finalize_source_card_worker_draft(
@@ -5021,13 +5178,9 @@ def _finalize_source_card_worker_draft(
         if field:
             field_name = field.group(2).strip().lower()
             value = field.group(3).strip()
-            normalized_routing_value = _source_card_normalize_routing_field(
-                field_name,
-                value,
-            )
-            if normalized_routing_value != value:
-                output.append(field.group(1) + normalized_routing_value)
-                continue
+            # Routing fields are rendered once over the whole card below, not
+            # per line: the two are cross-dependent, so rendering one without
+            # the other's value guesses at the cross-field rule.
             if in_manifest and field_name == "decision-key" and (
                 not value or value.upper().startswith("TODO:")
             ):
@@ -5059,7 +5212,7 @@ def _finalize_source_card_worker_draft(
                 continue
         output.append(line)
 
-    finalized = "\n".join(output).rstrip() + "\n"
+    finalized = _source_card_render_card_routing("\n".join(output).rstrip() + "\n")
     if re.search(r"(?i)\bTODO:", finalized):
         raise _SourceCardLandingError(
             "worker_output",
@@ -5398,6 +5551,21 @@ def _land_source_card(
             raise _SourceCardLandingError(
                 "validate", "card_content exceeded the configured byte limit"
             )
+    # Bytes exactly as read from the shared checkout, kept so the read-time
+    # TOCTOU guard below still compares like with like after rendering.
+    shared_source_bytes = card_bytes if shared_card is not None else None
+    # Render the token-only routing fields here, not only in the draft
+    # finalizer, so the duplicate path cannot land un-rendered prose. The
+    # duplicate path runs no model turn at all, so every model-output guard is
+    # skipped for it by construction.
+    try:
+        rendered_bytes = _source_card_render_card_routing(
+            card_bytes.decode("utf-8")
+        ).encode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _SourceCardLandingError(
+            "validate", "card is not valid UTF-8"
+        ) from exc
     validator = Path(environment["source_card_validator"]).resolve(strict=True)
     try:
         validator_relative = validator.relative_to(repository)
@@ -5443,6 +5611,16 @@ def _land_source_card(
                     "git_clean",
                     "dirty tracked card requires operator reconciliation",
                 )
+            if rendered_bytes != card_bytes:
+                # Already committed and outside the validator's routing
+                # grammar. Rewriting another actor's landed card during an
+                # unrelated intake is out of scope, so fail closed and name it.
+                raise _SourceCardLandingError(
+                    "validate",
+                    "tracked card is outside the validator routing grammar; "
+                    "operator reconciliation required",
+                )
+        card_bytes = rendered_bytes
         with _source_card_isolated_landing_repository(repository) as landing_repository:
             landing_cards_root = landing_repository / cards_root.name
             if landing_cards_root.exists():
@@ -5510,7 +5688,10 @@ def _land_source_card(
                     "validate",
                     "isolated card bytes changed during validation",
                 )
-            if shared_card is not None and shared_card.read_bytes() != card_bytes:
+            if (
+                shared_card is not None
+                and shared_card.read_bytes() != shared_source_bytes
+            ):
                 raise _SourceCardLandingError(
                     "validate",
                     "shared card bytes changed during validation",
@@ -20513,12 +20694,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "`direct`, `adjacent`, or `upgrade-candidate` Hermes relevance requires "
             "the bare `hermes` token in downstream learning targets; a `none:` "
             "downstream target requires `none:` Hermes relevance.\n"
-            "Return exactly one JSON object with only card_path and card_content. "
-            "Do not use Markdown fences or add prose around the JSON. card_path must "
-            "be one absolute lowercase flat .md path directly inside cards_root. "
-            "card_content must be the complete strict source card with exactly one "
-            "ER-278 decision manifest. The gateway writes, validates, commits, pushes, "
-            "receipts, and verifies the card after this response.\n\n"
+            "Return exactly one JSON object with only card_path, card_content and "
+            "analysis. Do not use Markdown fences or add prose around the JSON. "
+            "card_path must be one absolute lowercase flat .md path directly inside "
+            "cards_root. card_content must be the complete strict source card with "
+            "exactly one ER-278 decision manifest. analysis carries the routing "
+            "decision as data, not prose: analysis.hermes_relevance is exactly "
+            "`direct`, `adjacent`, `upgrade-candidate`, or `none: <reason>`, and "
+            "analysis.downstream_learning_targets is a list of bare repo slugs "
+            "matching [a-z0-9][a-z0-9-]*. The gateway renders those two fields from "
+            "analysis, so explanation belongs in the card body, never in them. The "
+            "gateway writes, validates, commits, pushes, receipts, and verifies the "
+            "card after this response.\n\n"
             "TRUSTED WORKER ENVIRONMENT (JSON)\n"
             f"{environment_json}\n\n"
             "TRUSTED DUPLICATE LOOKUP RESULT (JSON)\n"
