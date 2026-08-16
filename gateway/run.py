@@ -2708,6 +2708,71 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
+    """Return the pinned provider/model for the source-card worker, if set.
+
+    ``_resolve_session_agent_runtime`` is a five-layer stack in which the
+    config model is the lowest input, so a ``config.yaml`` model is not a pin
+    for this route: a session ``/model`` carrying an api_key returns early and
+    discards it, ``_resolve_runtime_agent_kwargs()`` displaces it with
+    ``runtime_model`` with no session or channel override involved, a channel
+    override replaces it again, and ``_apply_session_model_override``
+    re-applies on top.
+
+    ``auxiliary.source_card_worker`` is the same per-role mechanism the config
+    already uses for vision, web_extract, compression and the rest. Note that
+    the env-var bridging loop carries a hardcoded allowlist and will not bridge
+    this key, so the block is read directly.
+
+    A half-written block raises rather than silently falling back to the
+    session model, because an unattested model is exactly the condition this
+    pin exists to prevent.
+    """
+    auxiliary = user_config.get("auxiliary") if isinstance(user_config, dict) else None
+    if not isinstance(auxiliary, dict):
+        return None
+    block = auxiliary.get("source_card_worker")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise RuntimeError(
+            "auxiliary.source_card_worker must be a mapping with provider and model"
+        )
+    provider = str(block.get("provider") or "").strip()
+    model = str(block.get("model") or "").strip()
+    if not provider or not model:
+        raise RuntimeError(
+            "auxiliary.source_card_worker requires both provider and model"
+        )
+    return {"provider": provider, "model": model}
+
+
+def _apply_source_card_worker_pin(
+    model: str,
+    runtime_kwargs: dict,
+    user_config: dict,
+) -> tuple[str, dict, Optional[dict[str, str]]]:
+    """Override a session-resolved model with the source-card route pin.
+
+    Applied AFTER the session stack has resolved, because every layer of that
+    stack outranks the config model. Only the model and its provider
+    credentials are replaced; ``_resolve_session_agent_runtime`` itself is left
+    alone because it has eight call sites.
+
+    Returns the pin so the caller can also route-scope the fallback chain: the
+    global chain would otherwise carry the worker onto an unpinned model on the
+    first provider failure and silently defeat this.
+    """
+    pin = _source_card_worker_pin(user_config)
+    if not pin:
+        return model, runtime_kwargs, None
+    return (
+        pin["model"],
+        _resolve_runtime_agent_kwargs_for_provider(pin["provider"]),
+        pin,
+    )
+
+
 def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
@@ -20747,6 +20812,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_entry.session_key,
                 user_config=user_config,
             )
+            model, runtime_kwargs, worker_pin = _apply_source_card_worker_pin(
+                model, runtime_kwargs, user_config
+            )
             if not runtime_kwargs.get("api_key"):
                 raise RuntimeError("no provider credentials configured")
             turn_route = self._resolve_turn_agent_config(
@@ -20812,7 +20880,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=source.thread_id,
                 gateway_session_key=session_entry.session_key,
                 session_db=getattr(self._session_db, "_db", self._session_db),
-                fallback_model=self._refresh_fallback_model(),
+                # Route-scoped: _refresh_fallback_model() re-reads the GLOBAL
+                # chain, so the first provider failure would drop this worker
+                # onto an unpinned model and silently defeat the pin above.
+                fallback_model=(
+                    None if worker_pin else self._refresh_fallback_model()
+                ),
                 skip_context_files=True,
                 load_soul_identity=False,
                 skip_memory=True,

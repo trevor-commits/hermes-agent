@@ -2653,3 +2653,86 @@ def test_finalizer_substitutes_embedded_todo_values(tmp_path):
     )
     assert "TODO:" not in finalized
     assert "- risk signal: " in finalized
+
+
+# --- worker model pin --------------------------------------------------------
+#
+# `_resolve_session_agent_runtime` is a five-layer stack in which the config
+# model is the LOWEST input: a session `/model` carrying an api_key returns
+# early and discards it, `_resolve_runtime_agent_kwargs()` displaces it with
+# `runtime_model` with no session or channel override involved, a channel
+# override replaces it again, and `_apply_session_model_override` re-applies on
+# top. Pinning `config.yaml` therefore does NOT pin this route. The pin is read
+# from `auxiliary.source_card_worker`, the same per-role mechanism the config
+# already uses for vision, web_extract, compression and the rest.
+
+
+def test_source_card_worker_pin_is_read_from_auxiliary_config():
+    from gateway.run import _source_card_worker_pin
+
+    pin = _source_card_worker_pin(
+        {
+            "auxiliary": {
+                "source_card_worker": {"provider": "zai", "model": "glm-5.3"},
+                "vision": {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+            }
+        }
+    )
+    assert pin == {"provider": "zai", "model": "glm-5.3"}
+
+
+def test_source_card_worker_pin_absent_returns_none():
+    from gateway.run import _source_card_worker_pin
+
+    assert _source_card_worker_pin({"auxiliary": {"vision": {"model": "x"}}}) is None
+    assert _source_card_worker_pin({}) is None
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"provider": "zai"},
+        {"model": "glm-5.3"},
+        {"provider": "", "model": "glm-5.3"},
+        {"provider": "zai", "model": ""},
+        "glm-5.3",
+    ],
+)
+def test_incomplete_source_card_worker_pin_fails_closed(block):
+    """A half-written pin must not silently fall back to the session model."""
+    from gateway.run import _source_card_worker_pin
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _source_card_worker_pin({"auxiliary": {"source_card_worker": block}})
+    assert "source_card_worker" in str(excinfo.value)
+
+
+def test_worker_pin_overrides_the_session_resolved_model(monkeypatch):
+    """The pin outranks whatever the five-layer session stack produced."""
+    import gateway.run as gateway_run
+    from gateway.run import _apply_source_card_worker_pin
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {"api_key": f"key-for-{provider}", "provider": provider},
+    )
+    model, runtime, pin = _apply_source_card_worker_pin(
+        "session-override-model",
+        {"api_key": "session-key", "provider": "openrouter"},
+        {"auxiliary": {"source_card_worker": {"provider": "zai", "model": "glm-5.3"}}},
+    )
+    assert model == "glm-5.3"
+    assert runtime["provider"] == "zai"
+    assert runtime["api_key"] == "key-for-zai"
+    assert pin == {"provider": "zai", "model": "glm-5.3"}
+
+
+def test_absent_worker_pin_leaves_the_session_runtime_untouched():
+    from gateway.run import _apply_source_card_worker_pin
+
+    runtime = {"api_key": "session-key", "provider": "openrouter"}
+    model, resolved, pin = _apply_source_card_worker_pin(
+        "session-model", runtime, {"agent": {}}
+    )
+    assert (model, resolved, pin) == ("session-model", runtime, None)
