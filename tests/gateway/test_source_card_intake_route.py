@@ -7,8 +7,11 @@ to interpret the router prompt.
 
 import json
 import os
+import sqlite3
 import subprocess
 import threading
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +25,7 @@ from tests.gateway.test_42039_duplicate_user_message import (
 )
 
 
-def _event(*, text="https://example.invalid/post", route="source-card-intake"):
+def _event(*, text="https://github.com/example/repo", route="source-card-intake"):
     return MessageEvent(
         text=text,
         source=_source(),
@@ -42,8 +45,40 @@ def _write_worker_environment(home):
     x_lookup = home / "scripts" / "x-lookup"
     x_lookup.write_text("#!/bin/sh\n", encoding="utf-8")
     x_lookup.chmod(0o755)
+    new_source_card = home / "scripts" / "new-source-card"
+    new_source_card.write_text(
+        "#!/bin/sh\nprintf '# gateway/source-card\\n\\n- url: TODO\\n- owner/name: TODO\\n- by: TODO\\n\\n## Decision manifest (ER-278)\\n- decision-key: TODO\\n'\n",
+        encoding="utf-8",
+    )
+    new_source_card.chmod(0o755)
+    validator = home / "scripts" / "validate-touched-source-cards"
+    validator.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    validator.chmod(0o755)
+    source_card_prefetch = home / "scripts" / "source-card-prefetch"
+    source_card_prefetch.write_text(
+        "#!/bin/sh\n"
+        "printf 'repo: %s\\nurl: https://github.com/%s\\nhead: fixture-head\\n"
+        "license: fixture-license\\nsignal: fixture signal\\n' \"$1\" \"$1\"\n",
+        encoding="utf-8",
+    )
+    source_card_prefetch.chmod(0o755)
     transcript_db = home / "state.db"
-    transcript_db.write_bytes(b"sqlite fixture")
+    with sqlite3.connect(transcript_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                platform_message_id TEXT
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO messages(id, session_id, role, platform_message_id) "
+            "VALUES (?, ?, 'user', 'msg-source-42')",
+            ((41, "sess-dedup"), (42, "parent-session-9")),
+        )
     config = home / "state" / "research-decision-config.json"
     config.parent.mkdir()
     config.write_text(
@@ -69,6 +104,9 @@ def _write_worker_environment(home):
         "cards_root": cards_root,
         "writer": writer,
         "x_lookup": x_lookup,
+        "new_source_card": new_source_card,
+        "validator": validator,
+        "source_card_prefetch": source_card_prefetch,
         "transcript_db": transcript_db,
         "reference_bodies": reference_bodies,
     }
@@ -80,6 +118,9 @@ def test_route_requires_trusted_telegram_binding_url_and_external_event():
     assert _is_source_card_intake_event(_event(), _source())
     assert not _is_source_card_intake_event(_event(route=None), _source())
     assert not _is_source_card_intake_event(_event(text="please research this"), _source())
+    assert not _is_source_card_intake_event(
+        _event(text="https://example.com/general-web-page"), _source()
+    )
 
     internal = _event()
     internal.internal = True
@@ -113,7 +154,7 @@ def test_worker_context_ceiling_and_iteration_limit_cannot_be_reported_as_succes
     assert normalized["exit_reason"] == "max_iterations_reached(16/16)"
 
 
-def test_worker_tool_output_exhaustion_cannot_be_reported_as_success():
+def test_legacy_tool_withholding_does_not_override_a_completed_no_tool_draft():
     from gateway.run import _normalize_source_card_worker_result
 
     normalized = _normalize_source_card_worker_result(
@@ -128,47 +169,37 @@ def test_worker_tool_output_exhaustion_cannot_be_reported_as_success():
         worker_model="glm-5.2",
     )
 
-    assert normalized["status"] == "error"
-    assert normalized["summary"] is None
-    assert normalized["error"] == "source_card_tool_output_budget_exhausted:2"
+    assert normalized["status"] == "completed"
+    assert normalized["summary"] == "Card complete."
+    assert normalized["error"] is None
     assert normalized["tool_results_withheld"] == 2
 
 
-def test_missing_first_tool_does_not_overwrite_an_existing_worker_failure():
-    from gateway.run import _normalize_source_card_guarded_worker_result
+def test_no_tool_normalizer_preserves_an_existing_worker_failure():
+    from gateway.run import _normalize_source_card_worker_result
 
-    provider_failure = _normalize_source_card_guarded_worker_result(
+    provider_failure = _normalize_source_card_worker_result(
         {
             "final_response": "",
             "error": "provider authentication failed",
             "failed": True,
             "api_calls": 1,
         },
-        first_tool_validated=False,
-        duration_seconds=1.0,
-        worker_model="test-model",
-    )
-    false_success = _normalize_source_card_guarded_worker_result(
-        {"final_response": "card complete", "api_calls": 1},
-        first_tool_validated=False,
         duration_seconds=1.0,
         worker_model="test-model",
     )
 
     assert provider_failure["status"] == "error"
     assert provider_failure["error"] == "provider authentication failed"
-    assert false_success["status"] == "error"
-    assert "first_tool_contract_violated" in false_success["error"]
 
 
-def test_worker_tool_surface_is_minimal_and_fails_closed_when_required_tools_are_off():
+def test_worker_tool_surface_is_empty_regardless_of_configured_toolsets():
     from gateway.run import _source_card_worker_toolsets
 
     assert _source_card_worker_toolsets(
         ["browser", "file", "memory", "terminal", "web"]
-    ) == ["terminal", "file", "web"]
-    with pytest.raises(RuntimeError, match="file"):
-        _source_card_worker_toolsets(["terminal", "web"])
+    ) == []
+    assert _source_card_worker_toolsets([]) == []
 
 
 def test_worker_environment_resolves_exact_paths_and_origin(tmp_path):
@@ -190,6 +221,8 @@ def test_worker_environment_resolves_exact_paths_and_origin(tmp_path):
         "cards_root": str(fixture["cards_root"].resolve()),
         "decision_writer": str(fixture["writer"].resolve()),
         "x_lookup": str(fixture["x_lookup"].resolve()),
+        "new_source_card": str(fixture["new_source_card"].resolve()),
+        "source_card_validator": str(fixture["validator"].resolve()),
         "transcript_db": str(fixture["transcript_db"].resolve()),
         "source_chat_id": "-1001",
         "source_thread_id": "topic-77",
@@ -403,15 +436,31 @@ def test_mixed_intake_duplicate_identifiers_include_x_status_and_other_urls():
     ) == ["2088573393121509655", "https://github.com/example/repo"]
 
 
-def test_first_worker_tool_guard_blocks_full_tree_search_before_execution():
-    from gateway.run import _install_source_card_first_tool_guard
+def test_duplicate_lookup_ignores_nested_intake_records(tmp_path):
+    from gateway.run import _source_card_duplicate_lookup
+
+    cards_root = tmp_path / "researched-repos"
+    nested = cards_root / "_intake" / "external-source-intake.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("2088626767669981398\n", encoding="utf-8")
+
+    matches, arguments = _source_card_duplicate_lookup(
+        "https://x.com/i/status/2088626767669981398",
+        cards_root,
+    )
+
+    assert matches == []
+    assert arguments[:3] == ["rg", "-l", "-F"]
+
+
+def test_no_tool_worker_guard_blocks_full_tree_search_before_execution():
+    from gateway.run import _install_source_card_no_tool_guard
 
     executed = []
     agent = SimpleNamespace(
         _execute_tool_calls=lambda *args, **kwargs: executed.append((args, kwargs))
     )
-    expected = "rg -l -F -e 2088573393121509655 -- /tmp/cards"
-    _install_source_card_first_tool_guard(agent, expected)
+    _install_source_card_no_tool_guard(agent)
     broad_call = SimpleNamespace(
         function=SimpleNamespace(
             name="terminal",
@@ -419,7 +468,7 @@ def test_first_worker_tool_guard_blocks_full_tree_search_before_execution():
         )
     )
 
-    with pytest.raises(RuntimeError, match="first_tool_contract_violated"):
+    with pytest.raises(RuntimeError, match="no_tool_contract_violated"):
         agent._execute_tool_calls(
             SimpleNamespace(tool_calls=[broad_call]), [], "worker-session", 1
         )
@@ -605,7 +654,7 @@ async def test_dispatch_failure_fails_closed_without_parent_fallback(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_dispatch_ack_survives_transcript_mirror_failure(monkeypatch, tmp_path):
+async def test_transcript_persistence_failure_prevents_dispatch(monkeypatch, tmp_path):
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(side_effect=AssertionError("parent model called"))
     runner._dispatch_source_card_intake = AsyncMock(
@@ -619,8 +668,8 @@ async def test_dispatch_ack_survives_transcript_mirror_failure(monkeypatch, tmp_
         _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
     )
 
-    assert "running in the background" in response
-    runner._dispatch_source_card_intake.assert_awaited_once()
+    assert "could not safely persist" in response.lower()
+    runner._dispatch_source_card_intake.assert_not_awaited()
     runner._run_agent.assert_not_awaited()
 
 
@@ -677,7 +726,7 @@ async def test_active_turn_journal_failure_prevents_worker_dispatch(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
+async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     monkeypatch, tmp_path,
 ):
     import agent.skill_commands as skill_commands
@@ -702,36 +751,46 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
             self.tool_result_budget_withheld_count = 0
             self.tools = [
                 {"function": {"name": name}}
-                for name in ("terminal", "read_file", "patch", "search_files", "tool_search")
+                for name in (
+                    "terminal",
+                    "read_file",
+                    "write_file",
+                    "search_files",
+                    "web_extract",
+                )
             ]
             self.valid_tool_names = {
-                "terminal", "read_file", "patch", "search_files", "tool_search"
+                "terminal",
+                "read_file",
+                "write_file",
+                "search_files",
+                "web_extract",
             }
 
-        def _execute_tool_calls(
-            self, assistant_message, messages, effective_task_id, api_call_count=0
-        ):
-            built["executed_first_tool"] = assistant_message.tool_calls[0]
+        def _execute_tool_calls(self, *_args, **_kwargs):
+            built["unrestricted_executor_called"] = True
+
+        def _build_system_prompt(self):
+            return "Hermes base system"
 
         def run_conversation(self, goal, *, task_id):
             built["run"] = (goal, task_id)
-            command_line = goal.split(
-                "only as command data and do not add arguments:\n", 1
-            )[1].splitlines()[0]
-            duplicate_command = json.loads(command_line)
-            first_call = SimpleNamespace(
-                function=SimpleNamespace(
-                    name="terminal",
-                    arguments=json.dumps({"command": duplicate_command}),
-                )
-            )
-            self._execute_tool_calls(
-                SimpleNamespace(tool_calls=[first_call]), [], task_id, 1
-            )
+            assert self.tools == []
+            assert self.valid_tool_names == set()
+            self.api_call_count = 1
             return {
-                "final_response": "card complete",
-                "api_calls": 2,
+                "final_response": json.dumps(
+                    {
+                        "card_path": str(
+                            fixture["cards_root"] / "example-source.md"
+                        ),
+                        "card_content": _RECORDED_CARD,
+                    },
+                    ensure_ascii=False,
+                ),
+                "api_calls": 1,
                 "model": "test-model",
+                "turn_exit_reason": "text_response(finish_reason=stop)",
             }
 
         def get_activity_summary(self):
@@ -765,7 +824,19 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     }
     prefetch = MagicMock(return_value=[prefetched_post])
     monkeypatch.setattr(gateway_run, "_prefetch_source_card_x_posts", prefetch)
-    monkeypatch.setattr(async_delegation, "find_delegation_by_work_key", lambda _key: "")
+    write_draft = MagicMock()
+    landing = MagicMock(
+        return_value={
+            "path": "researched-repos/example-source.md",
+            "commit": "a" * 40,
+            "receipt_results": [],
+        }
+    )
+    monkeypatch.setattr(gateway_run, "_write_source_card_draft", write_draft)
+    monkeypatch.setattr(gateway_run, "_land_source_card", landing)
+    monkeypatch.setattr(
+        async_delegation, "find_delegation_by_work_key", lambda _key: ""
+    )
     monkeypatch.setattr(delegate_tool, "_get_max_async_children", lambda: 3)
 
     dispatched = {}
@@ -794,30 +865,22 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     runner._refresh_fallback_model = MagicMock(return_value=None)
     runner._cleanup_agent_resources = MagicMock()
 
-    async def _run_now(fn):
-        return fn()
-
-    runner._run_in_executor_with_context = _run_now
-
-    result = await runner._dispatch_source_card_intake(
-        event, source, session_entry
-    )
+    result = await runner._dispatch_source_card_intake(event, source, session_entry)
 
     assert result == {"status": "dispatched", "delegation_id": "deleg-bounded"}
     assert "agent_kwargs" not in built
     worker_result = dispatched["runner"]()
     assert worker_result["status"] == "completed"
-    assert worker_result["summary"] == "card complete"
+    assert worker_result["summary"] == (
+        "✅ Card landed: researched-repos/example-source.md @ " + "a" * 40
+    )
     kwargs = built["agent_kwargs"]
-    assert kwargs["max_iterations"] == 24
+    assert kwargs["max_iterations"] == 2
     assert kwargs["skip_context_files"] is True
     assert kwargs["load_soul_identity"] is False
     assert kwargs["skip_memory"] is True
     assert kwargs["skip_background_review"] is True
-    assert kwargs["tool_result_max_chars"] == 4_000
-    assert built["agent"].tool_result_emitted_max_chars == 4_000
-    assert built["agent"].tool_result_total_max_chars == 24_000
-    assert kwargs["enabled_toolsets"] == ["terminal", "file", "web"]
+    assert kwargs["enabled_toolsets"] == []
     worker_system = kwargs["ephemeral_system_prompt"]
     assert worker_system.startswith("bounded canonical worker contract")
     assert "TRUSTED PRELOADED SOURCE-CARD REFERENCES" in worker_system
@@ -830,50 +893,37 @@ async def test_worker_is_leaf_bounded_and_dispatched_for_direct_delivery(
     assert dispatched["role"] == "leaf"
     assert dispatched["max_async_children"] == 3
     assert dispatched["work_key"].startswith("source-card-intake:")
-    assert "MODE: source-card-worker" in dispatched["goal"]
     assert dispatched["goal"].splitlines()[:2] == [
         "MODE: source-card-worker",
         "WORKER PACKET: gateway-prefetched",
     ]
-    assert "UNTRUSTED JSON STRING" in dispatched["goal"]
-    assert json.dumps(event.text, ensure_ascii=False) in dispatched["goal"]
-    assert "Do not delegate" in dispatched["goal"]
-    assert "Do not restart" in dispatched["goal"]
-    assert "8,000 tokens" in dispatched["goal"]
-    assert "Do not read shared context journals" in dispatched["goal"]
-    assert "do not probe another tool" in dispatched["goal"]
-    assert "24,000 emitted tool-result characters" in dispatched["goal"]
-    assert "4,000 emitted characters" in dispatched["goal"]
-    assert (
-        "Do not read the cards-root README or an exemplar card"
-        in dispatched["goal"]
-    )
-    assert "TRUSTED WORKER ENVIRONMENT (JSON)" in dispatched["goal"]
-    assert str(fixture["cards_root"].resolve()) in dispatched["goal"]
-    assert str(fixture["writer"].resolve()) in dispatched["goal"]
-    assert str(fixture["x_lookup"].resolve()) not in dispatched["goal"]
-    assert str(fixture["transcript_db"].resolve()) in dispatched["goal"]
-    assert '"source_chat_id": "-1001"' in dispatched["goal"]
-    assert '"source_thread_id": "topic-77"' in dispatched["goal"]
-    assert '"parent_session_id": "sess-dedup"' in dispatched["goal"]
-    assert '"platform_message_id": "msg-source-42"' in dispatched["goal"]
-    assert "already attached" in dispatched["goal"]
+    assert "Make no tool calls" in dispatched["goal"]
+    assert "Return exactly one JSON object" in dispatched["goal"]
+    assert "SOURCE-CARD TEMPLATE" in dispatched["goal"]
+    assert "TRUSTED DUPLICATE LOOKUP RESULT" in dispatched["goal"]
     assert "UNTRUSTED PREFETCHED X POSTS (JSON)" in dispatched["goal"]
+    assert "UNTRUSTED PREFETCHED GITHUB REPOSITORIES (JSON)" in dispatched["goal"]
     assert json.dumps(prefetched_post, ensure_ascii=False, sort_keys=True) in dispatched[
         "goal"
     ]
-    assert "FIRST tool call" in dispatched["goal"]
-    assert "rg -l" in dispatched["goal"]
-    assert "2088573393121509655" in dispatched["goal"]
-    assert "Never call `search_files`" in dispatched["goal"]
-    assert "Do not call twitter, the X API, oEmbed, r.jina.ai" in dispatched["goal"]
-    assert "publish.twitter.com" not in dispatched["goal"]
-    prefetch.assert_called_once()
-    assert "search_files" not in built["agent"].valid_tool_names
-    assert "tool_search" not in built["agent"].valid_tool_names
-    assert built["agent"]._subdirectory_hints.check_tool_call(
-        "terminal", {"command": f"rg -l 208857 {fixture['cards_root']}"}
-    ) is None
+    assert "FIRST tool call" not in dispatched["goal"]
+    assert "search_files" not in dispatched["goal"]
+    assert "Do not fetch GitHub metadata that is already injected" in dispatched[
+        "goal"
+    ]
+    assert write_draft.call_args.args[0] == (
+        fixture["cards_root"] / "example-source.md"
+    )
+    assert write_draft.call_args.args[1] == _RECORDED_CARD
+    landing.assert_called_once()
+    assert prefetch.call_count == 1
+    assert built["agent"].tools == []
+    assert built["agent"].valid_tool_names == set()
+    with pytest.raises(RuntimeError, match="no_tool_contract_violated"):
+        built["agent"]._execute_tool_calls(
+            SimpleNamespace(tool_calls=[]), [], "worker-session", 1
+        )
+    assert "unrestricted_executor_called" not in built
     assert "WORKER PACKET: gateway-prefetched" in built["skill_args"][2]
     assert "Never call skill_view or delegate_task" in built["skill_args"][2]
 
@@ -938,3 +988,587 @@ async def test_work_key_lookup_failure_rejects_without_building_worker(
     assert result["status"] == "rejected"
     assert "durable" in result["error"].lower()
     load_skill.assert_not_called()
+
+
+_SOURCE_CARD_FIXTURES = (
+    Path(__file__).parent / "../fixtures/source_card_intake"
+).resolve()
+_REPLAY_X_POST = json.loads(
+    (_SOURCE_CARD_FIXTURES / "recorded-x-2087232392209531166.json").read_text(
+        encoding="utf-8"
+    )
+)
+_REPLAY_X_STATUS_ID = str(_REPLAY_X_POST["id"])
+_REPLAY_GITHUB_COMPACT = (
+    _SOURCE_CARD_FIXTURES
+    / "recorded-github-igorwarzocha-howaboua-pi-stuff.compact"
+).read_text(encoding="utf-8")
+_REPLAY_CARD = (
+    _SOURCE_CARD_FIXTURES / "recorded-howaboua-pi-shepherdr-card.md"
+).read_text(encoding="utf-8")
+_REAL_NEW_SOURCE_CARD_OUTPUT = (
+    _SOURCE_CARD_FIXTURES / "real-new-source-card-output.md"
+).read_text(encoding="utf-8")
+_CANONICAL_SKILL_FIXTURE = _SOURCE_CARD_FIXTURES / "canonical-skill"
+_RECORDED_CARD = (
+    _SOURCE_CARD_FIXTURES / "recorded-mapcn-card.md"
+).read_text(encoding="utf-8")
+
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _write_offline_route_fixture(tmp_path: Path) -> dict:
+    home = tmp_path / "hermes-home"
+    repo = tmp_path / "cards-repo"
+    remote = tmp_path / "cards-remote.git"
+    cards_root = repo / "researched-repos"
+    cards_root.mkdir(parents=True)
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True
+    )
+    _git(repo, "config", "user.name", "Source Card Replay")
+    _git(repo, "config", "user.email", "source-card-replay@example.invalid")
+    (repo / "README.md").write_text("offline replay\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "test: initialize source-card replay")
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
+
+    x_payload = json.dumps(_REPLAY_X_POST, ensure_ascii=False)
+    _write_executable(
+        repo / "scripts" / "x-lookup",
+        f"""
+        #!/usr/bin/env python3
+        import sys
+        if sys.argv[1:] != ["--json", "https://x.com/i/status/{_REPLAY_X_STATUS_ID}"]:
+            raise SystemExit(3)
+        print({x_payload!r})
+        """,
+    )
+    _write_executable(
+        repo / "scripts" / "source-card-prefetch",
+        f"""
+        #!/usr/bin/env python3
+        import sys
+        if sys.argv[1:] != ["IgorWarzocha/howaboua-pi-stuff", "--compact"]:
+            raise SystemExit(3)
+        print({_REPLAY_GITHUB_COMPACT!r})
+        """,
+    )
+    _write_executable(
+        repo / "scripts" / "new-source-card",
+        f"""
+        #!/usr/bin/env python3
+        import sys
+        if sys.argv[1:] != ["gateway/source-card", "--stdout"]:
+            raise SystemExit(3)
+        print({_REAL_NEW_SOURCE_CARD_OUTPUT!r})
+        """,
+    )
+    validator_log = tmp_path / "validator-argv.json"
+    _write_executable(
+        repo / "scripts" / "validate-touched-source-cards",
+        f"""
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        import sys
+        expected = ["--card", "researched-repos/igorwarzocha-howaboua-pi-stuff.md", "--no-full-backlog"]
+        pathlib.Path({str(validator_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+        if sys.argv[1:] != expected:
+            raise SystemExit(7)
+        card = pathlib.Path("researched-repos/igorwarzocha-howaboua-pi-stuff.md").read_text(encoding="utf-8")
+        if "## Decision manifest (ER-278)" not in card or "- by:" not in card:
+            raise SystemExit(8)
+        """,
+    )
+
+    decision_log = tmp_path / "decision-writer.jsonl"
+    _write_executable(
+        home / "scripts" / "hermes-research-decisions",
+        f"""
+        #!/usr/bin/env python3
+        import json
+        import pathlib
+        import sys
+        log = pathlib.Path({str(decision_log)!r})
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sys.argv[1:]) + "\\n")
+        print(json.dumps({{"ok": True, "command": sys.argv[1]}}))
+        """,
+    )
+    transcript_db = home / "state.db"
+    home.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(transcript_db) as connection:
+        connection.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, session_id TEXT, platform_message_id TEXT, "
+            "role TEXT, content TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO messages(id, session_id, platform_message_id, role, content) "
+            "VALUES(42, 'sess-dedup', 'msg-source-42', 'user', ?)",
+            (f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",),
+        )
+    config = home / "state" / "research-decision-config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cards_root": str(cards_root),
+                "transcript_db": str(transcript_db),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "home": home,
+        "repo": repo,
+        "remote": remote,
+        "cards_root": cards_root,
+        "validator_log": validator_log,
+        "decision_log": decision_log,
+        "decision_writer": home / "scripts" / "hermes-research-decisions",
+        "canonical_skill_dir": _CANONICAL_SKILL_FIXTURE,
+    }
+
+
+def test_template_prefetch_neutralizes_real_helper_subject_identity(tmp_path):
+    from gateway.run import _prefetch_source_card_template
+
+    fixture = _write_offline_route_fixture(tmp_path)
+
+    template = _prefetch_source_card_template(
+        fixture["repo"] / "scripts" / "new-source-card"
+    )
+
+    assert "gateway/source-card" not in template
+    assert "- url: TODO:" in template
+    assert "- owner/name: TODO:" in template
+
+
+def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
+    from gateway.run import _prefetch_source_card_github_repositories
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    posts = [
+        {
+            "links": [
+                "https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr?tab=readme#usage",
+                "https://github.com/IgorWarzocha/howaboua-pi-stuff/",
+            ]
+        }
+    ]
+
+    prefetched = _prefetch_source_card_github_repositories(
+        posts, fixture["repo"] / "scripts" / "source-card-prefetch"
+    )
+
+    assert len(prefetched) == 1
+    assert prefetched[0]["owner_name"] == "IgorWarzocha/howaboua-pi-stuff"
+    assert prefetched[0]["fields"]["head"] == (
+        "8d63d300597488e6fa4c30ccd6a3eb0fed2d4304"
+    )
+    assert _prefetch_source_card_github_repositories(
+        [{"links": ["https://github.com/settings/profile"]}],
+        fixture["repo"] / "scripts" / "source-card-prefetch",
+    ) == []
+    too_many = [
+        {"links": [f"https://github.com/example/repo-{index}"]}
+        for index in range(5)
+    ]
+    with pytest.raises(RuntimeError, match="maximum 4"):
+        _prefetch_source_card_github_repositories(
+            too_many, fixture["repo"] / "scripts" / "source-card-prefetch"
+        )
+
+
+def test_receipt_failure_reports_the_already_contained_card(tmp_path):
+    from gateway.run import (
+        _SourceCardPostLandingError,
+        _format_direct_source_card_completion,
+        _land_source_card,
+    )
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    _write_executable(
+        fixture["decision_writer"],
+        """
+        #!/usr/bin/env python3
+        import sys
+        print("receipt fixture failed", file=sys.stderr)
+        raise SystemExit(9)
+        """,
+    )
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    with pytest.raises(_SourceCardPostLandingError) as caught:
+        _land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    failure = caught.value
+    assert failure.path == "researched-repos/igorwarzocha-howaboua-pi-stuff.md"
+    remote_tip = _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0]
+    assert failure.commit == remote_tip
+    assert _git(
+        fixture["repo"],
+        "show",
+        f"{remote_tip}:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+    ) + "\n" == _REPLAY_CARD
+    summary = (
+        "⚠️ Card landed but receipts incomplete: "
+        f"{failure.path} @ {failure.commit}; {failure.step}: {failure.detail}"
+    )
+    assert _format_direct_source_card_completion(
+        {"status": "partial", "summary": summary, "error": str(failure)}
+    ) == summary
+
+
+def test_landing_rejects_a_dirty_tracked_duplicate_without_absorbing_it(tmp_path):
+    from gateway.run import _SourceCardLandingError, _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    _git(fixture["repo"], "add", "--", "researched-repos/igorwarzocha-howaboua-pi-stuff.md")
+    _git(fixture["repo"], "commit", "-m", "test: seed tracked source card")
+    _git(fixture["repo"], "push", "origin", "main")
+    clean_commit = _git(fixture["repo"], "rev-parse", "HEAD")
+    operator_edit = _REPLAY_CARD + "\nOperator-owned pending edit.\n"
+    card.write_text(operator_edit, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    with pytest.raises(_SourceCardLandingError, match="dirty tracked card") as caught:
+        _land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    assert caught.value.step == "git_clean"
+    assert card.read_text(encoding="utf-8") == operator_edit
+    assert _git(fixture["repo"], "rev-parse", "HEAD") == clean_commit
+    assert _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0] == clean_commit
+    assert not fixture["decision_log"].exists()
+
+
+@pytest.mark.asyncio
+async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
+    monkeypatch, tmp_path,
+):
+    """Recorded X + GitHub evidence traverses the live route into a Git remote."""
+    import agent.skill_commands as skill_commands
+    import gateway.run as gateway_run
+    import run_agent
+    import tools.async_delegation as async_delegation
+    import tools.delegate_tool as delegate_tool
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    unrelated_staged = fixture["cards_root"] / "unrelated-staged.md"
+    unrelated_staged.write_text("operator-owned staged change\n", encoding="utf-8")
+    _git(fixture["repo"], "add", "--", "researched-repos/unrelated-staged.md")
+    runner = _bootstrap(monkeypatch, fixture["home"])
+    event = _event(text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}")
+    source = _source()
+    session_entry = runner.session_store.get_or_create_session.return_value
+    captured = {}
+
+    provider_content = json.dumps(
+        {
+            "card_path": str(
+                fixture["cards_root"]
+                / "igorwarzocha-howaboua-pi-stuff.md"
+            ),
+            "card_content": _REPLAY_CARD,
+        },
+        ensure_ascii=False,
+    )
+    provider_message = SimpleNamespace(
+        content=provider_content,
+        tool_calls=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+        refusal=None,
+    )
+    provider_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=provider_message, finish_reason="stop")],
+        model="offline-replay",
+        usage=None,
+    )
+    provider_client = MagicMock()
+    provider_client.chat.completions.create.return_value = provider_response
+    executor_calls = []
+    original_execute = run_agent.AIAgent._execute_tool_calls
+
+    def _tracked_execute(self, *args, **kwargs):
+        executor_calls.append((args, kwargs))
+        return original_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        skill_commands,
+        "_load_skill_payload",
+        MagicMock(
+            return_value=(
+                {
+                    "success": True,
+                    "name": "source-card-intake",
+                    "content": (
+                        fixture["canonical_skill_dir"] / "SKILL.md"
+                    ).read_text(encoding="utf-8"),
+                    "raw_content": (
+                        fixture["canonical_skill_dir"] / "SKILL.md"
+                    ).read_text(encoding="utf-8"),
+                },
+                fixture["canonical_skill_dir"],
+                "Source Card Intake",
+            )
+        ),
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", MagicMock(return_value=provider_client))
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **_kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_agent.AIAgent, "_execute_tool_calls", _tracked_execute)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {}})
+    monkeypatch.setattr(gateway_run, "_checkpoint_agent_kwargs", lambda _cfg: {})
+    monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 99)
+    monkeypatch.setattr(async_delegation, "find_delegation_by_work_key", lambda _key: "")
+    monkeypatch.setattr(delegate_tool, "_get_max_async_children", lambda: 3)
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "openai/gpt-4o-mini",
+            {
+                "api_key": "fixture-key",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+    )
+    runner._resolve_turn_agent_config = MagicMock(
+        return_value={
+            "model": "openai/gpt-4o-mini",
+            "runtime": {
+                "api_key": "fixture-key",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            "request_overrides": None,
+        }
+    )
+    runner._resolve_enabled_toolsets_for_source = MagicMock(
+        return_value=["terminal", "file", "web"]
+    )
+    runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+    runner._resolve_session_service_tier = MagicMock(return_value=None)
+    runner._provider_routing = {}
+    runner._refresh_fallback_model = MagicMock(return_value=None)
+    runner._cleanup_agent_resources = MagicMock()
+    runner._run_agent = AsyncMock(side_effect=AssertionError("parent model called"))
+
+    def _dispatch(**kwargs):
+        captured["dispatch"] = kwargs
+        return {"status": "dispatched", "delegation_id": "deleg-offline-replay"}
+
+    monkeypatch.setattr(async_delegation, "dispatch_async_delegation", _dispatch)
+
+    response = await runner._handle_message_with_agent(
+        event, source, session_entry.session_key, 1
+    )
+
+    assert response == (
+        "Research is running in the background. The completed source card will "
+        "return here."
+    )
+    worker_result = captured["dispatch"]["runner"]()
+    assert provider_client.chat.completions.create.call_count == 1
+    assert executor_calls == []
+    provider_request = provider_client.chat.completions.create.call_args.kwargs
+    provider_messages = provider_request["messages"]
+    wire_goal = next(
+        message["content"]
+        for message in reversed(provider_messages)
+        if message.get("role") == "user"
+    )
+    system_content = provider_messages[0]["content"]
+    if isinstance(system_content, list):
+        system_text = "".join(
+            str(item.get("text") or "")
+            for item in system_content
+            if isinstance(item, dict)
+        )
+    else:
+        system_text = str(system_content)
+    replay_metrics = {
+        key: worker_result[key]
+        for key in (
+            "api_calls",
+            "worker_goal_chars",
+            "worker_goal_bytes",
+            "worker_result_chars",
+            "worker_result_bytes",
+            "worker_system_chars",
+            "worker_system_bytes",
+            "worker_system_byte_budget",
+            "worker_dynamic_chars",
+            "worker_dynamic_bytes",
+            "worker_total_chars",
+            "worker_total_bytes",
+            "worker_api_call_budget",
+            "worker_goal_byte_budget",
+            "worker_result_byte_budget",
+            "tool_result_chars",
+        )
+    }
+    replay_metrics.update(
+        {
+            "wire_provider_calls": provider_client.chat.completions.create.call_count,
+            "wire_executor_calls": len(executor_calls),
+        }
+    )
+    metrics_path = tmp_path / "source-card-replay-metrics.json"
+    metrics_path.write_text(
+        json.dumps(replay_metrics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert json.loads(metrics_path.read_text(encoding="utf-8")) == replay_metrics
+    assert worker_result["status"] == "completed"
+    assert worker_result["summary"].startswith(
+        "✅ Card landed: researched-repos/igorwarzocha-howaboua-pi-stuff.md @ "
+    )
+    assert worker_result["api_calls"] == 1
+    assert worker_result["tool_result_chars"] == 0
+    assert worker_result["worker_api_call_budget"] == worker_result["api_calls"] + 1
+    assert worker_result["worker_goal_byte_budget"] == 16_384
+    assert worker_result["worker_result_byte_budget"] == 16_384
+    assert worker_result["worker_system_byte_budget"] == 24_576
+    assert (
+        worker_result["worker_goal_byte_budget"]
+        - worker_result["worker_goal_bytes"]
+        >= 4_096
+    )
+    assert (
+        worker_result["worker_result_byte_budget"]
+        - worker_result["worker_result_bytes"]
+        >= 4_096
+    )
+    assert (
+        worker_result["worker_system_byte_budget"]
+        - worker_result["worker_system_bytes"]
+        >= 4_096
+    )
+    agent = runner._cleanup_agent_resources.call_args.args[0]
+    assert agent.max_iterations == 2
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert worker_result["worker_goal_chars"] == len(wire_goal)
+    assert worker_result["worker_goal_bytes"] == len(
+        wire_goal.encode("utf-8")
+    )
+    assert worker_result["worker_system_chars"] == len(system_text)
+    assert worker_result["worker_system_bytes"] == len(system_text.encode("utf-8"))
+    assert worker_result["worker_dynamic_chars"] == (
+        worker_result["worker_goal_chars"] + worker_result["worker_result_chars"]
+    )
+    assert worker_result["worker_dynamic_bytes"] == (
+        worker_result["worker_goal_bytes"] + worker_result["worker_result_bytes"]
+    )
+    assert worker_result["worker_total_chars"] == (
+        worker_result["worker_system_chars"] + worker_result["worker_dynamic_chars"]
+    )
+    assert worker_result["worker_total_bytes"] == (
+        worker_result["worker_system_bytes"] + worker_result["worker_dynamic_bytes"]
+    )
+    assert '"repo": "IgorWarzocha/howaboua-pi-stuff"' in wire_goal
+    assert '"signal": "GitHub metadata showed' in wire_goal
+    assert "SOURCE-CARD TEMPLATE" in wire_goal
+    assert "gateway/source-card" not in wire_goal
+    assert "A Gateway worker makes no tool calls." in system_text
+    assert worker_result["worker_result_chars"] == len(provider_content)
+    assert worker_result["worker_result_bytes"] == len(
+        provider_content.encode("utf-8")
+    )
+
+    remote_tip = _git(fixture["repo"], "ls-remote", "origin", "refs/heads/main").split()[0]
+    committed = _git(
+        fixture["repo"],
+        "show",
+        f"{remote_tip}:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+    )
+    assert committed + "\n" == _REPLAY_CARD
+    assert _git(
+        fixture["repo"],
+        "diff",
+        "--cached",
+        "--name-only",
+    ).splitlines() == ["researched-repos/unrelated-staged.md"]
+    assert "researched-repos/unrelated-staged.md" not in _git(
+        fixture["repo"],
+        "show",
+        "--format=",
+        "--name-only",
+        remote_tip,
+    ).splitlines()
+    assert json.loads(fixture["validator_log"].read_text(encoding="utf-8")) == [
+        "--card",
+        "researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+        "--no-full-backlog",
+    ]
+    decision_calls = [
+        json.loads(line)
+        for line in fixture["decision_log"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [call[0] for call in decision_calls] == ["add", "receipt-intake"]
+    assert "--commit" in decision_calls[1]
+    assert decision_calls[1][decision_calls[1].index("--commit") + 1] == remote_tip
+    assert "--card" in decision_calls[1]
+    assert decision_calls[1][decision_calls[1].index("--card") + 1] == (
+        "igorwarzocha-howaboua-pi-stuff.md"
+    )
