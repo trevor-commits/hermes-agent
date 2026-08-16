@@ -2303,7 +2303,16 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     )
     assert worker_result["worker_system_chars"] == len(system_text)
     assert worker_result["worker_system_bytes"] == len(system_text.encode("utf-8"))
-    assert worker_result["worker_system_bytes"] == 18_787
+    # Recorded measurement, asserted as a band rather than an exact equality.
+    # The base system prompt embeds the working directory, which under pytest is
+    # `.../pytest-of-<user>/pytest-<N>/...`. `<N>` increments on every pytest run
+    # on this machine, so the exact byte count changes whenever that counter
+    # gains a digit — observed drifting 18_787 -> 18_829 between two runs of
+    # this same commit, with no code change. Pinning the exact value made the
+    # test fail on unrelated machine state. The band still catches a real budget
+    # regression; the two assertions above still prove the runtime metric equals
+    # what the provider actually received.
+    assert abs(worker_result["worker_system_bytes"] - 18_787) <= 1_024
     assert worker_result["worker_dynamic_chars"] == (
         worker_result["worker_goal_chars"] + worker_result["worker_result_chars"]
     )
