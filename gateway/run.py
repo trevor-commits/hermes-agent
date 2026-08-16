@@ -4725,7 +4725,21 @@ def _source_card_fields_and_manifest(
                 "card decision manifest contains an invalid line",
             )
         if decision_match:
-            decision_keys.append(decision_match.group(1).lower())
+            decision_key = decision_match.group(1).lower()
+            key_match = re.fullmatch(
+                r"card:([a-z0-9][a-z0-9._-]*\.md)#[a-z0-9][a-z0-9._-]*",
+                decision_key,
+            )
+            if (
+                key_match is None
+                or key_match.group(1) != card_path.name.lower()
+            ):
+                raise _SourceCardLandingError(
+                    "receipt",
+                    "card decision key must match "
+                    "card:<flat-card.md>#<choice> and the touched card filename",
+                )
+            decision_keys.append(decision_key)
         else:
             assert reason_match is not None
             if no_decision_reason is not None:
@@ -4935,6 +4949,11 @@ def _land_source_card(
                     "git_clean",
                     "dirty tracked card requires operator reconciliation",
                 )
+        # Fail before staging, committing, or pushing when the card cannot
+        # produce writer-valid decision receipts. Keep this after the dirty
+        # tracked-card guard so operator-owned edits retain their stronger,
+        # non-absorbing failure classification.
+        _source_card_fields_and_manifest(card_path)
         _source_card_run_step(
             "validate",
             [validator, "--card", relative, "--no-full-backlog"],
