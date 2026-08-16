@@ -1243,6 +1243,31 @@ def test_worker_draft_finalizer_replaces_validator_rejected_placeholders(tmp_pat
     assert "- no-decision-reason: watch-only" in finalized
 
 
+def test_worker_draft_finalizer_normalizes_canary_routing_explanations(tmp_path):
+    from gateway.run import _finalize_source_card_worker_draft
+
+    draft = _REPLAY_CARD.replace(
+        "- downstream learning targets: hermes",
+        "- downstream learning targets: hermes: compare the claimed "
+        "agent+skill browser-control model with Hermes browser tooling once a "
+        "verified primary source exists",
+    ).replace(
+        "- Hermes relevance: adjacent",
+        "- Hermes relevance: adjacent: the post claims an agent+skill-driven "
+        "AI browser, conceptually overlapping Hermes agent/skill concepts",
+    )
+
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "ego-lite-ai-browser.md",
+        content=draft,
+        prefetched_x_posts=[],
+        prefetched_github_repositories=[],
+    )
+
+    assert "- downstream learning targets: hermes\n" in finalized
+    assert "- Hermes relevance: adjacent\n" in finalized
+
+
 def test_worker_draft_finalizer_selects_the_repository_named_by_the_worker(tmp_path):
     from gateway.run import _finalize_source_card_worker_draft
 

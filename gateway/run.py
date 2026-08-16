@@ -4918,6 +4918,37 @@ def _source_card_selected_x_post(
     return matches
 
 
+def _source_card_normalize_routing_field(field_name: str, value: str) -> str:
+    """Strip explanatory prose from the validator's token-only routing fields."""
+    separator = r"(?:\s*:\s*|\s+[\u2013\u2014-]\s+|\.\s+)"
+    if field_name == "hermes relevance":
+        for token in ("direct", "adjacent", "upgrade-candidate"):
+            if re.fullmatch(
+                rf"{re.escape(token)}{separator}\S.*",
+                value,
+                flags=re.IGNORECASE,
+            ):
+                return token
+        return value
+    if field_name != "downstream learning targets":
+        return value
+
+    normalized_targets: list[str] = []
+    changed = False
+    for target in value.split(","):
+        stripped = target.strip()
+        if re.fullmatch(
+            rf"hermes{separator}\S.*",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            normalized_targets.append("hermes")
+            changed = True
+        else:
+            normalized_targets.append(stripped)
+    return ", ".join(normalized_targets) if changed else value
+
+
 def _finalize_source_card_worker_draft(
     *,
     card_path: Path,
@@ -4990,6 +5021,13 @@ def _finalize_source_card_worker_draft(
         if field:
             field_name = field.group(2).strip().lower()
             value = field.group(3).strip()
+            normalized_routing_value = _source_card_normalize_routing_field(
+                field_name,
+                value,
+            )
+            if normalized_routing_value != value:
+                output.append(field.group(1) + normalized_routing_value)
+                continue
             if in_manifest and field_name == "decision-key" and (
                 not value or value.upper().startswith("TODO:")
             ):
