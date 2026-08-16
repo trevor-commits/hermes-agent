@@ -2629,3 +2629,27 @@ def test_invalid_typed_analysis_is_rejected_not_guessed(tmp_path, analysis):
     with pytest.raises(_SourceCardLandingError) as excinfo:
         _parse_source_card_worker_draft(response, cards_root)
     assert excinfo.value.step == "worker_output"
+
+
+def test_finalizer_substitutes_embedded_todo_values(tmp_path):
+    """An embedded `TODO:` self-heals instead of failing the whole intake.
+
+    The finalizer only substituted values that START with `TODO:`, so
+    `no advisories found - TODO: verify` fell through to the global
+    fail-closed guard and cost the user the whole card.
+    """
+    from gateway.run import _finalize_source_card_worker_draft
+
+    content = _REPLAY_CARD.replace(
+        "- risk signal:",
+        "- risk signal: no evidence-backed blocker - TODO: verify\n- spare-field:",
+        1,
+    )
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "embedded-todo-card.md",
+        content=content,
+        prefetched_x_posts=[],
+        prefetched_github_repositories=[],
+    )
+    assert "TODO:" not in finalized
+    assert "- risk signal: " in finalized
