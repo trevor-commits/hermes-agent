@@ -1,6 +1,6 @@
 # Canonical source-card schema
 
-The compact schema below is the writing contract. Do not read the cards-root README or an exemplar card. New GitHub and social cards use the unified flat-bullet form, not legacy YAML frontmatter.
+The compact schema below is the writing contract. Do not read the cards-root README or an exemplar card. Use flat bullets, not YAML.
 
 A new card includes:
 
@@ -11,6 +11,7 @@ A new card includes:
 - license, maintenance, build-versus-buy, security, credentials, network, local-mutation, sensitive-data, and blast-radius findings;
 - an evidenced disposition and exact next action;
 - downstream learning targets, Hermes relevance, and agent provenance;
+- `direct`, `adjacent`, or `upgrade-candidate` Hermes relevance requires the bare `hermes` token in downstream learning targets; a `none:` downstream target requires `none:` Hermes relevance.
 - Primary Research Context, Standard Secondary Scan, Transferable Patterns, Question And Answer Log, named feedback sections, and an implementation assessment;
 - exactly one ER-278 decision-manifest mode.
 

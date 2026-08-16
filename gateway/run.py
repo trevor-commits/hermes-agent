@@ -116,8 +116,9 @@ _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 _SOURCE_CARD_INTAKE_ROUTE = "source-card-intake"
 _SOURCE_CARD_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 # Faithful offline replay (2026-08-15): one provider call, no tool calls,
-# 18,881 system bytes, 10,879 goal bytes, and 7,816 result bytes. The rounded
-# ceilings retain 5,695, 5,505, and 8,568 bytes of margin respectively.
+# 18,651 system bytes, 11,071 goal bytes, and 7,820 result bytes in the recorded
+# run. Goal/result include a temporary path; tests measure their wire sizes and
+# require at least 4,096 bytes of margin instead of pinning path-dependent totals.
 _SOURCE_CARD_WORKER_MAX_ITERATIONS = 2
 _SOURCE_CARD_WORKER_SYSTEM_MAX_BYTES = 24_576
 _SOURCE_CARD_WORKER_GOAL_MAX_BYTES = 16_384
@@ -3724,6 +3725,10 @@ def _format_direct_source_card_completion(evt: dict) -> str:
         "⚠️ Card landed but receipts incomplete:"
     ):
         return summary
+    if status == "partial" and summary.startswith(
+        "⚠️ Card landing outcome could not be verified:"
+    ):
+        return summary
     try:
         from agent.redact import redact_sensitive_text
 
@@ -4373,17 +4378,49 @@ def _source_card_duplicate_identifiers(intake_text: str) -> list[str]:
     return identifiers
 
 
+def _source_card_safe_landing_detail(detail: Any) -> str:
+    """Redact a landing failure before it reaches durable async state."""
+    safe = _redact_gateway_user_facing_secrets(str(detail or ""))
+    safe = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@",
+        r"\1[REDACTED]@",
+        safe,
+    )
+    safe = re.sub(
+        r"\S*hermes-source-card-landing-\S*",
+        "[temporary landing checkout]",
+        safe,
+    )
+    return safe.strip()[:800] or "unknown error"
+
+
 class _SourceCardLandingError(RuntimeError):
     """One deterministic card landing step failed after a draft was available."""
 
     def __init__(self, step: str, detail: str):
         self.step = step
-        self.detail = detail.strip()[:800] or "unknown error"
+        self.detail = _source_card_safe_landing_detail(detail)
         super().__init__(f"{step}: {self.detail}")
 
 
 class _SourceCardPostLandingError(_SourceCardLandingError):
     """A card is contained on origin/main, but a later receipt step failed."""
+
+    def __init__(
+        self,
+        step: str,
+        detail: str,
+        *,
+        path: str,
+        commit: str,
+    ):
+        self.path = path
+        self.commit = commit
+        super().__init__(step, detail)
+
+
+class _SourceCardLandingOutcomeUnknownError(_SourceCardLandingError):
+    """A push failed ambiguously and remote containment could not be checked."""
 
     def __init__(
         self,
@@ -4865,6 +4902,103 @@ def _source_card_receipt_commands(
     return commands
 
 
+@_contextmanager
+def _source_card_isolated_landing_repository(repository: Path):
+    """Clone current origin/main without mutating the shared source checkout."""
+    remote_output = _source_card_run_step(
+        "git_remote",
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            "origin",
+        ],
+        cwd=repository,
+    ).stdout
+    remote_urls = [line.strip() for line in remote_output.splitlines() if line.strip()]
+    if len(remote_urls) != 1:
+        raise _SourceCardLandingError(
+            "git_remote",
+            "origin must have exactly one push URL",
+        )
+    remote_url = remote_urls[0]
+    parsed_remote = urlsplit(remote_url)
+    if parsed_remote.scheme.lower() in {"http", "https"} and (
+        parsed_remote.username is not None
+        or parsed_remote.password is not None
+        or bool(parsed_remote.query)
+        or bool(parsed_remote.fragment)
+    ):
+        raise _SourceCardLandingError(
+            "git_remote",
+            "origin push URL contains embedded credentials or query parameters",
+        )
+
+    identity: dict[str, str] = {}
+    for key in ("user.name", "user.email"):
+        result = _source_card_run_step(
+            "git_identity",
+            ["git", "-C", str(repository), "config", "--get", key],
+            cwd=repository,
+            accepted_returncodes=(0, 1),
+        )
+        value = result.stdout.strip()
+        if result.returncode != 0 or not value or "\n" in value or "\r" in value:
+            raise _SourceCardLandingError(
+                "git_identity",
+                f"{key} is missing or ambiguous",
+            )
+        identity[key] = value
+
+    with tempfile.TemporaryDirectory(prefix="hermes-source-card-landing-") as root:
+        checkout = Path(root) / "repo"
+        _source_card_run_step(
+            "git_clone",
+            [
+                "git",
+                "clone",
+                "--no-local",
+                "--no-tags",
+                "--single-branch",
+                "--branch",
+                "main",
+                "--depth",
+                "1",
+                "--",
+                remote_url,
+                str(checkout),
+            ],
+            cwd=repository,
+            timeout=120,
+        )
+        for key, value in identity.items():
+            _source_card_run_step(
+                "git_identity",
+                ["git", "-C", str(checkout), "config", "--local", key, value],
+                cwd=checkout,
+            )
+        head = _source_card_run_step(
+            "git_clone",
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            cwd=checkout,
+        ).stdout.strip()
+        origin_head = _source_card_run_step(
+            "git_clone",
+            ["git", "-C", str(checkout), "rev-parse", "origin/main"],
+            cwd=checkout,
+        ).stdout.strip()
+        if head != origin_head:
+            raise _SourceCardLandingError(
+                "git_clone",
+                "isolated checkout does not equal origin/main",
+            )
+        yield checkout
+
+
 def _land_source_card(
     *,
     card_path: Path,
@@ -4878,42 +5012,11 @@ def _land_source_card(
         raise _SourceCardLandingError("validate", "card path is outside the cards root")
     repository = cards_root.parent
     relative = card_path.relative_to(repository).as_posix()
-    digest_before = hashlib.sha256(card_path.read_bytes()).hexdigest()
+    card_bytes = card_path.read_bytes()
     validator = environment["source_card_validator"]
     writer_home = str(Path(environment["decision_writer"]).parent.parent)
 
     with _SOURCE_CARD_LANDING_LOCK:
-        branch = _source_card_run_step(
-            "git_branch",
-            ["git", "-C", str(repository), "branch", "--show-current"],
-            cwd=repository,
-        ).stdout.strip()
-        if branch != "main":
-            raise _SourceCardLandingError(
-                "git_branch",
-                f"expected main, found {branch or 'detached HEAD'}",
-            )
-        _source_card_run_step(
-            "git_fetch",
-            ["git", "-C", str(repository), "fetch", "origin", "main"],
-            cwd=repository,
-            timeout=60,
-        )
-        head = _source_card_run_step(
-            "git_head",
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            cwd=repository,
-        ).stdout.strip()
-        origin_head = _source_card_run_step(
-            "git_origin",
-            ["git", "-C", str(repository), "rev-parse", "origin/main"],
-            cwd=repository,
-        ).stdout.strip()
-        if head != origin_head:
-            raise _SourceCardLandingError(
-                "git_sync",
-                "local main must equal origin/main before deterministic landing",
-            )
         tracked = _source_card_run_step(
             "git_clean",
             [
@@ -4960,166 +5063,260 @@ def _land_source_card(
             cwd=repository,
             timeout=120,
         )
-        if hashlib.sha256(card_path.read_bytes()).hexdigest() != digest_before:
+        if card_path.read_bytes() != card_bytes:
             raise _SourceCardLandingError(
                 "validate",
                 "card bytes changed during validation",
             )
-        _source_card_run_step(
-            "git_add",
-            ["git", "-C", str(repository), "add", "--", relative],
-            cwd=repository,
-        )
-        changed = _source_card_run_step(
-            "git_diff",
-            [
-                "git",
-                "-C",
-                str(repository),
-                "diff",
-                "--cached",
-                "--quiet",
-                "HEAD",
-                "--",
-                relative,
-            ],
-            cwd=repository,
-            accepted_returncodes=(0, 1),
-        ).returncode == 1
-        if changed:
+
+        with _source_card_isolated_landing_repository(repository) as landing_repository:
+            landing_cards_root = landing_repository / cards_root.name
+            if landing_cards_root.exists():
+                if landing_cards_root.is_symlink() or not landing_cards_root.is_dir():
+                    raise _SourceCardLandingError(
+                        "git_clone",
+                        "isolated cards root is not a regular directory",
+                    )
+            else:
+                try:
+                    landing_cards_root.mkdir(mode=0o755)
+                except OSError as exc:
+                    raise _SourceCardLandingError(
+                        "git_clone",
+                        f"could not create isolated cards root: {exc}",
+                    ) from exc
+            landing_card = landing_repository / relative
+            if landing_card.exists():
+                if landing_card.is_symlink() or not landing_card.is_file():
+                    raise _SourceCardLandingError(
+                        "git_sync",
+                        "origin/main card path is not a regular file",
+                    )
+                if landing_card.read_bytes() != card_bytes:
+                    raise _SourceCardLandingError(
+                        "git_sync",
+                        "origin/main already contains a different card",
+                    )
+            else:
+                if tracked:
+                    raise _SourceCardLandingError(
+                        "git_clean",
+                        "tracked card is absent from origin/main",
+                    )
+                try:
+                    landing_card.write_bytes(card_bytes)
+                except OSError as exc:
+                    raise _SourceCardLandingError(
+                        "git_clone",
+                        f"could not write isolated card: {exc}",
+                    ) from exc
+
             _source_card_run_step(
-                "git_commit",
+                "git_add",
                 [
                     "git",
                     "-C",
-                    str(repository),
-                    "commit",
-                    "--only",
-                    "-m",
-                    f"docs(research): capture {card_path.stem}",
+                    str(landing_repository),
+                    "add",
                     "--",
                     relative,
                 ],
-                cwd=repository,
-                timeout=120,
+                cwd=landing_repository,
             )
-        commit = _source_card_run_step(
-            "git_commit",
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            cwd=repository,
-        ).stdout.strip()
-        _source_card_run_step(
-            "git_push",
-            [
-                "git",
-                "-C",
-                str(repository),
-                "push",
-                "origin",
-                "HEAD:refs/heads/main",
-            ],
-            cwd=repository,
-            timeout=120,
-        )
-        _source_card_run_step(
-            "git_verify",
-            ["git", "-C", str(repository), "fetch", "origin", "main"],
-            cwd=repository,
-            timeout=60,
-        )
-        _source_card_run_step(
-            "git_verify",
-            [
-                "git",
-                "-C",
-                str(repository),
-                "merge-base",
-                "--is-ancestor",
-                commit,
-                "origin/main",
-            ],
-            cwd=repository,
-        )
-        try:
-            committed = subprocess.run(
+            changed = _source_card_run_step(
+                "git_diff",
                 [
                     "git",
                     "-C",
-                    str(repository),
-                    "show",
-                    f"origin/main:{relative}",
+                    str(landing_repository),
+                    "diff",
+                    "--cached",
+                    "--quiet",
+                    "HEAD",
+                    "--",
+                    relative,
                 ],
-                cwd=repository,
-                timeout=30,
-                capture_output=True,
-                check=False,
-                env=_source_card_clean_subprocess_env(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise _SourceCardLandingError(
-                "git_verify",
-                f"card byte verification failed: {exc}",
-            ) from exc
-        if committed.returncode != 0 or committed.stdout != card_path.read_bytes():
-            raise _SourceCardLandingError(
-                "git_verify",
-                "origin/main card bytes do not match the working card",
-            )
-        try:
-            receipt_commands = _source_card_receipt_commands(
-                card_path=card_path,
-                commit=commit,
-                intake_text=intake_text,
-                environment=environment,
-                source_message_row_id=source_message_row_id,
-            )
-            receipt_results: list[dict[str, Any]] = []
-            for command in receipt_commands:
-                result = _source_card_run_step(
-                    "receipt",
-                    command,
-                    cwd=repository,
-                    timeout=180,
-                    extra_env={"HERMES_HOME": writer_home},
+                cwd=landing_repository,
+                accepted_returncodes=(0, 1),
+            ).returncode == 1
+            if changed:
+                _source_card_run_step(
+                    "git_commit",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "commit",
+                        "--only",
+                        "-m",
+                        f"docs(research): capture {card_path.stem}",
+                        "--",
+                        relative,
+                    ],
+                    cwd=landing_repository,
+                    timeout=120,
                 )
+            commit = _source_card_run_step(
+                "git_commit",
+                ["git", "-C", str(landing_repository), "rev-parse", "HEAD"],
+                cwd=landing_repository,
+            ).stdout.strip()
+            push_error: Optional[_SourceCardLandingError] = None
+            try:
+                _source_card_run_step(
+                    "git_push",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "push",
+                        "origin",
+                        "HEAD:refs/heads/main",
+                    ],
+                    cwd=landing_repository,
+                    timeout=120,
+                )
+            except _SourceCardLandingError as exc:
+                push_error = exc
+
+            try:
+                _source_card_run_step(
+                    "git_verify",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "fetch",
+                        "origin",
+                        "main",
+                    ],
+                    cwd=landing_repository,
+                    timeout=60,
+                )
+                ancestry = _source_card_run_step(
+                    "git_verify",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "merge-base",
+                        "--is-ancestor",
+                        commit,
+                        "origin/main",
+                    ],
+                    cwd=landing_repository,
+                    accepted_returncodes=(0, 1),
+                )
+            except _SourceCardLandingError as exc:
+                detail = f"remote verification failed: {exc.step}: {exc.detail}"
+                step = "git_verify"
+                if push_error is not None:
+                    step = "git_push"
+                    detail = f"{push_error.detail}; {detail}"
+                raise _SourceCardLandingOutcomeUnknownError(
+                    step,
+                    detail,
+                    path=relative,
+                    commit=commit,
+                ) from exc
+
+            if ancestry.returncode != 0:
+                if push_error is not None:
+                    raise push_error
+                raise _SourceCardLandingOutcomeUnknownError(
+                    "git_verify",
+                    "push reported success but origin/main does not contain the commit",
+                    path=relative,
+                    commit=commit,
+                )
+
+            try:
                 try:
-                    receipt_results.append(json.loads(result.stdout))
-                except (TypeError, ValueError) as exc:
+                    committed = subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(landing_repository),
+                            "show",
+                            f"origin/main:{relative}",
+                        ],
+                        cwd=landing_repository,
+                        timeout=30,
+                        capture_output=True,
+                        check=False,
+                        env=_source_card_clean_subprocess_env(),
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
                     raise _SourceCardLandingError(
-                        "receipt",
-                        "decision writer returned invalid JSON",
+                        "git_verify",
+                        f"card byte verification failed: {exc}",
                     ) from exc
-            _source_card_run_step(
-                "git_verify",
-                ["git", "-C", str(repository), "fetch", "origin", "main"],
-                cwd=repository,
-                timeout=60,
-            )
-            _source_card_run_step(
-                "git_verify",
-                [
-                    "git",
-                    "-C",
-                    str(repository),
-                    "merge-base",
-                    "--is-ancestor",
-                    commit,
-                    "origin/main",
-                ],
-                cwd=repository,
-            )
-        except _SourceCardLandingError as exc:
-            raise _SourceCardPostLandingError(
-                exc.step,
-                exc.detail,
-                path=relative,
-                commit=commit,
-            ) from exc
-    return {
-        "path": relative,
-        "commit": commit,
-        "receipt_results": receipt_results,
-    }
+                if committed.returncode != 0 or committed.stdout != card_bytes:
+                    raise _SourceCardLandingError(
+                        "git_verify",
+                        "origin/main card bytes do not match the validated card",
+                    )
+                receipt_commands = _source_card_receipt_commands(
+                    card_path=landing_card,
+                    commit=commit,
+                    intake_text=intake_text,
+                    environment=environment,
+                    source_message_row_id=source_message_row_id,
+                )
+                receipt_results: list[dict[str, Any]] = []
+                for command in receipt_commands:
+                    result = _source_card_run_step(
+                        "receipt",
+                        command,
+                        cwd=repository,
+                        timeout=180,
+                        extra_env={"HERMES_HOME": writer_home},
+                    )
+                    try:
+                        receipt_results.append(json.loads(result.stdout))
+                    except (TypeError, ValueError) as exc:
+                        raise _SourceCardLandingError(
+                            "receipt",
+                            "decision writer returned invalid JSON",
+                        ) from exc
+                _source_card_run_step(
+                    "git_verify",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "fetch",
+                        "origin",
+                        "main",
+                    ],
+                    cwd=landing_repository,
+                    timeout=60,
+                )
+                _source_card_run_step(
+                    "git_verify",
+                    [
+                        "git",
+                        "-C",
+                        str(landing_repository),
+                        "merge-base",
+                        "--is-ancestor",
+                        commit,
+                        "origin/main",
+                    ],
+                    cwd=landing_repository,
+                )
+            except _SourceCardLandingError as exc:
+                raise _SourceCardPostLandingError(
+                    exc.step,
+                    exc.detail,
+                    path=relative,
+                    commit=commit,
+                ) from exc
+            return {
+                "path": relative,
+                "commit": commit,
+                "receipt_results": receipt_results,
+            }
 
 
 def _source_card_worker_reference_context(skill_dir: Path) -> str:
@@ -19903,6 +20100,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Create one complete source card from the injected evidence and template. "
             "Replace every template placeholder with supported evidence or an explicit "
             "not-verified statement. Do not invent facts.\n"
+            "`direct`, `adjacent`, or `upgrade-candidate` Hermes relevance requires "
+            "the bare `hermes` token in downstream learning targets; a `none:` "
+            "downstream target requires `none:` Hermes relevance.\n"
             "Return exactly one JSON object with only card_path and card_content. "
             "Do not use Markdown fences or add prose around the JSON. card_path must "
             "be one absolute lowercase flat .md path directly inside cards_root. "
@@ -20171,6 +20371,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "summary": summary,
                     "error": (
                         "source_card_post_landing_failed:"
+                        f"{exc.step}:{exc.detail}"
+                    ),
+                    "api_calls": api_calls
+                    or int(getattr(agent, "api_call_count", 0) or 0),
+                    "duration_seconds": round(time.monotonic() - started, 2),
+                    "model": worker_model,
+                    "card_path": exc.path,
+                    "commit": exc.commit,
+                    **_metrics(),
+                }
+            except _SourceCardLandingOutcomeUnknownError as exc:
+                summary = (
+                    "⚠️ Card landing outcome could not be verified: "
+                    f"{exc.path} @ {exc.commit}; {exc.step}: {exc.detail}"
+                )
+                return {
+                    "status": "partial",
+                    "summary": summary,
+                    "error": (
+                        "source_card_landing_outcome_unknown:"
                         f"{exc.step}:{exc.detail}"
                     ),
                     "api_calls": api_calls
