@@ -5166,6 +5166,7 @@ def _source_card_selected_x_post(
     return matches
 
 
+_SOURCE_CARD_EMBEDDED_TODO_RE = re.compile(r"(?i)\bTODO:")
 _SOURCE_CARD_HERMES_RELEVANCE_VALUES = ("upgrade-candidate", "adjacent", "direct")
 _SOURCE_CARD_DOWNSTREAM_TARGET_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SOURCE_CARD_NONE_PREFIX_RE = re.compile(r"(?i)^none\s*:\s*(\S.*)$")
@@ -5335,7 +5336,7 @@ def _finalize_source_card_worker_draft(
         if in_manifest and line.startswith("## "):
             in_manifest = False
         if line.startswith("# ") and (
-            line[2:].strip().upper().startswith("TODO:")
+            bool(_SOURCE_CARD_EMBEDDED_TODO_RE.search(line[2:].strip()))
             or line[2:].strip()
             in {
                 "Source card from gateway-prefetched evidence",
@@ -5352,12 +5353,12 @@ def _finalize_source_card_worker_draft(
             # per line: the two are cross-dependent, so rendering one without
             # the other's value guesses at the cross-field rule.
             if in_manifest and field_name == "decision-key" and (
-                not value or value.upper().startswith("TODO:")
+                not value or _SOURCE_CARD_EMBEDDED_TODO_RE.search(value)
             ):
                 output.append("- no-decision-reason: watch-only")
                 continue
             if in_manifest and field_name == "no-decision-reason" and (
-                not value or value.upper().startswith("TODO:")
+                not value or _SOURCE_CARD_EMBEDDED_TODO_RE.search(value)
             ):
                 output.append("- no-decision-reason: watch-only")
                 continue
@@ -5366,7 +5367,11 @@ def _finalize_source_card_worker_draft(
                 continue
             if (
                 not value
-                or value.upper().startswith("TODO:")
+                # Matched anywhere, not only as a prefix: a value such as
+                # `no advisories found - TODO: verify` is just as unfilled, and
+                # a prefix-only test sent it to the fail-closed guard below
+                # instead of substituting an evidence-safe default.
+                or _SOURCE_CARD_EMBEDDED_TODO_RE.search(value)
                 or value == unavailable
                 or value == neutral_defaults.get(field_name)
                 or (
