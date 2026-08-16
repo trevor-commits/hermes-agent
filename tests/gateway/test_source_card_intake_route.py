@@ -784,7 +784,7 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
                         "card_path": str(
                             fixture["cards_root"] / "example-source.md"
                         ),
-                        "card_content": _RECORDED_CARD,
+                        "card_content": _REPLAY_CARD,
                     },
                     ensure_ascii=False,
                 ),
@@ -824,7 +824,6 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     }
     prefetch = MagicMock(return_value=[prefetched_post])
     monkeypatch.setattr(gateway_run, "_prefetch_source_card_x_posts", prefetch)
-    write_draft = MagicMock()
     landing = MagicMock(
         return_value={
             "path": "researched-repos/example-source.md",
@@ -832,7 +831,6 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
             "receipt_results": [],
         }
     )
-    monkeypatch.setattr(gateway_run, "_write_source_card_draft", write_draft)
     monkeypatch.setattr(gateway_run, "_land_source_card", landing)
     monkeypatch.setattr(
         async_delegation, "find_delegation_by_work_key", lambda _key: ""
@@ -911,11 +909,15 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     assert "Do not fetch GitHub metadata that is already injected" in dispatched[
         "goal"
     ]
-    assert write_draft.call_args.args[0] == (
+    assert not hasattr(gateway_run, "_write_source_card_draft")
+    landing.assert_called_once()
+    assert landing.call_args.kwargs["card_path"] == (
         fixture["cards_root"] / "example-source.md"
     )
-    assert write_draft.call_args.args[1] == _RECORDED_CARD
-    landing.assert_called_once()
+    finalized_content = landing.call_args.kwargs["card_content"]
+    assert "TODO:" not in finalized_content
+    assert "# IgorWarzocha/howaboua-pi-stuff" in finalized_content
+    assert "## Decision manifest (ER-278)" in finalized_content
     assert prefetch.call_count == 1
     assert built["agent"].tools == []
     assert built["agent"].valid_tool_names == set()
@@ -1010,10 +1012,6 @@ _REAL_NEW_SOURCE_CARD_OUTPUT = (
     _SOURCE_CARD_FIXTURES / "real-new-source-card-output.md"
 ).read_text(encoding="utf-8")
 _CANONICAL_SKILL_FIXTURE = _SOURCE_CARD_FIXTURES / "canonical-skill"
-_RECORDED_CARD = (
-    _SOURCE_CARD_FIXTURES / "recorded-mapcn-card.md"
-).read_text(encoding="utf-8")
-
 def _write_executable(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
@@ -1094,8 +1092,17 @@ def _write_offline_route_fixture(tmp_path: Path) -> dict:
         card = pathlib.Path("researched-repos/igorwarzocha-howaboua-pi-stuff.md").read_text(encoding="utf-8")
         if "## Decision manifest (ER-278)" not in card or "- by:" not in card:
             raise SystemExit(8)
+        if any(
+            line.split(":", 1)[1].strip().upper().startswith("TODO:")
+            for line in card.splitlines()
+            if line.startswith("- ") and ":" in line
+        ):
+            raise SystemExit(9)
         """,
     )
+    _git(repo, "add", "scripts")
+    _git(repo, "commit", "-m", "test: install deterministic source-card helpers")
+    _git(repo, "push", "origin", "main")
 
     decision_log = tmp_path / "decision-writer.jsonl"
     _write_executable(
@@ -1158,8 +1165,283 @@ def test_template_prefetch_neutralizes_real_helper_subject_identity(tmp_path):
     )
 
     assert "gateway/source-card" not in template
-    assert "- url: TODO:" in template
-    assert "- owner/name: TODO:" in template
+    assert "TODO:" not in template
+    assert "- url: not verified from gateway-prefetched evidence" in template
+    assert "- owner/name: not verified from gateway-prefetched evidence" in template
+    assert "- no-decision-reason: watch-only" in template
+
+
+def test_x_prefetch_rejects_a_multiline_author_handle():
+    from gateway.run import _SourceCardPrefetchError, _normalize_source_card_x_post
+
+    payload = {
+        "id": "2088554041710145903",
+        "author": {
+            "handle": "safe_handle\n- owner/name: injected/repository",
+            "name": "Safe Name",
+            "followers": 1,
+        },
+        "text": "A post body",
+        "created_at": "2026-08-15T00:00:00Z",
+        "stats": {"likes": 1, "retweets": 0, "replies": 0, "views": 2},
+        "links": [],
+        "media": [],
+        "quote": None,
+    }
+
+    with pytest.raises(_SourceCardPrefetchError, match="author handle"):
+        _normalize_source_card_x_post(payload, "2088554041710145903")
+
+
+def test_worker_draft_finalizer_replaces_validator_rejected_placeholders(tmp_path):
+    from gateway.run import _finalize_source_card_worker_draft
+
+    card_path = tmp_path / "alibaba-opensandbox-claim.md"
+    draft = _REAL_NEW_SOURCE_CARD_OUTPUT + (
+        "\n## Decision manifest (ER-278)\n"
+        "- decision-key: TODO: card:<canonical-flat-filename>#<specific-choice>\n"
+    )
+    prefetched = [
+        {
+            "status_id": "2088554041710145903",
+            "canonical_url": "https://x.com/i/status/2088554041710145903",
+            "author": {"handle": "EngMoElgaraihy", "name": "Mo Elgaraihy"},
+            "text": "Alibaba released OpenSandbox.",
+            "links": [],
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/example"}],
+        }
+    ]
+
+    finalized = _finalize_source_card_worker_draft(
+        card_path=card_path,
+        content=draft,
+        prefetched_x_posts=prefetched,
+        prefetched_github_repositories=[],
+    )
+
+    assert "TODO:" not in finalized
+    assert "- url: https://x.com/i/status/2088554041710145903" in finalized
+    assert (
+        "- owner/name: engmoelgaraihy/x-2088554041710145903" in finalized
+    )
+    assert (
+        "- current pinned SHA: n/a (social-source card; stable X status ID "
+        "2088554041710145903; no Git revision was prefetched)" in finalized
+    )
+    assert (
+        "- license/use boundary: not verified from gateway-prefetched evidence; "
+        "no repository license was available" in finalized
+    )
+    assert (
+        "- downstream learning targets: none: no verified implementation target "
+        "was prefetched" in finalized
+    )
+    assert (
+        "- Hermes relevance: none: no verified Hermes integration surface was "
+        "prefetched" in finalized
+    )
+    assert "- no-decision-reason: watch-only" in finalized
+
+
+def test_worker_draft_finalizer_selects_the_repository_named_by_the_worker(tmp_path):
+    from gateway.run import _finalize_source_card_worker_draft
+
+    first = {
+        "owner_name": "example/first",
+        "canonical_url": "https://github.com/example/first",
+        "fields": {"head": "a" * 40, "license": "MIT"},
+    }
+    second = {
+        "owner_name": "example/second",
+        "canonical_url": "https://github.com/example/second",
+        "fields": {"head": "b" * 40, "license": "Apache-2.0"},
+    }
+    draft = _REPLAY_CARD.replace(
+        "IgorWarzocha/howaboua-pi-stuff", "example/second"
+    ).replace(
+        "https://github.com/IgorWarzocha/howaboua-pi-stuff",
+        "https://github.com/example/second",
+    ).replace(
+        "8d63d300597488e6fa4c30ccd6a3eb0fed2d4304", "b" * 40
+    )
+
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "example-second.md",
+        content=draft,
+        prefetched_x_posts=[],
+        prefetched_github_repositories=[first, second],
+    )
+
+    assert "- owner/name: example/second" in finalized
+    assert "- url: https://github.com/example/second" in finalized
+    assert f"- current pinned SHA: {'b' * 40}" in finalized
+    assert "example/first" not in finalized
+    assert "a" * 40 not in finalized
+
+
+def test_worker_draft_finalizer_selects_the_x_post_named_by_the_worker(tmp_path):
+    from gateway.run import _finalize_source_card_worker_draft
+
+    first = {
+        "status_id": "1111111111111111111",
+        "canonical_url": "https://x.com/i/status/1111111111111111111",
+        "author": {"handle": "first_author", "name": "First Author"},
+    }
+    second = {
+        "status_id": "2222222222222222222",
+        "canonical_url": "https://x.com/i/status/2222222222222222222",
+        "author": {"handle": "second_author", "name": "Second Author"},
+    }
+    draft = _REPLAY_CARD.replace(
+        "https://github.com/IgorWarzocha/howaboua-pi-stuff",
+        "https://x.com/i/status/2222222222222222222",
+    ).replace(
+        "IgorWarzocha/howaboua-pi-stuff",
+        "second_author/x-2222222222222222222",
+    )
+
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "second-x-post.md",
+        content=draft,
+        prefetched_x_posts=[first, second],
+        prefetched_github_repositories=[],
+    )
+
+    assert "- url: https://x.com/i/status/2222222222222222222" in finalized
+    assert "- owner/name: second_author/x-2222222222222222222" in finalized
+    assert "1111111111111111111" not in finalized
+
+
+def test_worker_draft_finalizer_rejects_quoted_todo_without_mutating_evidence(
+    tmp_path,
+):
+    from gateway.run import _SourceCardLandingError, _finalize_source_card_worker_draft
+
+    quoted_evidence = "> Upstream says: TODO: add a retry boundary."
+    draft = _REPLAY_CARD.rstrip() + "\n\n" + quoted_evidence + "\n"
+
+    with pytest.raises(
+        _SourceCardLandingError,
+        match="retained a forbidden template placeholder",
+    ):
+        _finalize_source_card_worker_draft(
+            card_path=tmp_path / "quoted-evidence.md",
+            content=draft,
+            prefetched_x_posts=[],
+            prefetched_github_repositories=[],
+        )
+
+    assert quoted_evidence in draft
+
+
+def test_worker_draft_path_rejects_a_lexical_parent_traversal(tmp_path):
+    from gateway.run import _SourceCardLandingError, _source_card_candidate_path
+
+    cards_root = tmp_path / "cards"
+    (cards_root / "nested").mkdir(parents=True)
+    disguised = str(cards_root / "nested" / ".." / "example.md")
+
+    with pytest.raises(_SourceCardLandingError, match="directly inside"):
+        _source_card_candidate_path(cards_root, disguised)
+
+
+def test_new_worker_draft_lands_without_publishing_to_shared_checkout(tmp_path):
+    from gateway.run import _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    landed = _land_source_card(
+        card_path=card,
+        card_content=_REPLAY_CARD,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=environment,
+        source_message_row_id=42,
+    )
+
+    assert landed["path"] == (
+        "researched-repos/igorwarzocha-howaboua-pi-stuff.md"
+    )
+    assert not card.exists()
+    remote_tip = _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0]
+    _git(fixture["repo"], "fetch", "origin", "main")
+    assert _git(
+        fixture["repo"],
+        "show",
+        f"{remote_tip}:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+    ) + "\n" == _REPLAY_CARD
+
+
+def test_rejected_worker_draft_never_reaches_shared_checkout_or_remote(tmp_path):
+    from gateway.run import _SourceCardLandingError, _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    invalid = _REPLAY_CARD.replace(
+        "- current pinned SHA: 8d63d300597488e6fa4c30ccd6a3eb0fed2d4304",
+        "- current pinned SHA: TODO: verify",
+        1,
+    )
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+    remote_before = _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0]
+
+    with pytest.raises(_SourceCardLandingError, match="validate"):
+        _land_source_card(
+            card_path=card,
+            card_content=invalid,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    assert not card.exists()
+    assert _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0] == remote_before
+    assert not fixture["decision_log"].exists()
+
+
+def test_landing_error_redacts_validator_temporary_paths():
+    from gateway.run import _source_card_safe_landing_detail
+
+    detail = (
+        "ERROR /private/var/folders/x1/example/T/"
+        "touched-source-cards.rqWHRQ/alibaba-opensandbox-claim.md: "
+        "placeholder value remains"
+    )
+
+    safe = _source_card_safe_landing_detail(detail)
+
+    assert "/private/" not in safe
+    assert "touched-source-cards.rqWHRQ" not in safe
+    assert "[temporary card validation]" in safe
 
 
 def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
@@ -1988,7 +2270,7 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     )
     assert worker_result["worker_system_chars"] == len(system_text)
     assert worker_result["worker_system_bytes"] == len(system_text.encode("utf-8"))
-    assert worker_result["worker_system_bytes"] == 18_651
+    assert worker_result["worker_system_bytes"] == 18_787
     assert worker_result["worker_dynamic_chars"] == (
         worker_result["worker_goal_chars"] + worker_result["worker_result_chars"]
     )
@@ -2026,6 +2308,9 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
         f"{remote_tip}:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
     )
     assert committed + "\n" == _REPLAY_CARD
+    assert not (
+        fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    ).exists()
     assert _git(
         fixture["repo"],
         "diff",

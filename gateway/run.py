@@ -4074,6 +4074,27 @@ def _source_card_normalized_text(
     return value
 
 
+def _source_card_normalized_single_line(
+    value: Any,
+    *,
+    label: str,
+    max_chars: int,
+    optional: bool = True,
+) -> Optional[str]:
+    """Bound untrusted text that may later appear in Markdown structure."""
+    normalized = _source_card_normalized_text(
+        value,
+        label=label,
+        max_chars=max_chars,
+        optional=optional,
+    )
+    if normalized is None:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in normalized):
+        raise _SourceCardPrefetchError(f"exit 0: invalid {label} in x-lookup JSON")
+    return normalized
+
+
 def _normalize_source_card_x_post(payload: Any, status_id: str) -> dict[str, Any]:
     """Allowlist and bound the untrusted normalized JSON from x-lookup."""
     if not isinstance(payload, dict) or str(payload.get("id") or "") != status_id:
@@ -4083,11 +4104,18 @@ def _normalize_source_card_x_post(payload: Any, status_id: str) -> dict[str, Any
     if not isinstance(author_raw, dict) or not isinstance(stats_raw, dict):
         raise _SourceCardPrefetchError("exit 0: invalid author or stats in x-lookup JSON")
 
+    author_handle = _source_card_normalized_single_line(
+        author_raw.get("handle"), label="author handle", max_chars=32
+    )
+    if author_handle is not None and not re.fullmatch(
+        r"@?[A-Za-z0-9_]{1,32}", author_handle
+    ):
+        raise _SourceCardPrefetchError(
+            "exit 0: invalid author handle in x-lookup JSON"
+        )
     author = {
-        "handle": _source_card_normalized_text(
-            author_raw.get("handle"), label="author handle", max_chars=128
-        ),
-        "name": _source_card_normalized_text(
+        "handle": author_handle,
+        "name": _source_card_normalized_single_line(
             author_raw.get("name"), label="author name", max_chars=256
         ),
         "followers": author_raw.get("followers")
@@ -4153,7 +4181,7 @@ def _normalize_source_card_x_post(payload: Any, status_id: str) -> dict[str, Any
         if not isinstance(quote_raw, dict):
             raise _SourceCardPrefetchError("exit 0: invalid quote in x-lookup JSON")
         quote = {
-            "author": _source_card_normalized_text(
+            "author": _source_card_normalized_single_line(
                 quote_raw.get("author"), label="quote author", max_chars=128
             ),
             "text": _source_card_normalized_text(
@@ -4168,7 +4196,7 @@ def _normalize_source_card_x_post(payload: Any, status_id: str) -> dict[str, Any
         "text": _source_card_normalized_text(
             payload.get("text"), label="post text", max_chars=8_000
         ),
-        "created_at": _source_card_normalized_text(
+        "created_at": _source_card_normalized_single_line(
             payload.get("created_at"), label="creation time", max_chars=128
         ),
         "stats": stats,
@@ -4509,24 +4537,40 @@ def _prefetch_source_card_template(new_source_card: Path) -> str:
         raise _SourceCardPrefetchError(
             "source-card template output is missing the strict card title"
         )
-    lines[0] = "# TODO: source-card title from prefetched evidence"
+    lines[0] = "# Source card from gateway-prefetched evidence"
     for index, line in enumerate(lines):
-        if line.startswith("- url:"):
-            lines[index] = "- url: TODO: canonical URL from prefetched evidence"
-        elif line.startswith("- owner/name:"):
+        field = re.fullmatch(r"- ([^:]+):\s*(.*)", line)
+        if field and (
+            field.group(1).strip().lower() in {"url", "owner/name"}
+            or not field.group(2).strip()
+            or field.group(2).strip().upper().startswith("TODO:")
+        ):
             lines[index] = (
-                "- owner/name: TODO: canonical owner/name from prefetched evidence"
+                f"- {field.group(1)}: "
+                + _source_card_placeholder_defaults(
+                    prefetched_x_posts=[],
+                    prefetched_github_repositories=[],
+                ).get(
+                    field.group(1).strip().lower(),
+                    "not verified from gateway-prefetched evidence",
+                )
             )
     neutral = "\n".join(lines).rstrip()
     if "## Decision manifest (ER-278)" not in neutral:
         neutral += (
             "\n\n## Decision manifest (ER-278)\n"
-            "- decision-key: TODO: card:<canonical-flat-filename>#<specific-choice>"
+            "- no-decision-reason: watch-only"
         )
+    neutral = re.sub(
+        r"(?i)\bTODO:\s*",
+        "not verified: ",
+        neutral,
+    )
     if (
         len(neutral.encode("utf-8")) > _SOURCE_CARD_TEMPLATE_MAX_BYTES
         or neutral.count("## Decision manifest (ER-278)") != 1
         or "gateway/source-card" in neutral
+        or re.search(r"(?i)\bTODO:", neutral)
     ):
         raise _SourceCardPrefetchError(
             "source-card template could not be made subject-neutral"
@@ -4559,6 +4603,11 @@ def _source_card_safe_landing_detail(detail: Any) -> str:
     safe = re.sub(
         r"\S*hermes-source-card-landing-\S*",
         "[temporary landing checkout]",
+        safe,
+    )
+    safe = re.sub(
+        r"(?:/[^\s:]+)*/touched-source-cards\.[^/\s:]+/",
+        "[temporary card validation]/",
         safe,
     )
     return safe.strip()[:800] or "unknown error"
@@ -4781,7 +4830,10 @@ def _source_card_candidate_path(cards_root: Path, raw_path: str) -> Path:
         )
     candidate = Path(raw_path)
     root = cards_root.resolve(strict=True)
-    if candidate.parent.resolve(strict=True) != root:
+    if (
+        candidate.parent.resolve(strict=True) != root
+        or candidate != root / candidate.name
+    ):
         raise _SourceCardLandingError(
             "worker_output",
             "card_path must be directly inside the configured cards root",
@@ -4844,48 +4896,313 @@ def _parse_source_card_worker_draft(
     return path, content
 
 
-def _write_source_card_draft(path: Path, content: str) -> None:
-    """Publish one new card atomically without overwriting an existing path."""
-    root = path.parent.resolve(strict=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".source-card-gateway-",
-        dir=root,
-    )
-    temporary = Path(temporary_name)
-    try:
-        encoded = content.encode("utf-8")
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            os.fchmod(handle.fileno(), 0o644)
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        temporary.unlink()
-        directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
-            raise _SourceCardLandingError(
-                "write",
-                "published card bytes did not match the worker draft",
+def _source_card_placeholder_defaults(
+    *,
+    prefetched_x_posts: list[dict[str, Any]],
+    prefetched_github_repositories: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Return evidence-safe values for fields a worker could not verify."""
+    unavailable = "not verified from gateway-prefetched evidence"
+    defaults = {
+        "url": unavailable,
+        "owner/name": unavailable,
+        "drift risk": "high: unresolved facts require verification before use",
+        "freshness threshold": "refresh before any trust, pilot, or adoption decision",
+        "current pinned sha": "n/a (no Git revision was prefetched)",
+        "execution/pilot status": (
+            "NOT installed, run, built, tested, or connected; no credentials or "
+            "private data were sent"
+        ),
+        "license/use boundary": (
+            "not verified from gateway-prefetched evidence; no repository license "
+            "was available"
+        ),
+        "security policy / vulnerability reporting": (
+            "not inspected; no verified repository was prefetched"
+        ),
+        "credential and secret surfaces": (
+            "none identified in gateway-prefetched evidence; not inspected"
+        ),
+        "network/api/webhook/tunnel/browser surface": (
+            "none identified in gateway-prefetched evidence; not inspected"
+        ),
+        "local file/config mutation surface": (
+            "none identified in gateway-prefetched evidence; not inspected"
+        ),
+        "sensitive data classes": (
+            "none identified in gateway-prefetched evidence; not inspected"
+        ),
+        "install/run blast radius": (
+            "high until the referenced artifact and execution behavior are verified"
+        ),
+        "risk signal": (
+            "insufficient evidence for a code or runtime safety assessment"
+        ),
+        "disposition": "watch-until: missing source evidence is verified",
+        "downstream learning targets": (
+            "none: no verified implementation target was prefetched"
+        ),
+        "hermes relevance": (
+            "none: no verified Hermes integration surface was prefetched"
+        ),
+        "by": "Hermes gateway source-card worker",
+    }
+
+    github = prefetched_github_repositories[0] if prefetched_github_repositories else None
+    if isinstance(github, dict):
+        owner_name = str(github.get("owner_name") or "").strip()
+        canonical_url = str(github.get("canonical_url") or "").strip()
+        fields = github.get("fields")
+        fields = fields if isinstance(fields, dict) else {}
+        if owner_name:
+            defaults["owner/name"] = owner_name
+        if canonical_url:
+            defaults["url"] = canonical_url
+        head = str(fields.get("head") or "").strip()
+        if head:
+            defaults["current pinned sha"] = head
+        license_value = str(fields.get("license") or "").strip()
+        if license_value:
+            defaults["license/use boundary"] = (
+                f"{license_value} in prefetched GitHub metadata; file-level and "
+                "dependency terms were not verified"
             )
-    except FileExistsError as exc:
+
+    post = prefetched_x_posts[0] if prefetched_x_posts else None
+    if isinstance(post, dict):
+        status_id = str(post.get("status_id") or "").strip()
+        canonical_url = str(post.get("canonical_url") or "").strip()
+        author = post.get("author")
+        author = author if isinstance(author, dict) else {}
+        handle = str(author.get("handle") or "").strip().lstrip("@").lower()
+        if canonical_url and defaults["url"] == unavailable:
+            defaults["url"] = canonical_url
+        if status_id and defaults["owner/name"] == unavailable:
+            safe_handle = re.sub(r"[^a-z0-9_.-]+", "-", handle).strip("-._")
+            defaults["owner/name"] = f"{safe_handle or 'x-post'}/x-{status_id}"
+            defaults["current pinned sha"] = (
+                "n/a (social-source card; stable X status ID "
+                f"{status_id}; no Git revision was prefetched)"
+            )
+            defaults["license/use boundary"] = (
+                "not verified from gateway-prefetched evidence; no repository "
+                "license was available"
+            )
+    return defaults
+
+
+def _source_card_selected_github_repository(
+    content: str,
+    prefetched_github_repositories: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind a multi-repository draft to exactly one prefetched subject."""
+    if len(prefetched_github_repositories) <= 1:
+        return prefetched_github_repositories
+
+    field_values: dict[str, set[str]] = {"url": set(), "owner/name": set()}
+    for line in content.splitlines():
+        field = re.fullmatch(r"- ([^:]+):\s*(.*)", line)
+        if not field:
+            continue
+        field_name = field.group(1).strip().lower()
+        if field_name in field_values:
+            value = field.group(2).strip()
+            if value:
+                field_values[field_name].add(value)
+    if any(len(values) > 1 for values in field_values.values()):
         raise _SourceCardLandingError(
-            "write",
-            "card path appeared before publication",
-        ) from exc
-    except _SourceCardLandingError:
-        raise
-    except OSError as exc:
-        raise _SourceCardLandingError("write", str(exc)) from exc
-    finally:
-        if temporary.exists():
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+            "worker_output",
+            "card draft identified conflicting prefetched GitHub repositories",
+        )
+
+    draft_url = next(iter(field_values["url"]), "").rstrip("/")
+    draft_owner = next(iter(field_values["owner/name"]), "").casefold()
+    matches: list[dict[str, Any]] = []
+    for repository in prefetched_github_repositories:
+        owner_name = str(repository.get("owner_name") or "").strip()
+        canonical_url = str(repository.get("canonical_url") or "").strip()
+        if (
+            draft_owner
+            and owner_name
+            and draft_owner == owner_name.casefold()
+        ) or (
+            draft_url
+            and canonical_url
+            and draft_url == canonical_url.rstrip("/")
+        ):
+            matches.append(repository)
+    if len(matches) != 1:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "card draft did not identify exactly one prefetched GitHub repository",
+        )
+    return matches
+
+
+def _source_card_selected_x_post(
+    content: str,
+    prefetched_x_posts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind a multi-post social draft to exactly one prefetched status."""
+    if len(prefetched_x_posts) <= 1:
+        return prefetched_x_posts
+
+    field_values: dict[str, set[str]] = {"url": set(), "owner/name": set()}
+    for line in content.splitlines():
+        field = re.fullmatch(r"- ([^:]+):\s*(.*)", line)
+        if not field:
+            continue
+        field_name = field.group(1).strip().lower()
+        if field_name in field_values:
+            value = field.group(2).strip()
+            if value:
+                field_values[field_name].add(value)
+    if any(len(values) > 1 for values in field_values.values()):
+        raise _SourceCardLandingError(
+            "worker_output",
+            "card draft identified conflicting prefetched X posts",
+        )
+
+    draft_url = next(iter(field_values["url"]), "").rstrip("/")
+    draft_owner = next(iter(field_values["owner/name"]), "").casefold()
+    matches: list[dict[str, Any]] = []
+    for post in prefetched_x_posts:
+        status_id = str(post.get("status_id") or "").strip()
+        canonical_url = str(post.get("canonical_url") or "").strip()
+        owner_suffix = f"/x-{status_id}".casefold() if status_id else ""
+        if (
+            draft_url
+            and canonical_url
+            and draft_url == canonical_url.rstrip("/")
+        ) or (
+            draft_owner
+            and owner_suffix
+            and draft_owner.endswith(owner_suffix)
+        ):
+            matches.append(post)
+    if len(matches) != 1:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "card draft did not identify exactly one prefetched X post",
+        )
+    return matches
+
+
+def _finalize_source_card_worker_draft(
+    *,
+    card_path: Path,
+    content: str,
+    prefetched_x_posts: list[dict[str, Any]],
+    prefetched_github_repositories: list[dict[str, Any]],
+) -> str:
+    """Replace known template residue with bounded evidence-safe statements."""
+    selected_github_repositories = _source_card_selected_github_repository(
+        content,
+        prefetched_github_repositories,
+    )
+    selected_x_posts = (
+        []
+        if selected_github_repositories
+        else _source_card_selected_x_post(content, prefetched_x_posts)
+    )
+    defaults = _source_card_placeholder_defaults(
+        prefetched_x_posts=selected_x_posts,
+        prefetched_github_repositories=selected_github_repositories,
+    )
+    neutral_defaults = _source_card_placeholder_defaults(
+        prefetched_x_posts=[],
+        prefetched_github_repositories=[],
+    )
+    unavailable = "not verified from gateway-prefetched evidence"
+    post = selected_x_posts[0] if selected_x_posts else {}
+    status_id = str(post.get("status_id") or "").strip() if isinstance(post, dict) else ""
+    author = post.get("author") if isinstance(post, dict) else {}
+    author = author if isinstance(author, dict) else {}
+    handle = str(author.get("handle") or "").strip().lstrip("@")
+    locked_fields = {"url", "owner/name", "current pinned sha"}
+    if selected_x_posts and not selected_github_repositories:
+        locked_fields.update(
+            {
+                "license/use boundary",
+                "security policy / vulnerability reporting",
+            }
+        )
+    if selected_github_repositories:
+        github_owner = str(
+            selected_github_repositories[0].get("owner_name") or ""
+        ).strip()
+        title = github_owner or f"Source card: {card_path.stem}"
+    elif status_id:
+        title = f"X post {status_id} by @{handle}"
+    else:
+        title = f"Source card: {card_path.stem}"
+
+    output: list[str] = []
+    in_manifest = False
+    for line in content.splitlines():
+        if line.strip() == "## Decision manifest (ER-278)":
+            in_manifest = True
+            output.append(line)
+            continue
+        if in_manifest and line.startswith("## "):
+            in_manifest = False
+        if line.startswith("# ") and (
+            line[2:].strip().upper().startswith("TODO:")
+            or line[2:].strip()
+            in {
+                "Source card from gateway-prefetched evidence",
+                "gateway/source-card",
+            }
+        ):
+            output.append(f"# {title}")
+            continue
+        field = re.fullmatch(r"(- ([^:]+):\s*)(.*)", line)
+        if field:
+            field_name = field.group(2).strip().lower()
+            value = field.group(3).strip()
+            if in_manifest and field_name == "decision-key" and (
+                not value or value.upper().startswith("TODO:")
+            ):
+                output.append("- no-decision-reason: watch-only")
+                continue
+            if in_manifest and field_name == "no-decision-reason" and (
+                not value or value.upper().startswith("TODO:")
+            ):
+                output.append("- no-decision-reason: watch-only")
+                continue
+            if field_name in locked_fields and defaults.get(field_name) != unavailable:
+                output.append(field.group(1) + defaults[field_name])
+                continue
+            if (
+                not value
+                or value.upper().startswith("TODO:")
+                or value == unavailable
+                or value == neutral_defaults.get(field_name)
+                or (
+                    field_name == "url"
+                    and value == "https://github.com/gateway/source-card"
+                )
+                or (field_name == "owner/name" and value == "gateway/source-card")
+            ):
+                output.append(
+                    field.group(1)
+                    + defaults.get(field_name, unavailable)
+                )
+                continue
+        output.append(line)
+
+    finalized = "\n".join(output).rstrip() + "\n"
+    if re.search(r"(?i)\bTODO:", finalized):
+        raise _SourceCardLandingError(
+            "worker_output",
+            "card_content retained a forbidden template placeholder",
+        )
+    if len(finalized.encode("utf-8")) > _SOURCE_CARD_WORKER_RESULT_MAX_BYTES:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "finalized card_content exceeded the configured byte limit",
+        )
+    return finalized
 
 
 def _source_card_fields_and_manifest(
@@ -5172,18 +5489,54 @@ def _source_card_isolated_landing_repository(repository: Path):
 def _land_source_card(
     *,
     card_path: Path,
+    card_content: Optional[str] = None,
     intake_text: str,
     environment: dict[str, str],
     source_message_row_id: int,
 ) -> dict[str, Any]:
     """Validate, commit, push, receipt, and re-verify one exact card."""
     cards_root = Path(environment["cards_root"]).resolve(strict=True)
-    if card_path.resolve(strict=True).parent != cards_root or card_path.is_symlink():
+    try:
+        candidate_parent = card_path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _SourceCardLandingError(
+            "validate", "card parent is unavailable"
+        ) from exc
+    if candidate_parent != cards_root or card_path.is_symlink():
         raise _SourceCardLandingError("validate", "card path is outside the cards root")
     repository = cards_root.parent
     relative = card_path.relative_to(repository).as_posix()
-    card_bytes = card_path.read_bytes()
-    validator = environment["source_card_validator"]
+    shared_card = card_path if card_content is None else None
+    if card_content is None:
+        try:
+            if not card_path.is_file():
+                raise OSError("card is not a regular file")
+            card_bytes = card_path.read_bytes()
+        except OSError as exc:
+            raise _SourceCardLandingError(
+                "validate", f"card could not be read: {exc}"
+            ) from exc
+    else:
+        if (
+            not isinstance(card_content, str)
+            or not card_content.strip()
+            or "\x00" in card_content
+        ):
+            raise _SourceCardLandingError(
+                "validate", "card_content is empty or unsafe"
+            )
+        card_bytes = card_content.encode("utf-8")
+        if len(card_bytes) > _SOURCE_CARD_WORKER_RESULT_MAX_BYTES:
+            raise _SourceCardLandingError(
+                "validate", "card_content exceeded the configured byte limit"
+            )
+    validator = Path(environment["source_card_validator"]).resolve(strict=True)
+    try:
+        validator_relative = validator.relative_to(repository)
+    except ValueError as exc:
+        raise _SourceCardLandingError(
+            "validate", "source-card validator is outside the cards repository"
+        ) from exc
     writer_home = str(Path(environment["decision_writer"]).parent.parent)
 
     with _SOURCE_CARD_LANDING_LOCK:
@@ -5222,23 +5575,6 @@ def _land_source_card(
                     "git_clean",
                     "dirty tracked card requires operator reconciliation",
                 )
-        # Fail before staging, committing, or pushing when the card cannot
-        # produce writer-valid decision receipts. Keep this after the dirty
-        # tracked-card guard so operator-owned edits retain their stronger,
-        # non-absorbing failure classification.
-        _source_card_fields_and_manifest(card_path)
-        _source_card_run_step(
-            "validate",
-            [validator, "--card", relative, "--no-full-backlog"],
-            cwd=repository,
-            timeout=120,
-        )
-        if card_path.read_bytes() != card_bytes:
-            raise _SourceCardLandingError(
-                "validate",
-                "card bytes changed during validation",
-            )
-
         with _source_card_isolated_landing_repository(repository) as landing_repository:
             landing_cards_root = landing_repository / cards_root.name
             if landing_cards_root.exists():
@@ -5280,6 +5616,37 @@ def _land_source_card(
                         "git_clone",
                         f"could not write isolated card: {exc}",
                     ) from exc
+
+            landing_validator = landing_repository / validator_relative
+            if (
+                landing_validator.is_symlink()
+                or not landing_validator.is_file()
+                or not os.access(landing_validator, os.X_OK)
+            ):
+                raise _SourceCardLandingError(
+                    "validate",
+                    "isolated source-card validator is unavailable",
+                )
+            # Receipt parsing and strict touched-card validation both operate on
+            # the exact immutable candidate that may be committed. A rejected
+            # model draft never appears in the shared checkout.
+            _source_card_fields_and_manifest(landing_card)
+            _source_card_run_step(
+                "validate",
+                [str(landing_validator), "--card", relative, "--no-full-backlog"],
+                cwd=landing_repository,
+                timeout=120,
+            )
+            if landing_card.read_bytes() != card_bytes:
+                raise _SourceCardLandingError(
+                    "validate",
+                    "isolated card bytes changed during validation",
+                )
+            if shared_card is not None and shared_card.read_bytes() != card_bytes:
+                raise _SourceCardLandingError(
+                    "validate",
+                    "shared card bytes changed during validation",
+                )
 
             _source_card_run_step(
                 "git_add",
@@ -20749,7 +21116,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "template loading. Do not fetch GitHub metadata that is already injected.\n"
             "Create one complete source card from the injected evidence and template. "
             "Replace every template placeholder with supported evidence or an explicit "
-            "not-verified statement. Do not invent facts.\n"
+            "not-verified statement. Never emit `TODO:`, template hints, or placeholder "
+            "values. For unresolved facts, write `not verified - <specific evidence "
+            "boundary>`. For inapplicable fields, write `not applicable - <specific "
+            "reason>`. Do not invent facts.\n"
             "`direct`, `adjacent`, or `upgrade-candidate` Hermes relevance requires "
             "the bare `hermes` token in downstream learning targets; a `none:` "
             "downstream target requires `none:` Hermes relevance.\n"
@@ -20898,6 +21268,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             worker_result_bytes = 0
             worker_effective_system = worker_system
             api_calls = 0
+            generated_card_draft = False
 
             def _metrics() -> dict[str, int]:
                 worker_dynamic_chars = len(worker_goal) + worker_result_chars
@@ -20989,10 +21360,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         str(normalized["summary"]),
                         Path(worker_environment["cards_root"]),
                     )
-                    _write_source_card_draft(card_path, card_content)
+                    generated_card_draft = True
+                    card_content = _finalize_source_card_worker_draft(
+                        card_path=card_path,
+                        content=card_content,
+                        prefetched_x_posts=prefetched_x_posts,
+                        prefetched_github_repositories=(
+                            prefetched_github_repositories
+                        ),
+                    )
 
                 landing = _land_source_card(
                     card_path=card_path,
+                    card_content=(card_content if agent is not None else None),
                     intake_text=intake_text,
                     environment=worker_environment,
                     source_message_row_id=source_message_row_id,
@@ -21055,7 +21435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 card_exists = bool(card_path is not None and card_path.exists())
                 prefix = (
                     "source_card_landing_failed"
-                    if card_exists
+                    if card_exists and not generated_card_draft
                     else "source_card_worker_failed"
                 )
                 return {
