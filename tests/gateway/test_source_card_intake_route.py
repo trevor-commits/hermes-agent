@@ -2847,3 +2847,131 @@ def test_attestation_receipt_flows_from_the_real_conversation_loop():
     assert error is not None
     assert "call 3" in error and "glm-5.4" in error
     assert "call 1" not in error and "call 2" not in error
+
+
+# --- authenticated push rejection --------------------------------------------
+#
+# Landing does one bare `git push origin HEAD:refs/heads/main` and treats ANY
+# nonzero as a landing failure. The starred-repo drain pushes card commits to
+# the same branch every ~5 minutes (StartInterval 300, RunAtLoad true), so a
+# push landing in the clone->validate->commit->push window is rejected.
+#
+# The distinction that matters is the one `source-card-commit-push:471-489`
+# already encodes: an AUTHENTICATED rejection for this exact destination is
+# safe to retry, while a generic nonzero may mean the server accepted the push
+# before the client lost its acknowledgement, and retrying that could duplicate
+# work. Only the parser is reused; the helper itself is not a drop-in (it takes
+# a GLOBAL checkout mutex and presumes a staged card plus todo.md).
+
+
+@pytest.mark.parametrize(
+    "porcelain",
+    [
+        "!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)",
+        "!\trefs/heads/main:refs/heads/main\t[rejected] (stale info)",
+        "!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)",
+    ],
+)
+def test_authenticated_rejection_is_recognised(porcelain):
+    from gateway.run import _source_card_push_rejected_authenticated
+
+    assert _source_card_push_rejected_authenticated(porcelain, "refs/heads/main") is True
+
+
+@pytest.mark.parametrize(
+    "porcelain",
+    [
+        "",
+        "fatal: could not readから remote",
+        # a different destination must not authorize a retry
+        "!\trefs/heads/other:refs/heads/other\t[rejected] (fetch first)",
+        # a rejection for a different reason is not the concurrent-writer case
+        "!\trefs/heads/main:refs/heads/main\t[rejected] (permission denied)",
+        # more than one status line is ambiguous
+        (
+            "!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\n"
+            "!\trefs/heads/main:refs/heads/main\t[rejected] (stale info)"
+        ),
+        # a success line is not a rejection
+        "\trefs/heads/main:refs/heads/main\t0000000..1111111",
+    ],
+)
+def test_ambiguous_or_foreign_push_output_is_not_an_authenticated_rejection(porcelain):
+    from gateway.run import _source_card_push_rejected_authenticated
+
+    assert _source_card_push_rejected_authenticated(porcelain, "refs/heads/main") is False
+
+
+def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
+    """The drain pushes to this branch every ~5 minutes; landing must survive it.
+
+    A second clone advances `origin/main` after this landing has cloned, so the
+    push is rejected exactly the way a real concurrent writer rejects it. The
+    card must still land, the concurrent writer's commit must survive, and the
+    shared checkout must be untouched.
+    """
+    from gateway.run import _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    repo = fixture["repo"]
+    original_head = _git(repo, "rev-parse", "HEAD")
+
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    unrelated = fixture["cards_root"] / "operator-owned-pending.md"
+    unrelated.write_text("operator-owned pending card\n", encoding="utf-8")
+
+    import gateway.run as gateway_run
+
+    real_clone_cm = gateway_run._source_card_isolated_landing_repository
+    advanced = {}
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _clone_then_advance_remote(repository):
+        with real_clone_cm(repository) as checkout:
+            # Advance origin/main only AFTER the isolated clone exists, so the
+            # push this landing is about to make is genuinely stale.
+            if not advanced:
+                peer = tmp_path / "concurrent-peer"
+                subprocess.run(
+                    ["git", "clone", "--branch", "main", str(fixture["remote"]), str(peer)],
+                    check=True,
+                    capture_output=True,
+                )
+                _git(peer, "config", "user.name", "Concurrent Source Writer")
+                _git(peer, "config", "user.email", "concurrent@example.invalid")
+                (peer / "concurrent-writer.txt").write_text("drain\n", encoding="utf-8")
+                _git(peer, "add", "concurrent-writer.txt")
+                _git(peer, "commit", "-m", "drain: concurrent card commit")
+                _git(peer, "push", "origin", "main")
+                advanced["sha"] = _git(peer, "rev-parse", "HEAD")
+            yield checkout
+
+    gateway_run._source_card_isolated_landing_repository = _clone_then_advance_remote
+    try:
+        landed = _land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=_routing_environment(fixture),
+            source_message_row_id=77,
+        )
+    finally:
+        gateway_run._source_card_isolated_landing_repository = real_clone_cm
+
+    _git(repo, "fetch", "origin", "main")
+    remote_tip = _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
+    assert landed["commit"] == remote_tip
+    # The concurrent writer's commit is still contained.
+    assert (
+        _git(repo, "merge-base", "--is-ancestor", advanced["sha"], "origin/main") == ""
+    )
+    assert _git(repo, "show", "origin/main:concurrent-writer.txt") == "drain"
+    # The card landed.
+    assert (
+        _git(repo, "show", f"origin/main:{landed['path']}") + "\n" == _REPLAY_CARD
+    )
+    # The shared checkout is untouched.
+    assert _git(repo, "rev-parse", "HEAD") == original_head
+    assert unrelated.read_text(encoding="utf-8") == "operator-owned pending card\n"
