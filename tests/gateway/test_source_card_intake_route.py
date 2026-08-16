@@ -1244,6 +1244,7 @@ def test_receipt_failure_reports_the_already_contained_card(tmp_path):
         fixture["repo"], "ls-remote", "origin", "refs/heads/main"
     ).split()[0]
     assert failure.commit == remote_tip
+    _git(fixture["repo"], "fetch", "origin", "main")
     assert _git(
         fixture["repo"],
         "show",
@@ -1326,6 +1327,381 @@ def test_landing_rejects_an_invalid_decision_key_before_push(tmp_path):
         )
 
     assert _git(fixture["repo"], "rev-parse", "origin/main") == before
+    assert not fixture["decision_log"].exists()
+
+
+def test_landing_uses_isolated_origin_main_when_shared_checkout_is_behind_and_dirty(
+    tmp_path,
+):
+    from gateway.run import _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    repo = fixture["repo"]
+    original_head = _git(repo, "rev-parse", "HEAD")
+
+    remote_peer = tmp_path / "remote-peer"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--branch",
+            "main",
+            str(fixture["remote"]),
+            str(remote_peer),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _git(remote_peer, "config", "user.name", "Concurrent Source Writer")
+    _git(remote_peer, "config", "user.email", "source-writer@example.invalid")
+    (remote_peer / "remote-only.txt").write_text(
+        "remote main advanced\n",
+        encoding="utf-8",
+    )
+    _git(remote_peer, "add", "remote-only.txt")
+    _git(remote_peer, "commit", "-m", "test: advance remote main")
+    _git(remote_peer, "push", "origin", "main")
+    remote_advance = _git(remote_peer, "rev-parse", "HEAD")
+
+    unrelated = fixture["cards_root"] / "operator-owned-pending.md"
+    unrelated.write_text("operator-owned pending card\n", encoding="utf-8")
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            repo / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    landed = _land_source_card(
+        card_path=card,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=environment,
+        source_message_row_id=42,
+    )
+
+    assert _git(repo, "rev-parse", "HEAD") == original_head
+    assert unrelated.read_text(encoding="utf-8") == "operator-owned pending card\n"
+    assert card.read_text(encoding="utf-8") == _REPLAY_CARD
+    remote_tip = _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
+    assert landed["commit"] == remote_tip
+    _git(repo, "fetch", "origin", "main")
+    assert _git(repo, "merge-base", "--is-ancestor", remote_advance, "origin/main") == ""
+    assert _git(repo, "show", "origin/main:remote-only.txt") == "remote main advanced"
+    assert (
+        _git(
+            repo,
+            "show",
+            "origin/main:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+        )
+        + "\n"
+        == _REPLAY_CARD
+    )
+    assert fixture["decision_log"].exists()
+
+
+def test_landing_receipts_use_the_immutable_landed_card_after_shared_edit(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+    original_builder = run_module._source_card_receipt_commands
+    parsed_paths = []
+
+    def edit_shared_card_then_build(**kwargs):
+        card.write_text(
+            card.read_text(encoding="utf-8").replace(
+                "IgorWarzocha/howaboua-pi-stuff", "operator/changed-after-push"
+            ),
+            encoding="utf-8",
+        )
+        parsed_paths.append(kwargs["card_path"])
+        return original_builder(**kwargs)
+
+    monkeypatch.setattr(
+        run_module, "_source_card_receipt_commands", edit_shared_card_then_build
+    )
+
+    landed = run_module._land_source_card(
+        card_path=card,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=environment,
+        source_message_row_id=42,
+    )
+
+    assert parsed_paths and parsed_paths[0] != card
+    assert "operator/changed-after-push" in card.read_text(encoding="utf-8")
+    receipt_log = fixture["decision_log"].read_text(encoding="utf-8")
+    assert "operator/changed-after-push" not in receipt_log
+    remote_tip = _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0]
+    assert landed["commit"] == remote_tip
+
+
+def test_landing_recovers_when_push_succeeds_but_reports_a_timeout(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+    original_run_step = run_module._source_card_run_step
+
+    def accepted_then_timeout(step, arguments, **kwargs):
+        result = original_run_step(step, arguments, **kwargs)
+        if step == "git_push":
+            raise run_module._SourceCardLandingError(
+                "git_push", "timeout after 120 seconds"
+            )
+        return result
+
+    monkeypatch.setattr(run_module, "_source_card_run_step", accepted_then_timeout)
+
+    landed = run_module._land_source_card(
+        card_path=card,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=environment,
+        source_message_row_id=42,
+    )
+
+    remote_tip = _git(
+        fixture["repo"], "ls-remote", "origin", "refs/heads/main"
+    ).split()[0]
+    assert landed["commit"] == remote_tip
+    assert fixture["decision_log"].exists()
+
+
+def test_landing_reports_unknown_when_push_and_remote_verification_both_fail(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+    original_run_step = run_module._source_card_run_step
+
+    def fail_push_and_probe(step, arguments, **kwargs):
+        if step == "git_push":
+            raise run_module._SourceCardLandingError(
+                "git_push",
+                "exit 128: https://secret-token@example.invalid/repo.git "
+                "/tmp/hermes-source-card-landing-private/repo",
+            )
+        if step == "git_verify":
+            raise run_module._SourceCardLandingError(
+                "git_verify", "timeout after 60 seconds"
+            )
+        return original_run_step(step, arguments, **kwargs)
+
+    monkeypatch.setattr(run_module, "_source_card_run_step", fail_push_and_probe)
+
+    with pytest.raises(run_module._SourceCardLandingOutcomeUnknownError) as caught:
+        run_module._land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    failure = caught.value
+    assert failure.path == "researched-repos/igorwarzocha-howaboua-pi-stuff.md"
+    assert failure.commit
+    assert "secret-token" not in str(failure)
+    assert "hermes-source-card-landing" not in str(failure)
+    assert not fixture["decision_log"].exists()
+    summary = (
+        "⚠️ Card landing outcome could not be verified: "
+        f"{failure.path} @ {failure.commit}; {failure.step}: {failure.detail}"
+    )
+    assert run_module._format_direct_source_card_completion(
+        {"status": "partial", "summary": summary, "error": str(failure)}
+    ) == summary
+
+
+def test_landing_reports_unknown_when_successful_push_cannot_be_verified(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+    original_run_step = run_module._source_card_run_step
+
+    def push_then_fail_first_probe(step, arguments, **kwargs):
+        if step == "git_verify":
+            raise run_module._SourceCardLandingError(
+                "git_verify", "timeout after 60 seconds"
+            )
+        return original_run_step(step, arguments, **kwargs)
+
+    monkeypatch.setattr(
+        run_module, "_source_card_run_step", push_then_fail_first_probe
+    )
+
+    with pytest.raises(run_module._SourceCardLandingOutcomeUnknownError) as caught:
+        run_module._land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    failure = caught.value
+    assert failure.step == "git_verify"
+    assert failure.path == "researched-repos/igorwarzocha-howaboua-pi-stuff.md"
+    assert failure.commit
+    assert "remote verification failed" in failure.detail
+    assert not fixture["decision_log"].exists()
+
+
+def test_isolated_landing_rejects_multiple_push_urls(tmp_path):
+    from gateway.run import (
+        _SourceCardLandingError,
+        _source_card_isolated_landing_repository,
+    )
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    second_remote = tmp_path / "second-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(second_remote)],
+        check=True,
+        capture_output=True,
+    )
+    _git(fixture["repo"], "remote", "set-url", "--add", "--push", "origin", str(fixture["remote"]))
+    _git(fixture["repo"], "remote", "set-url", "--add", "--push", "origin", str(second_remote))
+
+    with pytest.raises(_SourceCardLandingError, match="exactly one push URL"):
+        with _source_card_isolated_landing_repository(fixture["repo"]):
+            pass
+
+
+def test_isolated_landing_rejects_embedded_remote_credentials(
+    tmp_path, monkeypatch
+):
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+
+    def credential_remote_only(step, arguments, **kwargs):
+        if step == "git_remote":
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout="https://secret-token@example.invalid/repo.git\n",
+                stderr="",
+            )
+        raise AssertionError("credential-bearing remote must fail before clone")
+
+    monkeypatch.setattr(run_module, "_source_card_run_step", credential_remote_only)
+
+    with pytest.raises(run_module._SourceCardLandingError) as caught:
+        with run_module._source_card_isolated_landing_repository(fixture["repo"]):
+            pass
+    assert caught.value.step == "git_remote"
+    assert "embedded credentials" in caught.value.detail
+    assert "secret-token" not in str(caught.value)
+
+
+def test_landing_rejects_a_clean_tracked_card_absent_from_origin_main(tmp_path):
+    from gateway.run import _SourceCardLandingError, _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    repo = fixture["repo"]
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    _git(repo, "add", "--", "researched-repos/igorwarzocha-howaboua-pi-stuff.md")
+    _git(repo, "commit", "-m", "test: preserve local-only tracked card")
+    local_commit = _git(repo, "rev-parse", "HEAD")
+    remote_before = _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
+    environment = {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            repo / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dedup",
+        "platform_message_id": "msg-source-42",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+    with pytest.raises(
+        _SourceCardLandingError,
+        match="tracked card is absent from origin/main",
+    ) as caught:
+        _land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=environment,
+            source_message_row_id=42,
+        )
+
+    assert caught.value.step == "git_clean"
+    assert _git(repo, "rev-parse", "HEAD") == local_commit
+    assert _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0] == remote_before
     assert not fixture["decision_log"].exists()
 
 
@@ -1585,6 +1961,7 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     )
     assert worker_result["worker_system_chars"] == len(system_text)
     assert worker_result["worker_system_bytes"] == len(system_text.encode("utf-8"))
+    assert worker_result["worker_system_bytes"] == 18_651
     assert worker_result["worker_dynamic_chars"] == (
         worker_result["worker_goal_chars"] + worker_result["worker_result_chars"]
     )
@@ -1602,12 +1979,20 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     assert "SOURCE-CARD TEMPLATE" in wire_goal
     assert "gateway/source-card" not in wire_goal
     assert "A Gateway worker makes no tool calls." in system_text
+    relevance_rule = (
+        "`direct`, `adjacent`, or `upgrade-candidate` Hermes relevance requires "
+        "the bare `hermes` token in downstream learning targets; a `none:` "
+        "downstream target requires `none:` Hermes relevance."
+    )
+    assert relevance_rule in wire_goal
+    assert relevance_rule in system_text
     assert worker_result["worker_result_chars"] == len(provider_content)
     assert worker_result["worker_result_bytes"] == len(
         provider_content.encode("utf-8")
     )
 
     remote_tip = _git(fixture["repo"], "ls-remote", "origin", "refs/heads/main").split()[0]
+    _git(fixture["repo"], "fetch", "origin", "main")
     committed = _git(
         fixture["repo"],
         "show",
