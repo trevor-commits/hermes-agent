@@ -1,0 +1,25 @@
+{
+  "id": "2087232392209531166",
+  "url": "https://x.com/Howaboua/status/2087232392209531166",
+  "route": "fxtwitter",
+  "author": {
+    "handle": "Howaboua",
+    "name": "Howaboua",
+    "followers": 1230
+  },
+  "created_at": "Tue Aug 11 17:39:15 +0000 2026",
+  "text": "People of @pidotdev! I just clanked up pi-shepherdr (KEKW): talk to one Pi, let it run the others.\n\nOne master Pi gets a tiny 271-token orchestration surface (sounds ridiculous compared to some subagent extensions):\n\n- `list` finds agents and workspaces\n- `start` requires a name and explicit placement: a new workspace, new tab or existing pane. It can also set the session/tab label, directory and first task\n- `watch` adopts an existing agent\n- `send` gives an agent more work\n- `unwatch` stops reporting it without stopping or moving it\n\nDelegation is fire-and-forget. Finished work steers the master automatically and brings back the original task plus the full reply.\n\nIf a worker is blocked, the notification includes the exact Herdr CLI commands for inspecting the pane, replying or sending keys. No skills, convoluted @herdrdev  introduction or `--help` archaeology needed. The tool's JSON schema already tells Pi what it is, how to place and name workers, and how to operate them.\n\nThe boundaries are deliberate. Shepherdr does not focus, move, stop or close panes. Herdr owns the terminals, layout and session lifecycle.\n\nI recorded the demo below using realtime voice to build and test the thing, while Clawa apparently decided this was also her podcast. New meta for filming videos buahahhahaha.\n\nAnd, this time around, I made the Clanker louder so you can hear it in all of its glory. Fun times.\n\npi install npm:@howaboua/pi-shepherdr\n\nhttps://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr\n\nHappy Clanking!\n\n- Clawa\n\nPS. Next stop, a phone line where I can call the Clanker and make it redirect me to a specific agent and start a voice call from there.",
+  "stats": {
+    "likes": 55,
+    "retweets": 2,
+    "replies": 5,
+    "views": 3550
+  },
+  "media": [
+    "https://video.twimg.com/amplify_video/2087231628737171456/vid/avc1/1920x1080/YeJebNk4KRiGv93C.mp4?tag=29"
+  ],
+  "links": [
+    "https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr"
+  ],
+  "quote": null
+}

@@ -1,0 +1,16 @@
+repo: IgorWarzocha/howaboua-pi-stuff
+url: https://github.com/IgorWarzocha/howaboua-pi-stuff
+stars: 313
+forks: 27
+license: MIT License
+created: 2026-05-28
+last_push: 2026-08-15
+head: 8d63d300597488e6fa4c30ccd6a3eb0fed2d4304
+open_issues: 8
+advisories: 0
+release: @howaboua/pi-unicode-charts@0.1.0 published 2026-08-15
+default_branch: main
+description: A monorepo of extensions and skills by yours truly.
+topics: none
+languages: Shell, TypeScript, JavaScript, Python, Rust, Starlark
+signal: GitHub metadata showed IgorWarzocha/howaboua-pi-stuff (created 2026-05-28, last push 2026-08-15), 313 stars / 27 forks, license MIT License, latest release @howaboua/pi-unicode-charts@0.1.0 published 2026-08-15, HEAD 8d63d300597488e6fa4c30ccd6a3eb0fed2d4304 dated 2026-08-15T20:31:03Z, 8 open issues+PRs (GitHub open_issues_count), 0 public security advisories.
