@@ -31,6 +31,16 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
+def _served_model_receipt(agent):
+    """Per-call provider attestation for this turn; never raises."""
+    try:
+        from agent.served_model import served_model_receipt
+
+        return served_model_receipt(agent)
+    except Exception:
+        return []
+
+
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
 
@@ -705,6 +715,9 @@ def finalize_turn(
         "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
+        # Per-call provider attestation. `model` above is what was CONFIGURED;
+        # this is what each call reported actually answering.
+        "served_models": _served_model_receipt(agent),
         "provider": agent.provider,
         "base_url": agent.base_url,
         "input_tokens": agent.session_input_tokens,

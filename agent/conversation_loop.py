@@ -7058,6 +7058,18 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            # Record the provider-attested model for THIS call, unconditionally.
+            # The only other read of `response.model` sits behind the
+            # `has_hook` guard below, so with no hook registered nothing
+            # carried the served model out of the loop and a silent provider
+            # substitution was invisible downstream.
+            try:
+                from agent.served_model import record_served_model
+
+                record_served_model(agent, requested=agent.model, response=response)
+            except Exception:
+                pass
+
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,

@@ -1109,6 +1109,12 @@ def build_turn_context(
     _preflight_compressed = False
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
+    try:
+        from agent.served_model import reset_served_models
+
+        reset_served_models(agent)
+    except Exception:
+        pass
     agent._turn_preflight_display_snapshot = None
     if (
         agent.compression_enabled
