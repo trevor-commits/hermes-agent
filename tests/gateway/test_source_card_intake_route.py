@@ -2365,3 +2365,267 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     assert decision_calls[1][decision_calls[1].index("--card") + 1] == (
         "igorwarzocha-howaboua-pi-stuff.md"
     )
+
+
+# --- deterministic routing-field rendering (typed grammar, every landing path) ---
+#
+# The validator's routing grammar is closed: `hermes relevance` is `direct`,
+# `adjacent`, `upgrade-candidate`, or `none: <reason>`; every downstream target
+# is a `[a-z0-9][a-z0-9-]*` slug unless the whole value is `none: <reason>`.
+# The previous normalizer was separator-shaped and only stripped prose after
+# `:`, ` - `, or `. `, so every other phrasing reached the validator intact and
+# failed a live intake.
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # shapes the separator-shaped normalizer already handled
+        ("adjacent: the post claims…", "adjacent"),
+        ("direct — extends the gateway", "direct"),
+        ("upgrade-candidate. newer than ours", "upgrade-candidate"),
+        # shapes it missed, each one a live failure class
+        ("adjacent because the post overlaps Hermes", "adjacent"),
+        ("adjacent (overlaps Hermes agent concepts)", "adjacent"),
+        ("Adjacent, the post overlaps Hermes", "adjacent"),
+        ("direct; extends the gateway route", "direct"),
+        # already-valid values pass through untouched
+        ("adjacent", "adjacent"),
+        ("none: unrelated to any Hermes surface", "none: unrelated to any Hermes surface"),
+    ],
+)
+def test_hermes_relevance_renders_to_the_validator_grammar(raw, expected):
+    from gateway.run import _source_card_render_routing_fields
+
+    relevance, _targets = _source_card_render_routing_fields(raw, "hermes")
+    assert relevance == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("hermes: compare browser tooling", "hermes"),
+        # `hermes-agent` is a valid slug but is not the bare `hermes` target the
+        # cross-field rule requires for an enum relevance, so both survive.
+        ("hermes-agent: compare browser tooling", "hermes, hermes-agent"),
+        ("hermes, codex-cli", "hermes, codex-cli"),
+        ("hermes (browser tooling), codex-cli", "hermes, codex-cli"),
+        ("Hermes — browser tooling", "hermes"),
+        ("none: nothing downstream consumes this", "none: nothing downstream consumes this"),
+    ],
+)
+def test_downstream_targets_render_to_slugs(raw, expected):
+    from gateway.run import _source_card_render_routing_fields
+
+    # `none:` relevance is used for the `none:` target case so the cross-field
+    # rule does not inject `hermes` into the expectation.
+    relevance = "none: n/a" if raw.startswith("none:") else "adjacent"
+    _relevance, targets = _source_card_render_routing_fields(relevance, raw)
+    assert targets == expected
+
+
+def test_enum_relevance_forces_the_bare_hermes_target():
+    """`adjacent` without `hermes` downstream is the exact 04:08 UTC failure."""
+    from gateway.run import _source_card_render_routing_fields
+
+    relevance, targets = _source_card_render_routing_fields(
+        "adjacent", "hermes-agent, codex-cli"
+    )
+    assert relevance == "adjacent"
+    assert targets.split(", ")[0] == "hermes"
+    assert "hermes" in [item.strip() for item in targets.split(",")]
+
+
+def test_none_relevance_removes_the_hermes_target():
+    from gateway.run import _source_card_render_routing_fields
+
+    relevance, targets = _source_card_render_routing_fields(
+        "none: unrelated to any Hermes surface", "hermes, codex-cli"
+    )
+    assert relevance == "none: unrelated to any Hermes surface"
+    assert "hermes" not in [item.strip() for item in targets.split(",")]
+    assert targets == "codex-cli"
+
+
+def test_none_relevance_with_only_hermes_target_renders_none_targets():
+    from gateway.run import _source_card_render_routing_fields
+
+    _relevance, targets = _source_card_render_routing_fields(
+        "none: unrelated to any Hermes surface", "hermes"
+    )
+    assert targets.startswith("none:")
+    assert targets.strip() != "none:"
+
+
+def test_unresolvable_relevance_is_left_for_the_validator_not_guessed():
+    """Rendering never invents a routing decision it cannot read."""
+    from gateway.run import _source_card_render_routing_fields
+
+    relevance, _targets = _source_card_render_routing_fields(
+        "probably worth a look someday", "hermes"
+    )
+    assert relevance == "probably worth a look someday"
+
+
+# --- rendering runs on EVERY landing path, including the duplicate path -------
+#
+# When the scoped duplicate lookup matches, the route lands the pre-existing
+# file with no model turn: `_build_worker`, `run_conversation`,
+# `_parse_source_card_worker_draft` and `_finalize_source_card_worker_draft` are
+# all gated behind `if card_path is None:`. A finalizer-only fix therefore never
+# runs for a duplicate, and a repair call cannot help because there is no model
+# output to repair.
+
+
+def _routing_environment(fixture):
+    return {
+        "cards_root": str(fixture["cards_root"]),
+        "source_card_validator": str(
+            fixture["repo"] / "scripts" / "validate-touched-source-cards"
+        ),
+        "decision_writer": str(fixture["decision_writer"]),
+        "source_chat_id": "-5551733823",
+        "source_thread_id": "",
+        "parent_session_id": "sess-dup",
+        "platform_message_id": "msg-source-77",
+        "transcript_db": str(fixture["home"] / "state.db"),
+    }
+
+
+def test_duplicate_landing_path_renders_untracked_card_routing(tmp_path):
+    """An untracked card written by an earlier run still gets rendered."""
+    from gateway.run import _land_source_card
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    # Exactly the prose shape that the separator-shaped normalizer missed.
+    prose = "- downstream learning targets: hermes: compare the claimed pi tooling"
+    card.write_text(
+        _REPLAY_CARD.replace("- downstream learning targets: hermes", prose),
+        encoding="utf-8",
+    )
+    assert prose in card.read_text(encoding="utf-8")
+
+    landed = _land_source_card(
+        card_path=card,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=_routing_environment(fixture),
+        source_message_row_id=77,
+    )
+
+    _git(fixture["repo"], "fetch", "origin", "main")
+    committed = _git(
+        fixture["repo"],
+        "show",
+        f"{landed['commit']}:researched-repos/igorwarzocha-howaboua-pi-stuff.md",
+    )
+    assert "- downstream learning targets: hermes\n" in committed + "\n"
+    assert "compare the claimed pi tooling" not in committed
+    # The shared checkout is never rewritten by landing.
+    assert prose in card.read_text(encoding="utf-8")
+
+
+def test_duplicate_landing_path_fails_closed_on_a_tracked_nonconforming_card(
+    tmp_path,
+):
+    """A committed card that renders differently is an operator conflict."""
+    from gateway.run import _land_source_card, _SourceCardLandingError
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    repo = fixture["repo"]
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(
+        _REPLAY_CARD.replace(
+            "- downstream learning targets: hermes",
+            "- downstream learning targets: hermes (compare the claimed pi tooling)",
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "researched-repos/igorwarzocha-howaboua-pi-stuff.md")
+    _git(repo, "commit", "-m", "test: land a non-conforming card")
+    _git(repo, "push", "origin", "main")
+
+    with pytest.raises(_SourceCardLandingError) as excinfo:
+        _land_source_card(
+            card_path=card,
+            intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+            environment=_routing_environment(fixture),
+            source_message_row_id=77,
+        )
+    assert excinfo.value.step == "validate"
+    assert "routing" in excinfo.value.detail
+
+
+# --- typed analysis payload --------------------------------------------------
+#
+# Rendering salvages a readable leading token from prose. A value with no
+# readable token (`probably worth a look someday`) cannot be salvaged, so the
+# worker is asked for the routing decision as typed data instead of as prose
+# inside the card body. The typed value wins over whatever the body says.
+
+
+def test_typed_analysis_overrides_routing_prose_in_the_card_body(tmp_path):
+    from gateway.run import _parse_source_card_worker_draft
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    body = _REPLAY_CARD.replace(
+        "- downstream learning targets: hermes",
+        "- downstream learning targets: probably worth a look someday",
+    )
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "typed-analysis-card.md"),
+            "card_content": body,
+            "analysis": {
+                "hermes_relevance": "adjacent",
+                "downstream_learning_targets": ["hermes", "codex-cli"],
+            },
+        }
+    )
+
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+    assert "- downstream learning targets: hermes, codex-cli\n" in content + "\n"
+    assert "probably worth a look someday" not in content
+
+
+def test_typed_analysis_is_optional_and_absent_payloads_still_parse(tmp_path):
+    from gateway.run import _parse_source_card_worker_draft
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "untyped-card.md"),
+            "card_content": _REPLAY_CARD,
+        }
+    )
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+    assert "- downstream learning targets: hermes" in content
+
+
+@pytest.mark.parametrize(
+    "analysis",
+    [
+        {"hermes_relevance": "maybe", "downstream_learning_targets": ["hermes"]},
+        {"hermes_relevance": "adjacent", "downstream_learning_targets": "hermes"},
+        {"hermes_relevance": "adjacent", "downstream_learning_targets": ["Hermes!"]},
+        {"hermes_relevance": "none:", "downstream_learning_targets": ["hermes"]},
+        {"downstream_learning_targets": ["hermes"]},
+    ],
+)
+def test_invalid_typed_analysis_is_rejected_not_guessed(tmp_path, analysis):
+    from gateway.run import _parse_source_card_worker_draft, _SourceCardLandingError
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "bad-typed-card.md"),
+            "card_content": _REPLAY_CARD,
+            "analysis": analysis,
+        }
+    )
+    with pytest.raises(_SourceCardLandingError) as excinfo:
+        _parse_source_card_worker_draft(response, cards_root)
+    assert excinfo.value.step == "worker_output"
