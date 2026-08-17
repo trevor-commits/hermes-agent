@@ -2877,7 +2877,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     )
 
 
-def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
+def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, Any]]:
     """Return the pinned provider/model for the source-card worker, if set.
 
     ``_resolve_session_agent_runtime`` is a five-layer stack in which the
@@ -2896,6 +2896,15 @@ def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
     A half-written block raises rather than silently falling back to the
     session model, because an unattested model is exactly the condition this
     pin exists to prevent.
+
+    The optional ``fallback`` key declares this route's OWN chain. Pinning was
+    originally implemented by handing the worker no chain at all, which stopped
+    the silent drift onto the global chain but also removed the route's only
+    escape hatch: a Z.AI weekly-quota exhaustion then takes out the primary and
+    this worker at once, with nothing to fall to. A declared chain restores the
+    hatch without restoring the drift -- the operator names every hop, and the
+    served-model receipt still records which one answered. Absent the key the
+    behavior is unchanged (no chain), so this is opt-in.
     """
     auxiliary = user_config.get("auxiliary") if isinstance(user_config, dict) else None
     if not isinstance(auxiliary, dict):
@@ -2913,7 +2922,42 @@ def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, str]]:
         raise RuntimeError(
             "auxiliary.source_card_worker requires both provider and model"
         )
-    return {"provider": provider, "model": model}
+    pin: dict[str, Any] = {"provider": provider, "model": model}
+    pin["fallback"] = _source_card_worker_fallback_chain(block)
+    return pin
+
+
+def _source_card_worker_fallback_chain(block: dict) -> list[dict[str, Any]]:
+    """Validate this route's declared fallback chain.
+
+    Same entry shape as ``fallback_providers`` so the agent consumes it
+    unchanged. Fails closed on a malformed entry for the same reason the pin
+    itself does: a half-written chain that silently becomes an empty one would
+    reintroduce the exact failure this key exists to prevent, quietly.
+    """
+    raw = block.get("fallback")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise RuntimeError(
+            "auxiliary.source_card_worker.fallback must be a list of "
+            "provider/model mappings"
+        )
+    chain: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f"auxiliary.source_card_worker.fallback[{index}] must be a mapping"
+            )
+        hop_provider = str(entry.get("provider") or "").strip()
+        hop_model = str(entry.get("model") or "").strip()
+        if not hop_provider or not hop_model:
+            raise RuntimeError(
+                f"auxiliary.source_card_worker.fallback[{index}] requires both "
+                "provider and model"
+            )
+        chain.append(dict(entry))
+    return chain
 
 
 _SOURCE_CARD_PUSH_MAX_ATTEMPTS = 4
@@ -3003,7 +3047,7 @@ def _apply_source_card_worker_pin(
     model: str,
     runtime_kwargs: dict,
     user_config: dict,
-) -> tuple[str, dict, Optional[dict[str, str]]]:
+) -> tuple[str, dict, Optional[dict[str, Any]]]:
     """Override a session-resolved model with the source-card route pin.
 
     Applied AFTER the session stack has resolved, because every layer of that
@@ -21715,8 +21759,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Route-scoped: _refresh_fallback_model() re-reads the GLOBAL
                 # chain, so the first provider failure would drop this worker
                 # onto an unpinned model and silently defeat the pin above.
+                # A pinned route uses its OWN declared chain when it has one --
+                # handing it None was what left it with no escape hatch at all,
+                # so a Z.AI weekly-quota exhaustion took out the primary and
+                # this worker together. An empty declared chain stays None,
+                # which is the prior behavior.
                 fallback_model=(
-                    None if worker_pin else self._refresh_fallback_model()
+                    (worker_pin.get("fallback") or None)
+                    if worker_pin
+                    else self._refresh_fallback_model()
                 ),
                 skip_context_files=True,
                 load_soul_identity=False,
