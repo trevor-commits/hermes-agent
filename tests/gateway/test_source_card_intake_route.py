@@ -2695,7 +2695,79 @@ def test_source_card_worker_pin_is_read_from_auxiliary_config():
             }
         }
     )
-    assert pin == {"provider": "zai", "model": "glm-5.3"}
+    assert pin == {"provider": "zai", "model": "glm-5.3", "fallback": []}
+
+
+def test_pinned_route_declares_its_own_fallback_chain():
+    """A pin restricts which model runs; it must not delete the escape hatch.
+
+    Pinning was first implemented by handing the worker no chain at all. That
+    stopped the drift onto the global chain, but a Z.AI weekly-quota
+    exhaustion then took out the primary model and this worker together with
+    nothing to fall to -- which is exactly what happened on 2026-08-16.
+    """
+    from gateway.run import _source_card_worker_pin
+
+    pin = _source_card_worker_pin(
+        {
+            "auxiliary": {
+                "source_card_worker": {
+                    "provider": "zai",
+                    "model": "glm-5.3",
+                    "fallback": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "key_env": "DEEPSEEK_API_KEY",
+                        },
+                    ],
+                }
+            }
+        }
+    )
+    assert pin["provider"] == "zai"
+    assert pin["model"] == "glm-5.3"
+    assert pin["fallback"] == [
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "key_env": "DEEPSEEK_API_KEY",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        [{"provider": "deepseek"}],
+        [{"model": "deepseek-v4-pro"}],
+        [{"provider": "", "model": "deepseek-v4-pro"}],
+        [{"provider": "deepseek", "model": ""}],
+        ["deepseek-v4-pro"],
+        {"provider": "deepseek", "model": "deepseek-v4-pro"},
+    ],
+)
+def test_malformed_route_fallback_chain_fails_closed(fallback):
+    """A half-written chain must raise, not quietly become an empty one.
+
+    Silently dropping to [] would reproduce the no-escape-hatch failure this
+    key exists to fix, without any signal that it had happened.
+    """
+    from gateway.run import _source_card_worker_pin
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _source_card_worker_pin(
+            {
+                "auxiliary": {
+                    "source_card_worker": {
+                        "provider": "zai",
+                        "model": "glm-5.3",
+                        "fallback": fallback,
+                    }
+                }
+            }
+        )
+    assert "source_card_worker.fallback" in str(excinfo.value)
 
 
 def test_source_card_worker_pin_absent_returns_none():
@@ -2742,7 +2814,7 @@ def test_worker_pin_overrides_the_session_resolved_model(monkeypatch):
     assert model == "glm-5.3"
     assert runtime["provider"] == "zai"
     assert runtime["api_key"] == "key-for-zai"
-    assert pin == {"provider": "zai", "model": "glm-5.3"}
+    assert pin == {"provider": "zai", "model": "glm-5.3", "fallback": []}
 
 
 def test_absent_worker_pin_leaves_the_session_runtime_untouched():
