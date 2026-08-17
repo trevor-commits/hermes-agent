@@ -216,6 +216,38 @@ _RATE_LIMIT_PATTERNS = [
 # the rate_limit default.  Phrases are kept narrow and overload-flavoured so a
 # normal rate-limit message ("you have been rate-limited") doesn't hit this
 # bucket. (#14038, #15297)
+# A subscription plan's quota is spent for the rest of its cycle. This is NOT
+# the same failure as a per-credential rate limit that shares HTTP 429:
+#
+#   * Retrying does not help. Z.AI's own body carries the reset time, which is
+#     days out ("Your limit will reset at 2026-08-19 10:03:06").
+#   * Rotating the credential does not help either, and actively hurts. The
+#     quota is per ACCOUNT PLAN, not per key, so the next key hits the same
+#     wall while the pool is burned.
+#   * Every model on the plan shares one credit pool, so a cheaper sibling
+#     model is already out too. Only an off-subscription provider can serve.
+#
+# Z.AI signals this as code 1310. Left on the generic 429 path it inherited
+# retry + credential rotation + a same-plan retry, which is how a source-card
+# run spent three retries and a credential rotation before erroring on
+# 2026-08-16 instead of falling through to DeepSeek.
+_PLAN_QUOTA_EXHAUSTED_CODES = {"1310"}
+_PLAN_QUOTA_EXHAUSTED_PATTERNS = [
+    "weekly/monthly limit exhausted",
+    "weekly limit exhausted",
+    "monthly limit exhausted",
+    "limit exhausted",
+]
+
+
+def _is_plan_quota_exhausted(error_code: str, error_msg: str) -> bool:
+    """True when a subscription plan's quota is spent for its whole cycle."""
+    if str(error_code or "").strip().lower() in _PLAN_QUOTA_EXHAUSTED_CODES:
+        return True
+    lowered = str(error_msg or "").lower()
+    return any(p in lowered for p in _PLAN_QUOTA_EXHAUSTED_PATTERNS)
+
+
 _OVERLOADED_PATTERNS = [
     "overloaded",
     "temporarily overloaded",
@@ -1022,6 +1054,19 @@ def classify_api_error(
 
     # ── 3. Error code classification ────────────────────────────────
 
+    # Checked ahead of the `if error_code:` guard on purpose. A spent plan must
+    # not retry or rotate, and the signal may arrive as a body code OR as bare
+    # message text with no code and no parseable status — that shape fell all
+    # the way to the `unknown` catch-all, which is retryable, so it retried
+    # against a quota that will not return for days.
+    if _is_plan_quota_exhausted(error_code, error_msg):
+        return _result(
+            FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
     if error_code:
         classified = _classify_by_error_code(error_code, error_msg, _result)
         if classified is not None:
@@ -1264,6 +1309,18 @@ def _classify_by_status(
         # endpoint is still busy, and does nothing for a single-key user).
         # Disambiguate on the error body so an overload 429 takes the
         # transient-overload path instead of burning the pool. (#14038)
+        # A spent subscription plan also arrives as 429, but needs the opposite
+        # recovery from both an overload and a per-key rate limit: no retry
+        # (the reset is days away), no rotation (the quota is per account plan,
+        # so the next key hits the same wall), and fall straight off the
+        # subscription because every model on it shares one credit pool.
+        if _is_plan_quota_exhausted(error_code, error_msg):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=False,
+                should_fallback=True,
+            )
         if any(p in error_msg for p in _OVERLOADED_PATTERNS):
             return result_fn(
                 FailoverReason.overloaded,
