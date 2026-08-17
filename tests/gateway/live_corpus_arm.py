@@ -73,6 +73,16 @@ def main() -> int:
     parser.add_argument("--cards-root", default="/tmp/live-arm-cards")
     parser.add_argument("--max-tokens", type=int, default=6000)
     parser.add_argument("--max-calls", type=int, default=8)
+    # A gate that returns success when it could not run is not a gate. This
+    # printed "SKIPPED: no <KEY>" and exited 0, so a caller using it to qualify
+    # a model would have read a missing credential as a pass. Failing closed is
+    # the default; --allow-missing-credential opts back into the old skip for
+    # exploratory runs where no verdict is being claimed.
+    parser.add_argument(
+        "--allow-missing-credential",
+        action="store_true",
+        help="exit 0 instead of 2 when the key is absent (never use as a gate)",
+    )
     args = parser.parse_args()
 
     env = {}
@@ -84,8 +94,17 @@ def main() -> int:
                 env[name.strip()] = value.strip().strip("\"'")
     key = os.environ.get(args.key_env) or env.get(args.key_env)
     if not key:
-        print(f"SKIPPED: no {args.key_env}")
-        return 0
+        if args.allow_missing_credential:
+            print(f"SKIPPED: no {args.key_env} (--allow-missing-credential)")
+            return 0
+        print(
+            f"CANNOT GATE: no {args.key_env} in the environment or "
+            f"{env_path} — this arm proves nothing without a credential. "
+            f"Pass --allow-missing-credential only when you are not claiming "
+            f"a verdict.",
+            file=sys.stderr,
+        )
+        return 2
 
     from gateway.run import _parse_source_card_worker_draft
 
