@@ -353,6 +353,39 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_rotate_credential is False
 
+    def test_429_plan_quota_exhausted_does_not_retry_or_rotate(self):
+        """Z.AI code 1310 means the whole subscription cycle is spent.
+
+        The generic 429 path was wrong three ways for this one: retrying does
+        not help (the body says the reset is days out), rotating the credential
+        does not help and burns the pool (the quota is per account plan, not
+        per key), and no sibling model helps (every model on the plan shares
+        one credit pool). On 2026-08-16 a source-card run spent three retries
+        and a credential rotation before erroring instead of falling through.
+        """
+        e = MockAPIError(
+            "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+            "2026-08-19 10:03:06",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_plan_quota_exhausted_without_status_still_fails_over(self):
+        """With no parseable HTTP status this fell to the `unknown` catch-all,
+        which is retryable — so it retried against an exhausted quota."""
+        e = MockAPIError(
+            "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+            "2026-08-19 10:03:06"
+        )
+        result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+
     def test_429_normal_rate_limit_still_rotates(self):
         """Guard: a genuine 429 rate limit (no overload language) must still
         classify as rate_limit and rotate the credential. (#14038)"""
