@@ -2879,6 +2879,51 @@ def test_attestation_gate_fails_closed_when_nothing_was_attested():
     )
 
 
+def test_a_failed_worker_turn_is_not_reported_as_an_attestation_failure():
+    """A billing outage must read as a billing outage, not a security problem.
+
+    The failure-path returns in conversation_loop never populate served_models
+    -- that key is added only by finalize_turn on the normal-completion exit --
+    so with ran_turn hardcoded True, every worker failure surfaced as
+    "no provider-attested model was recorded for this turn". On 2026-08-16 that
+    is exactly what a Z.AI weekly-quota exhaustion looked like in the logs,
+    while _normalize_source_card_worker_result would have propagated the real
+    error correctly had this gate not returned first.
+    """
+    from gateway.run import (
+        _source_card_attestation_error,
+        _source_card_worker_turn_failed,
+    )
+
+    quota_outage = {
+        "failed": True,
+        "error": (
+            "API call failed after 3 retries. HTTP 429 ... "
+            "Weekly/Monthly Limit Exhausted"
+        ),
+    }
+    assert _source_card_worker_turn_failed(quota_outage) is True
+    assert (
+        _source_card_attestation_error(
+            [], ran_turn=not _source_card_worker_turn_failed(quota_outage)
+        )
+        is None
+    ), "a failed turn must not be relabelled as an attestation failure"
+
+    # error alone, without the failed flag, still counts as a failure
+    assert _source_card_worker_turn_failed({"error": "boom"}) is True
+
+    # A turn that genuinely completed is still held to attestation.
+    completed = {"final_response": "...", "api_calls": 8}
+    assert _source_card_worker_turn_failed(completed) is False
+    assert (
+        _source_card_attestation_error(
+            [], ran_turn=not _source_card_worker_turn_failed(completed)
+        )
+        is not None
+    ), "a completed turn with no receipt is still unattested"
+
+
 def test_attestation_gate_exempts_the_duplicate_path():
     """The duplicate short-circuit runs no model turn, so there is nothing to attest."""
     from gateway.run import _source_card_attestation_error

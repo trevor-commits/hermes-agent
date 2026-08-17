@@ -2759,6 +2759,20 @@ def _source_card_worker_pin(user_config: dict) -> Optional[dict[str, Any]]:
     return pin
 
 
+def _source_card_worker_turn_failed(result: dict) -> bool:
+    """True when run_conversation returned a failure rather than a completed turn.
+
+    The attestation gate needs this because the failure-path returns in
+    ``agent/conversation_loop.py`` never populate ``served_models`` -- that key
+    is added only by ``finalize_turn()`` on the normal-completion exit. Passing
+    ``ran_turn=True`` unconditionally therefore reported EVERY worker failure as
+    ``source_card_model_attestation_failed:no provider-attested model was
+    recorded for this turn``, burying the real cause. On 2026-08-16 that is what
+    a Z.AI weekly-quota outage looked like in the logs.
+    """
+    return bool(result.get("failed")) or bool(result.get("error"))
+
+
 def _source_card_worker_fallback_chain(block: dict) -> list[dict[str, Any]]:
     """Validate this route's declared fallback chain.
 
@@ -21245,8 +21259,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         or getattr(agent, "model", None)
                         or worker_model
                     )
+                    # ran_turn was hardcoded True, which made this gate claim
+                    # every worker failure was an attestation problem. The
+                    # failure-path returns in conversation_loop never populate
+                    # served_models -- that key is added only by finalize_turn
+                    # on the normal-completion exit -- so a turn that died for
+                    # ANY reason arrived here with an empty receipt and was
+                    # reported as
+                    #   source_card_model_attestation_failed:no provider-attested
+                    #   model was recorded for this turn
+                    # On 2026-08-16 that is what a Z.AI weekly-quota outage
+                    # looked like in the logs: a security-shaped message for a
+                    # billing problem, with the real error -- which
+                    # _normalize_source_card_worker_result propagates correctly
+                    # -- never reached because this returned first.
+                    #
+                    # A turn that genuinely ran and produced no receipt is still
+                    # unattested and still fails; only a turn that never got
+                    # that far is exempt.
                     attestation_error = _source_card_attestation_error(
-                        served_receipt, ran_turn=True
+                        served_receipt,
+                        ran_turn=not _source_card_worker_turn_failed(result),
                     )
                     if attestation_error:
                         logger.error(
