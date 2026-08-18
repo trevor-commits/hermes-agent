@@ -5089,10 +5089,10 @@ def _source_card_typed_analysis(raw: Any) -> Optional[dict[str, Any]]:
             "upgrade-candidate, or none: <reason>",
         )
     targets = raw.get("downstream_learning_targets")
-    if not isinstance(targets, list) or not targets or len(targets) > 16:
+    if not isinstance(targets, list) or len(targets) > 16:
         raise _SourceCardLandingError(
             "worker_output",
-            "analysis.downstream_learning_targets must be a list of 1-16 slugs",
+            "analysis.downstream_learning_targets must be a list of 0-16 slugs",
         )
     slugs: list[str] = []
     for item in targets:
@@ -5105,6 +5105,26 @@ def _source_card_typed_analysis(raw: Any) -> Optional[dict[str, Any]]:
             )
         if item.strip() not in slugs:
             slugs.append(item.strip())
+    none_match = _SOURCE_CARD_NONE_PREFIX_RE.fullmatch(relevance)
+    if not slugs:
+        # Live 2026-08-18 natebjones intake: DeepSeek returned a correct
+        # `none: <reason>` decision with `[]`. That is a valid "no repo"
+        # routing value, not a missing field. Enum relevance still needs
+        # the documented bare `hermes` token.
+        if none_match:
+            return {
+                "hermes relevance": f"none: {none_match.group(1).strip()}",
+                "downstream learning targets": [],
+            }
+        if relevance in _SOURCE_CARD_HERMES_RELEVANCE_VALUES:
+            return {
+                "hermes relevance": relevance,
+                "downstream learning targets": ["hermes"],
+            }
+        raise _SourceCardLandingError(
+            "worker_output",
+            "analysis.downstream_learning_targets must be a list of 0-16 slugs",
+        )
     return {"hermes relevance": relevance, "downstream learning targets": slugs}
 
 
@@ -5113,11 +5133,17 @@ def _source_card_apply_typed_analysis(
     analysis: dict[str, Any],
 ) -> str:
     """Overwrite the card's routing field lines from the typed decision."""
+    relevance = str(analysis["hermes relevance"])
+    slugs = analysis["downstream learning targets"]
+    if slugs:
+        rendered_targets = ", ".join(slugs)
+    elif relevance.lower().startswith("none:"):
+        rendered_targets = relevance
+    else:
+        rendered_targets = "hermes"
     rendered = {
-        "hermes relevance": str(analysis["hermes relevance"]),
-        "downstream learning targets": ", ".join(
-            analysis["downstream learning targets"]
-        ),
+        "hermes relevance": relevance,
+        "downstream learning targets": rendered_targets,
     }
     field_re = re.compile(
         r"(?im)^(-\s*(hermes relevance|downstream learning targets)\s*:\s*)(.*)$"
@@ -21661,8 +21687,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "exactly one ER-278 decision manifest. analysis carries the routing "
             "decision as data, not prose: analysis.hermes_relevance is exactly "
             "`direct`, `adjacent`, `upgrade-candidate`, or `none: <reason>`, and "
-            "analysis.downstream_learning_targets is a list of bare repo slugs "
-            "matching [a-z0-9][a-z0-9-]*. The gateway renders those two fields from "
+            "analysis.downstream_learning_targets is a list of 0-16 bare repo slugs "
+            "matching [a-z0-9][a-z0-9-]*. An empty list is valid: `none:` relevance "
+            "means no downstream repo, and enum relevance receives the `hermes` token "
+            "from the gateway. The gateway renders those two fields from "
             "analysis, so explanation belongs in the card body, never in them. The "
             "gateway writes, validates, commits, pushes, receipts, and verifies the "
             "card after this response.\n\n"
