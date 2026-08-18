@@ -1195,6 +1195,10 @@ class TestRunJobConfigEnvVarExpansion:
         raised httpx.ConnectError ([Errno 8] nodename nor servname provided)
         and the scheduler only tried fallbacks on AuthError, so the job died
         before XAI_API_KEY / Anthropic could rescue it.
+
+        Note: the job below pins only ``provider`` (not ``model``) so it is NOT a
+        hard inference pin — an explicit provider+model pair is a hard route pin
+        and correctly skips fallback (see test_explicit_provider_model_pin_*).
         """
         import httpx
 
@@ -1214,7 +1218,6 @@ class TestRunJobConfigEnvVarExpansion:
             "name": "dns fallback",
             "prompt": "hi",
             "provider": "xai-oauth",
-            "model": "grok-4.5",
         }
         fake_db = MagicMock()
         requested = []
