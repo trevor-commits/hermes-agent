@@ -6163,14 +6163,10 @@ def _land_source_card(
             # landing clone is `--depth 1` — the machine's global pre-push
             # credential gate cannot resolve `remote_sha..local_sha` and fails
             # the push with a generic error carrying no porcelain status at all.
-            # Unshallowing first keeps that gate working rather than bypassing it.
-            _source_card_run_step(
-                "git_push_sync",
-                ["git", "-C", str(landing_repository), "fetch", "--unshallow", "origin", "main"],
-                cwd=landing_repository,
-                timeout=120,
-                accepted_returncodes=(0, 128),
-            )
+            # Fetching the new tip (not unshallowing) is enough: after rebase the
+            # gate's range is the card commit, which is present locally. A full
+            # `--unshallow` of this research repo (~2400 commits, >1 GiB)
+            # exceeds the 120s step budget (live 2026-08-18 AYi_AInotes intake).
             _source_card_run_step(
                 "git_push_sync",
                 ["git", "-C", str(landing_repository), "fetch", "origin", "main"],

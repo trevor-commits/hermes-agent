@@ -3158,3 +3158,43 @@ def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
     # The shared checkout is untouched.
     assert _git(repo, "rev-parse", "HEAD") == original_head
     assert unrelated.read_text(encoding="utf-8") == "operator-owned pending card\n"
+
+
+def test_landing_does_not_unshallow_the_isolated_clone(tmp_path, monkeypatch):
+    """Live 2026-08-18 08:32 PT: `--unshallow` timed out after 120 seconds.
+
+    The isolated clone is `--depth 1`. Fetching origin/main plus rebase is
+    enough for the credential gate. Unshallowing the whole research history
+    is not.
+    """
+    import gateway.run as run_module
+
+    fixture = _write_offline_route_fixture(tmp_path)
+    card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
+    card.write_text(_REPLAY_CARD, encoding="utf-8")
+    recorded = []
+    original_run_step = run_module._source_card_run_step
+
+    def reject_unshallow(step, arguments, **kwargs):
+        recorded.append(list(arguments))
+        if "--unshallow" in arguments:
+            raise run_module._SourceCardLandingError(
+                step, "timeout after 120 seconds"
+            )
+        return original_run_step(step, arguments, **kwargs)
+
+    monkeypatch.setattr(run_module, "_source_card_run_step", reject_unshallow)
+
+    landed = run_module._land_source_card(
+        card_path=card,
+        intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
+        environment=_routing_environment(fixture),
+        source_message_row_id=77,
+    )
+
+    assert landed["commit"]
+    assert not any("--unshallow" in args for args in recorded)
+    assert any(
+        "fetch" in args and "origin" in args and "main" in args
+        for args in recorded
+    )
