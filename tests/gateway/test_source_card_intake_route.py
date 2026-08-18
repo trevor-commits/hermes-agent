@@ -1342,6 +1342,45 @@ def test_worker_draft_finalizer_selects_the_x_post_named_by_the_worker(tmp_path)
     assert "1111111111111111111" not in finalized
 
 
+def test_finalizer_keeps_an_x_post_card_when_github_prefetch_was_capped(tmp_path):
+    from gateway.run import _finalize_source_card_worker_draft
+
+    first = {
+        "owner_name": "example/first",
+        "canonical_url": "https://github.com/example/first",
+        "fields": {"head": "a" * 40, "license": "MIT"},
+    }
+    second = {
+        "owner_name": "example/second",
+        "canonical_url": "https://github.com/example/second",
+        "fields": {"head": "b" * 40, "license": "Apache-2.0"},
+    }
+    x_post = {
+        "status_id": "2089403001836609792",
+        "canonical_url": "https://x.com/i/status/2089403001836609792",
+        "author": {"handle": "DAIEvolutionHub", "name": "Kshitij Mishra"},
+    }
+    draft = _REPLAY_CARD.replace(
+        "https://github.com/IgorWarzocha/howaboua-pi-stuff",
+        "https://x.com/i/status/2089403001836609792",
+    ).replace(
+        "IgorWarzocha/howaboua-pi-stuff",
+        "DAIEvolutionHub (display name 'Kshitij Mishra | AI & Tech')",
+    )
+
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "x-post-2089403001836609792.md",
+        content=draft,
+        prefetched_x_posts=[x_post],
+        prefetched_github_repositories=[first, second],
+    )
+
+    assert "- url: https://x.com/i/status/2089403001836609792" in finalized
+    assert "example/first" not in finalized
+    assert "a" * 40 not in finalized
+    assert "n/a (social-source card; stable X status ID 2089403001836609792" in finalized
+
+
 def test_worker_draft_finalizer_rejects_quoted_todo_without_mutating_evidence(
     tmp_path,
 ):
@@ -1475,7 +1514,11 @@ def test_landing_error_redacts_validator_temporary_paths():
 
 
 def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
-    from gateway.run import _prefetch_source_card_github_repositories
+    from gateway.run import (
+        _prefetch_source_card_github_repositories,
+        _source_card_github_prefetch_bound_note,
+        _source_card_github_repositories,
+    )
 
     fixture = _write_offline_route_fixture(tmp_path)
     posts = [
@@ -1487,27 +1530,36 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
         }
     ]
 
-    prefetched = _prefetch_source_card_github_repositories(
+    prefetched, omitted = _prefetch_source_card_github_repositories(
         posts, fixture["repo"] / "scripts" / "source-card-prefetch"
     )
 
+    assert omitted == []
     assert len(prefetched) == 1
     assert prefetched[0]["owner_name"] == "IgorWarzocha/howaboua-pi-stuff"
     assert prefetched[0]["fields"]["head"] == (
         "8d63d300597488e6fa4c30ccd6a3eb0fed2d4304"
     )
-    assert _prefetch_source_card_github_repositories(
+    empty, empty_omitted = _prefetch_source_card_github_repositories(
         [{"links": ["https://github.com/settings/profile"]}],
         fixture["repo"] / "scripts" / "source-card-prefetch",
-    ) == []
+    )
+    assert empty == []
+    assert empty_omitted == []
     too_many = [
-        {"links": [f"https://github.com/example/repo-{index}"]}
-        for index in range(5)
+        {
+            "links": [
+                f"https://github.com/example/repo-{index}" for index in range(5)
+            ]
+        }
     ]
-    with pytest.raises(RuntimeError, match="maximum 4"):
-        _prefetch_source_card_github_repositories(
-            too_many, fixture["repo"] / "scripts" / "source-card-prefetch"
-        )
+    kept, omitted = _source_card_github_repositories(too_many)
+    assert kept == [f"example/repo-{index}" for index in range(4)]
+    assert omitted == ["example/repo-4"]
+    note = _source_card_github_prefetch_bound_note(omitted)
+    assert "truncated: 1" in note
+    assert "example/repo-4" in note
+    assert _source_card_github_prefetch_bound_note([]) == ""
 
 
 def test_receipt_failure_reports_the_already_contained_card(tmp_path):
