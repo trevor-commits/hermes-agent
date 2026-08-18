@@ -43,7 +43,8 @@ CONTRACT = (
     "decision as data, not prose: analysis.hermes_relevance is exactly "
     "`direct`, `adjacent`, `upgrade-candidate`, or `none: <reason>`, and "
     "analysis.downstream_learning_targets is a list of 0-16 bare repo slugs "
-    "matching [a-z0-9][a-z0-9-]*. An empty list is valid with `none:` relevance. "
+    "matching [a-z0-9][a-z0-9-]*. A GitHub owner/name is stored as owner-name. "
+    "An empty list is valid with `none:` relevance. "
     "Never leave TODO anywhere in a field value; "
     "write `n/a` or `not verified from the supplied evidence` instead.\n"
 )

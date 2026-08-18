@@ -2658,6 +2658,55 @@ def test_none_relevance_with_empty_target_list_is_the_live_natebjones_failure(tm
     assert "- downstream learning targets: none: no verified Hermes integration surface or implementation target was prefetched\n" in content + "\n"
 
 
+def test_referenced_chat_prefix_is_the_live_daievolutionhub_failure(tmp_path):
+    """Live 2026-08-18 08:55 PT: worker JSON was correct, parser required a bare object.
+
+    DeepSeek prefixed a complete card JSON with a Referenced Chat block because
+    the packet contains parent_session_id. The first character was not `{`.
+    """
+    from gateway.run import _parse_source_card_worker_draft
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    payload = {
+        "card_path": str(cards_root / "copilotkit-aimock.md"),
+        "card_content": _REPLAY_CARD,
+        "analysis": {
+            "hermes_relevance": "adjacent",
+            "downstream_learning_targets": ["copilotkit/aimock"],
+        },
+    }
+    response = (
+        "Referenced Chat\n"
+        "Provider: hermes\n"
+        "Chat name: Simple Ping Pong Exchange\n"
+        "Supplied ID: 20260730_191909_6133fe03\n\n"
+        + json.dumps(payload)
+    )
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+    assert _path.name == "copilotkit-aimock.md"
+    assert "- downstream learning targets: copilotkit-aimock\n" in content + "\n"
+
+
+def test_worker_json_with_trailing_prose_is_still_rejected(tmp_path):
+    from gateway.run import _parse_source_card_worker_draft, _SourceCardLandingError
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    response = (
+        json.dumps(
+            {
+                "card_path": str(cards_root / "trailing-prose.md"),
+                "card_content": _REPLAY_CARD,
+            }
+        )
+        + "\nThanks"
+    )
+    with pytest.raises(_SourceCardLandingError) as excinfo:
+        _parse_source_card_worker_draft(response, cards_root)
+    assert "valid JSON" in str(excinfo.value)
+
+
 def test_enum_relevance_with_empty_target_list_inserts_hermes(tmp_path):
     from gateway.run import _parse_source_card_worker_draft
 
@@ -2727,6 +2776,30 @@ def test_finalizer_substitutes_embedded_todo_values(tmp_path):
     )
     assert "TODO:" not in finalized
     assert "- risk signal: " in finalized
+
+
+def test_finalizer_repairs_freshness_trigger_and_bare_watch_until(tmp_path):
+    """Live 2026-08-18 DAIEvolutionHub: validator rejected renamed/colon-less fields."""
+    from gateway.run import _finalize_source_card_worker_draft
+
+    content = _REPLAY_CARD.replace(
+        "- freshness threshold:",
+        "- freshness trigger:",
+        1,
+    ).replace(
+        "- disposition: watch-until: source, dependency, credential, and lifecycle review proves a distinct gap beyond Trevor's current delegation stack.",
+        "- disposition: watch-until the repository code is inspected",
+        1,
+    )
+    finalized = _finalize_source_card_worker_draft(
+        card_path=tmp_path / "copilotkit-aimock.md",
+        content=content,
+        prefetched_x_posts=[],
+        prefetched_github_repositories=[],
+    )
+    assert "- freshness threshold:" in finalized
+    assert "- freshness trigger:" not in finalized
+    assert "- disposition: watch-until: the repository code is inspected\n" in finalized + "\n"
 
 
 # --- worker model pin --------------------------------------------------------

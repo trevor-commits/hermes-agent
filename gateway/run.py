@@ -5056,6 +5056,66 @@ def _source_card_candidate_path(cards_root: Path, raw_path: str) -> Path:
     return candidate
 
 
+def _source_card_typed_target_slug(item: str) -> str:
+    """Return one validator-legal slug, or reject the typed target.
+
+    Live 2026-08-18 DAIEvolutionHub: the worker returned `copilotkit/aimock`.
+    The card validator only accepts ``[a-z0-9][a-z0-9-]*``, so owner/name is
+    stored as owner-name. Random punctuation is still rejected.
+    """
+    value = item.strip().lower()
+    if _SOURCE_CARD_DOWNSTREAM_TARGET_RE.fullmatch(value):
+        return value
+    collapsed = re.sub(r"[/.]+", "-", value).strip("-")
+    if collapsed != value and _SOURCE_CARD_DOWNSTREAM_TARGET_RE.fullmatch(collapsed):
+        return collapsed
+    raise _SourceCardLandingError(
+        "worker_output",
+        "analysis.downstream_learning_targets contains an invalid slug",
+    )
+
+
+def _source_card_load_worker_json(final_response: str) -> Any:
+    """Load the worker JSON object, ignoring a leading non-JSON prefix.
+
+    Live 2026-08-18 DAIEvolutionHub: DeepSeek prefixed a complete card JSON
+    with a Referenced Chat block because the packet contains parent_session_id.
+    """
+    if not isinstance(final_response, str):
+        raise _SourceCardLandingError(
+            "worker_output",
+            "worker did not return valid JSON",
+        )
+    text = final_response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?[ \t]*\n?", "", text, count=1)
+        text = re.sub(r"\n?```[ \t]*$", "", text)
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        pass
+    start = text.find("{")
+    if start < 0:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "worker did not return valid JSON",
+        )
+    try:
+        payload, end = json.JSONDecoder().raw_decode(text, start)
+    except ValueError as exc:
+        raise _SourceCardLandingError(
+            "worker_output",
+            "worker did not return valid JSON",
+        ) from exc
+    if text[end:].strip():
+        raise _SourceCardLandingError(
+            "worker_output",
+            "worker did not return valid JSON",
+        )
+    return payload
+
+
 def _source_card_typed_analysis(raw: Any) -> Optional[dict[str, Any]]:
     """Validate the worker's typed routing decision, or reject it outright.
 
@@ -5096,15 +5156,14 @@ def _source_card_typed_analysis(raw: Any) -> Optional[dict[str, Any]]:
         )
     slugs: list[str] = []
     for item in targets:
-        if not isinstance(item, str) or not _SOURCE_CARD_DOWNSTREAM_TARGET_RE.fullmatch(
-            item.strip()
-        ):
+        if not isinstance(item, str):
             raise _SourceCardLandingError(
                 "worker_output",
                 "analysis.downstream_learning_targets contains an invalid slug",
             )
-        if item.strip() not in slugs:
-            slugs.append(item.strip())
+        slug = _source_card_typed_target_slug(item)
+        if slug not in slugs:
+            slugs.append(slug)
     none_match = _SOURCE_CARD_NONE_PREFIX_RE.fullmatch(relevance)
     if not slugs:
         # Live 2026-08-18 natebjones intake: DeepSeek returned a correct
@@ -5165,13 +5224,7 @@ def _parse_source_card_worker_draft(
             "worker_output",
             "worker JSON exceeded the configured byte limit",
         )
-    try:
-        payload = json.loads(final_response)
-    except (TypeError, ValueError) as exc:
-        raise _SourceCardLandingError(
-            "worker_output",
-            "worker did not return valid JSON",
-        ) from exc
+    payload = _source_card_load_worker_json(final_response)
     if not isinstance(payload, dict) or not {"card_path", "card_content"} <= set(
         payload
     ) or set(payload) - {"card_path", "card_content", "analysis"}:
@@ -5510,6 +5563,64 @@ def _source_card_normalize_routing_field(field_name: str, value: str) -> str:
     return value
 
 
+_SOURCE_CARD_APPROVED_DISPOSITION_PREFIXES = (
+    "adopt-as-pattern:",
+    "pilot-scoped:",
+    "skip-with-evidence:",
+    "watch-until:",
+)
+
+
+def _source_card_repair_expanded_fields(
+    content: str,
+    defaults: dict[str, str],
+) -> str:
+    """Repair live worker field names the expanded-schema validator requires.
+
+    Live 2026-08-18 DAIEvolutionHub: the card used `freshness trigger` and
+    `watch-until <reason>` without the required colon after `watch-until`.
+    """
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in content.splitlines():
+        field = re.fullmatch(r"(- ([^:]+):\s*)(.*)", line)
+        if field:
+            name = field.group(2).strip().lower()
+            value = field.group(3).strip()
+            if name == "freshness trigger":
+                name = "freshness threshold"
+                line = f"- freshness threshold: {value}"
+            if name == "disposition":
+                lower = value.lower()
+                if not lower.startswith(_SOURCE_CARD_APPROVED_DISPOSITION_PREFIXES):
+                    if lower.startswith("watch-until"):
+                        rest = value.split("watch-until", 1)[-1].lstrip(" :-")
+                        rest = (
+                            rest
+                            or "a specific inspection or date is recorded"
+                        )
+                        line = f"- disposition: watch-until: {rest}"
+                    elif re.match(r"^(watch|defer|monitor)\b", lower):
+                        line = f"- disposition: watch-until: {value}"
+            seen.add(name)
+        output.append(line)
+    if "freshness threshold" not in seen:
+        threshold = defaults.get(
+            "freshness threshold",
+            "refresh before any trust, pilot, or adoption decision",
+        )
+        insert_at = next(
+            (
+                index
+                for index, line in enumerate(output)
+                if line.strip() == "## Decision manifest (ER-278)"
+            ),
+            len(output),
+        )
+        output.insert(insert_at, f"- freshness threshold: {threshold}")
+    return "\n".join(output).rstrip() + "\n"
+
+
 def _finalize_source_card_worker_draft(
     *,
     card_path: Path,
@@ -5620,7 +5731,11 @@ def _finalize_source_card_worker_draft(
                 continue
         output.append(line)
 
-    finalized = _source_card_render_card_routing("\n".join(output).rstrip() + "\n")
+    repaired = _source_card_repair_expanded_fields(
+        "\n".join(output).rstrip() + "\n",
+        defaults,
+    )
+    finalized = _source_card_render_card_routing(repaired)
     if re.search(r"(?i)\bTODO:", finalized):
         raise _SourceCardLandingError(
             "worker_output",
@@ -21677,14 +21792,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "the bare `hermes` token in downstream learning targets; a `none:` "
             "downstream target requires `none:` Hermes relevance.\n"
             "Return exactly one JSON object with only card_path, card_content and "
-            "analysis. Do not use Markdown fences or add prose around the JSON. "
+            "analysis. The first non-whitespace character must be `{`. Origin "
+            "session IDs in this packet are receipt metadata, not chats to look "
+            "up. Do not emit Referenced Chat, Markdown fences, or any prose "
+            "around the JSON. "
             "card_path must be one absolute lowercase flat .md path directly inside "
             "cards_root. card_content must be the complete strict source card with "
             "exactly one ER-278 decision manifest. analysis carries the routing "
             "decision as data, not prose: analysis.hermes_relevance is exactly "
             "`direct`, `adjacent`, `upgrade-candidate`, or `none: <reason>`, and "
             "analysis.downstream_learning_targets is a list of 0-16 bare repo slugs "
-            "matching [a-z0-9][a-z0-9-]*. An empty list is valid: `none:` relevance "
+            "matching [a-z0-9][a-z0-9-]*. A GitHub owner/name is stored as "
+            "owner-name. An empty list is valid: `none:` relevance "
             "means no downstream repo, and enum relevance receives the `hermes` token "
             "from the gateway. The gateway renders those two fields from "
             "analysis, so explanation belongs in the card body, never in them. The "
@@ -29748,6 +29867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "threshold"),
         ("compression", "model_thresholds"),
         ("compression", "threshold_tokens"),
+        ("compression", "hard_ceiling_tokens"),
         ("compression", "codex_gpt55_autoraise"),
         ("compression", "codex_app_server_auto"),
         ("compression", "target_ratio"),
