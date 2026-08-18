@@ -330,18 +330,17 @@ def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
     """Shorten a durable receipt's model copy without touching stored output.
 
     The normal receipt format keeps its storage path and closing tag while the
-    inline preview absorbs the requested reduction.  Extremely small budgets
-    fall back to a compact receipt, then to an exact-length marked prefix.
+    inline preview absorbs the requested reduction. Extremely small budgets
+    fall back to a compact receipt that still includes the spill path and any
+    outer untrusted frame.
     """
     if len(content) <= max_chars:
         return content
-    if max_chars <= 0:
-        return ""
 
     persisted_closing = f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     header = _PERSISTED_PREVIEW_HEADER.search(content)
     closing_at = content.rfind(persisted_closing)
-    if header is not None and closing_at >= header.end():
+    if header is not None and closing_at >= header.end() and max_chars > 0:
         prefix = content[:header.end()]
         preview = content[header.end():closing_at]
         suffix = content[closing_at:]
@@ -376,24 +375,10 @@ def _trim_persisted_model_preview(content: str, max_chars: int) -> str:
         ]
     )
     compact = outer_prefix + "\n".join(compact_lines) + outer_suffix
-    if len(compact) <= max_chars:
-        return compact
-
-    framed_minimum = (
-        outer_prefix
-        + _AGGREGATE_PREVIEW_TRUNCATION_MARKER.lstrip("\n")
-        + outer_suffix
-    )
-    if (outer_prefix or outer_suffix) and len(framed_minimum) <= max_chars:
-        return framed_minimum
-    if outer_prefix or outer_suffix:
-        # A partial trust boundary is unsafe. Withhold the preview when the
-        # complete frame cannot fit rather than emitting an unterminated block.
-        return ""
-
-    if max_chars == 1:
-        return "…"
-    return content[:max_chars - 1] + "…"
+    # Compact is the smallest complete receipt: outer trust frame (if any),
+    # persisted-output tags, and the spill path. Slicing below that length
+    # either cuts a tag or drops the path; returning empty does both.
+    return compact
 
 
 @overload
@@ -485,7 +470,10 @@ def maybe_persist_tool_result(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return _result(
+                _build_persisted_message(preview, has_more, len(content), host_path),
+                full_output_persisted=True,
+            )
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the
@@ -497,7 +485,12 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
                     tool_name, tool_use_id, len(content), visible, host_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), visible)
+                return _result(
+                    _build_persisted_message(
+                        preview, has_more, len(content), visible
+                    ),
+                    full_output_persisted=True,
+                )
         # Fallback: write into the sandbox temp dir (pre-existing containers
         # without the spillover mount, translation/probe failures).
         storage_dir = _resolve_storage_dir(env)

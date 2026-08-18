@@ -208,7 +208,9 @@ class TestMaybePersistToolResult:
         assert isinstance(result, ToolResultPersistence)
         assert result.full_output_persisted is True
         assert PERSISTED_OUTPUT_TAG in result.content
-        assert env.execute.call_args.kwargs["stdin_data"] == content
+        assert (get_spillover_dir() / "tc_receipt.txt").read_text(
+            encoding="utf-8"
+        ) == content
 
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
@@ -391,7 +393,9 @@ class TestEnforceTurnBudget:
         )
         persist_again.assert_not_called()
         assert env.execute.call_count == writes_before_budgeting
-        assert [call.kwargs["stdin_data"] for call in env.execute.call_args_list] == full_outputs
+        spill = get_spillover_dir()
+        assert (spill / "persisted-0.txt").read_text(encoding="utf-8") == full_outputs[0]
+        assert (spill / "persisted-1.txt").read_text(encoding="utf-8") == full_outputs[1]
 
 
     def test_compact_persisted_preview_preserves_untrusted_frame(self):
@@ -430,6 +434,20 @@ class TestEnforceTurnBudget:
         assert trimmed.startswith('<untrusted_tool_result source="web_search">\n')
         assert trimmed.endswith("</untrusted_tool_result>")
         assert "Preview (first" not in trimmed
+
+    def test_trim_zero_budget_keeps_compact_receipt(self):
+        path = "/tmp/hermes-results/zero-budget.txt"
+        persisted = _build_persisted_message(
+            preview="x" * 200,
+            has_more=True,
+            original_size=2_000,
+            file_path=path,
+        )
+        trimmed = _trim_persisted_model_preview(persisted, 0)
+        assert PERSISTED_OUTPUT_TAG in trimmed
+        assert PERSISTED_OUTPUT_CLOSING_TAG in trimmed
+        assert f"Full output saved to: {path}" in trimmed
+        assert trimmed != ""
 
 
     def test_empty_messages(self):

@@ -82,8 +82,8 @@ class TestInPlaceCompaction:
             compressed, _ = compress_context(
                 agent,
                 [
-                    {"role": "user", "content": "old ask"},
-                    {"role": "assistant", "content": "old answer"},
+                    {"role": "user", "content": "old ask " + ("x" * 4000)},
+                    {"role": "assistant", "content": "old answer " + ("y" * 4000)},
                 ],
                 approx_tokens=100_000,
                 system_message="sys",
@@ -125,8 +125,8 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             turn_identity = f"{sid}:active-turn"
             messages = [
-                {"role": "user", "content": "old ask"},
-                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "old ask " + ("x" * 4000)},
+                {"role": "assistant", "content": "old answer " + ("y" * 4000)},
                 {
                     "role": "user",
                     "content": "active ask",
