@@ -677,6 +677,14 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "hard_ceiling_tokens": None, # absolute hard send ceiling, independent of
+                                      # the trigger above. When set, compression
+                                      # still triggers at threshold_tokens, but a
+                                      # request only fails closed at this (larger)
+                                      # token count. None/0 keeps the historical
+                                      # behavior: ceiling == trigger threshold.
+                                      # Clamped to the model window and floored at
+                                      # the trigger in conversation_loop.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "tail_mode": "legacy",        # tail retention policy (#87326):
                                       #   "legacy" — 0.20×window verbatim tail (default)

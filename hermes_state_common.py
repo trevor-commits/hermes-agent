@@ -6,6 +6,7 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+import re
 from typing import Any
 
 from agent.skill_commands import (
@@ -75,8 +76,56 @@ def _shape_preview(raw: Any) -> str:
         return ""
     described = describe_skill_invocation(text)
     text = described if described is not None else text.split(SKILL_EXCERPT_JOINT)[0]
+    text = _strip_image_attachment_text(text)
     if len(text) > _PREVIEW_MAX_CHARS:
         return text[:_PREVIEW_MAX_CHARS] + "..."
+    return text
+
+
+# Image turns persist as machine-authored content that must never become the
+# sidebar preview: the desktop writes "@image:`path`" reference lines
+# (tui_gateway.server._build_persist_message_with_image_refs), while the CLI
+# and the Anthropic fallback persist bracketed "[The user attached an image
+# ...]" notes (cli.py / run_agent.py). Strip both so an image-opening session
+# previews its caption — or nothing when there is no caption (the row then
+# shows just the derived "Image" title). Kept in sync with the note shapes
+# handled in agent/title_generator.py.
+#
+# The SQL window flattens newlines to spaces before shaping, so refs and notes
+# arrive inline ("…bug @image:`path`", "[…image: x.png] [Examine it with …]").
+_IMAGE_REF_RE = re.compile(r"@image:(?:`[^`]*`|`[^`]*$|\S+)")
+_IMAGE_NOTE_BLOCK_RE = re.compile(
+    r"\s*\[\s*(?:"
+    r"The\s+(?:user|assistant)\s+attached\s+an\s+image|"
+    r"Examine it with the vision_analyze tool|"
+    r"If you need a closer look"
+    r")[^\]]*\]"
+)
+# Heads of the same notes, for recognizing a note the 63-char window cut off
+# before its closing bracket.
+_IMAGE_NOTE_HEADS = (
+    "[the user attached an image",
+    "[the assistant attached an image",
+    "[examine it with the vision_analyze tool",
+    "[if you need a closer look",
+)
+
+
+def _strip_image_attachment_text(text: str) -> str:
+    """Remove image-attachment scaffolding from a preview window."""
+    text = _IMAGE_REF_RE.sub("", text).strip()
+    while True:
+        block = _IMAGE_NOTE_BLOCK_RE.match(text)
+        if not block:
+            break
+        text = text[block.end():].strip()
+    if text and "]" not in text:
+        # An unterminated bracket at the head is a note the window cut off —
+        # unless it is a fragment of one of the known note heads, in which
+        # case the whole window is scaffolding.
+        head = text.lstrip().lower()
+        if any(note.startswith(head) or head.startswith(note) for note in _IMAGE_NOTE_HEADS):
+            return ""
     return text
 
 

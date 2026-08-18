@@ -158,6 +158,52 @@ _MACHINE_PREFIXES = (
     "[System: The active model for this chat has changed to ",
 )
 
+# Image turns lead with machine-authored attachment notes. Two shapes exist:
+# the short "[The user attached an image: photo.png]" + vision-tool hint form
+# (tui_gateway.server._build_image_ref_message, the desktop/CLI model-facing
+# message) and the description-carrying "[The user attached an image. Here's
+# what it contains:\n…]" form (cli.py image enrichment, run_agent.py
+# Anthropic fallback). The user's own caption, when present, follows after a
+# blank line. Titling from the notes names the session "[The user attached an
+# image…" instead of the actual ask, so they are stripped before the first
+# meaningful line is chosen.
+_IMAGE_ATTACH_NOTE_START_RE = re.compile(
+    r"^\s*\[\s*The\s+(?:user|assistant)\s+attached\s+an\s+image\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_image_attachment_notes(text: str) -> str:
+    """Remove the machine-authored image-attachment notes leading a turn.
+
+    The notes are one or two ``[ … ]`` blocks; the caption (when present)
+    begins after a blank line. Everything from the opening note up to that
+    blank line is scaffolding, so it is dropped and the caption (or ``''``
+    for an image-only turn) is what remains.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+    if not _IMAGE_ATTACH_NOTE_START_RE.match(stripped):
+        return stripped
+    blank = re.search(r"\n\s*\n", stripped)
+    region_end = blank.start() if blank else len(stripped)
+    region = stripped[:region_end]
+    last_close = region.rfind("]")
+    if last_close == -1:
+        # No closing bracket inside the region (the description form cut by
+        # an internal blank line, or a truncated note): keep whatever comes
+        # after the blank line (the caption), else nothing.
+        return stripped[region_end:].strip() if blank else ""
+    return stripped[last_close + 1 :].strip()
+
+
+def _is_image_only_opener(user_message: str) -> bool:
+    """True when the opening turn is an image attachment with no caption."""
+    if not isinstance(user_message, str) or not user_message.strip():
+        return False
+    return bool(_IMAGE_ATTACH_NOTE_START_RE.match(user_message.strip()))
+
 
 # Disposable probes (PONG checks, smoke-token checks) exist only to verify the
 # agent is alive. They should be archived rather than titled and shown in the
@@ -346,21 +392,25 @@ def _summarize_user_message(user_message: str) -> str:
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
     text = described if described is not None else user_message
-    return strip_control_wrappers(text)
+    return _strip_image_attachment_notes(strip_control_wrappers(text))
 
 
 def is_titleable_user_message(user_message: str) -> bool:
     """Return whether *user_message* carries real user intent to title from.
 
     False for machine-authored openers (compaction handoffs, runtime notes) and
-    for turns that reduce to nothing once control scaffolding is stripped.
+    for turns that reduce to nothing once control scaffolding is stripped. An
+    image-only opener (attachment notes, no caption) still counts — it is a
+    real user turn, and the instant titler names it "Image".
     """
     if not isinstance(user_message, str) or not user_message.strip():
         return False
     for prefix in _MACHINE_PREFIXES:
         if user_message.lstrip().startswith(prefix):
             return False
-    return bool(_summarize_user_message(user_message).strip())
+    if _summarize_user_message(user_message).strip():
+        return True
+    return _is_image_only_opener(user_message)
 
 
 def derive_title(user_message: str) -> Optional[str]:
@@ -370,9 +420,16 @@ def derive_title(user_message: str) -> Optional[str]:
     message. It is intentionally dumb — first meaningful line, trimmed to a
     word boundary — because its job is to beat the model to the screen, not to
     beat it on quality. The model's title replaces it moments later.
+
+    An image turn titles from its caption once the attachment notes are
+    stripped; an image with no caption gets the deterministic "Image" (the
+    text-only model upgrade has nothing better to work from, so this is the
+    name the session keeps).
     """
     text = _summarize_user_message(user_message)
     if not text:
+        if _is_image_only_opener(user_message):
+            return "Image"
         return None
     # First non-empty line: a pasted log or a multi-paragraph brief still gets
     # named after its opening intent.
@@ -881,6 +938,12 @@ def maybe_auto_title(
         return
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
+
+    if not _summarize_user_message(user_message).strip():
+        # Image-only opener: the deterministic "Image" title is as good as a
+        # text-only titler gets — an LLM call would only see the attachment
+        # scaffolding — so do not spend one upgrading it.
+        return
 
     thread = threading.Thread(
         target=auto_title_session,

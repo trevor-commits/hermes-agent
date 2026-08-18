@@ -2175,6 +2175,18 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Hard send ceiling, split from the trigger. None/0 = legacy behavior
+    # (ceiling == trigger threshold). Clamped to the model window and floored
+    # at the trigger in conversation_loop when the compressor's context length
+    # is known.
+    compression_hard_ceiling_tokens = _compression_cfg.get("hard_ceiling_tokens")
+    if compression_hard_ceiling_tokens is not None:
+        try:
+            compression_hard_ceiling_tokens = int(compression_hard_ceiling_tokens)
+            if compression_hard_ceiling_tokens <= 0:
+                compression_hard_ceiling_tokens = None
+        except (TypeError, ValueError):
+            compression_hard_ceiling_tokens = None
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2697,6 +2709,7 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent._hard_ceiling_tokens = compression_hard_ceiling_tokens
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):

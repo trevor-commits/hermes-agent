@@ -1950,6 +1950,38 @@ class TestListSessionsRich:
         assert len(sessions) == 1
         assert "Help me refactor the auth module" in sessions[0]["preview"]
 
+    def test_preview_strips_image_ref_for_image_only_opener(self, db):
+        """Desktop persists image-only turns as a bare @image: ref line; that
+        file path must never become the sidebar preview."""
+        db.create_session("s1", "tui")
+        db.append_message("s1", "user", "@image:`/Users/x/photo.png`")
+        db.append_message("s1", "assistant", "Nice photo.")
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == ""
+
+    def test_preview_keeps_caption_and_strips_trailing_image_refs(self, db):
+        db.create_session("s1", "tui")
+        db.append_message(
+            "s1", "user", "Here is a screenshot of the bug\n@image:`/Users/x/photo.png`"
+        )
+        db.append_message("s1", "assistant", "Let me look.")
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "Here is a screenshot of the bug"
+
+    def test_preview_strips_bracket_image_notes(self, db):
+        """CLI/fallback flows persist bracketed image notes; the note must not
+        preview either (the session shows its derived "Image" title instead)."""
+        db.create_session("s1", "cli")
+        db.append_message(
+            "s1",
+            "user",
+            "[The user attached an image: photo.png]\n"
+            "[Examine it with the vision_analyze tool using image_url: /Users/x/photo.png]",
+        )
+        db.append_message("s1", "assistant", "ok")
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == ""
+
 
 
 

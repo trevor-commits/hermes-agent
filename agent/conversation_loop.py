@@ -2829,6 +2829,22 @@ def run_conversation(
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
+        # Hard send ceiling, split from the compression trigger. The trigger
+        # (threshold_tokens) should fire well before the provider window so
+        # compression has runway to succeed; the ceiling is where a send must
+        # fail closed when compression cannot continue. Unset (0/None) keeps
+        # the historical behavior: ceiling == trigger threshold. Clamped to the
+        # model window and never below the trigger (a ceiling below the trigger
+        # would fail-close before compression ever had a chance to run).
+        _hard_ceiling_cfg = int(getattr(agent, "_hard_ceiling_tokens", 0) or 0)
+        if _hard_ceiling_cfg > 0:
+            _ctx_len = int(getattr(_compressor, "context_length", 0) or 0)
+            _hard_ceiling_tokens = (
+                min(_hard_ceiling_cfg, _ctx_len) if _ctx_len > 0 else _hard_ceiling_cfg
+            )
+            _hard_ceiling_tokens = max(_hard_ceiling_tokens, _preflight_threshold)
+        else:
+            _hard_ceiling_tokens = _preflight_threshold
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
         # fully assembled request with the fully assembled request that caused
@@ -3041,7 +3057,7 @@ def run_conversation(
         _hard_ceiling_reason = _hard_context_ceiling_reason(
             agent,
             estimated_tokens=request_pressure_tokens,
-            ceiling_tokens=_preflight_threshold,
+            ceiling_tokens=_hard_ceiling_tokens,
             compression_attempts=compression_attempts,
             max_compression_attempts=max_compression_attempts,
             preflight_compression_blocked=_preflight_compression_blocked,
@@ -3402,7 +3418,7 @@ def run_conversation(
                         _terminal_estimate = _provider_request_tokens_rough(
                             next_api_kwargs
                         )
-                        if _terminal_estimate >= _preflight_threshold:
+                        if _terminal_estimate >= _hard_ceiling_tokens:
                             _hard_ceiling_trip = (
                                 _terminal_estimate,
                                 _hard_ceiling_reason,
@@ -3498,7 +3514,7 @@ def run_conversation(
                     # send — without spending the model-backed max_attempts
                     # budget and without dropping any message. The deficit
                     # window keeps big overshoots failing closed as before.
-                    _trim_deficit = _terminal_estimate - _preflight_threshold
+                    _trim_deficit = _terminal_estimate - _hard_ceiling_tokens
                     if (
                         _terminal_reason != "compression_lock"
                         and _terminal_reason != "input_too_large"
@@ -3523,7 +3539,7 @@ def run_conversation(
                                 "retrying provider send for session=%s",
                                 _reclaimed,
                                 _trim_deficit,
-                                _preflight_threshold,
+                                _hard_ceiling_tokens,
                                 agent.session_id or "none",
                             )
                             _hard_ceiling_trip = None
@@ -3540,7 +3556,7 @@ def run_conversation(
                         conversation_history,
                         api_call_count,
                         estimated_tokens=_terminal_estimate,
-                        ceiling_tokens=_preflight_threshold,
+                        ceiling_tokens=_hard_ceiling_tokens,
                         block_reason=_terminal_reason,
                     )
                 if _redirect_crossed_response:

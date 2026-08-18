@@ -599,6 +599,102 @@ class TestModelSwitchMarkerNotTitleable:
         )
 
 
+class TestImageAttachmentNotesStripped:
+    """Regression: an image turn must never be titled after the machine notes.
+
+    ``_build_image_ref_message`` (tui_gateway/server.py) leads the
+    model-facing message with "[The user attached an image: <name>]" plus a
+    vision hint, and the CLI / Anthropic-fallback paths use the
+    description-carrying "Here's what it contains: …" form. Flattening that
+    made the derived title the scaffolding itself — the sidebar showed
+    "[The user attached an image…" instead of the ask. The notes must be
+    stripped so the caption titles the session; an image with no caption gets
+    the deterministic "Image" and skips the text-only LLM upgrade.
+    """
+
+    SHORT = (
+        "[The user attached an image: photo.png]\n"
+        "[Examine it with the vision_analyze tool using image_url: /Users/x/photo.png]"
+    )
+    DESCRIBED = (
+        "[The user attached an image. Here's what it contains:\n"
+        "A red car parked on a mountain road at sunset.]\n"
+        "[If you need a closer look, use vision_analyze with image_url: /Users/x/photo.png]"
+    )
+
+    def test_image_only_short_form_derives_image(self):
+        from agent.title_generator import derive_title
+
+        assert derive_title(self.SHORT) == "Image"
+
+    def test_image_only_described_form_derives_image(self):
+        from agent.title_generator import derive_title
+
+        assert derive_title(self.DESCRIBED) == "Image"
+
+    def test_image_only_opener_is_titleable(self):
+        from agent.title_generator import is_titleable_user_message
+
+        assert is_titleable_user_message(self.SHORT) is True
+        assert is_titleable_user_message(self.DESCRIBED) is True
+
+    def test_caption_after_short_notes_titles_from_caption(self):
+        from agent.title_generator import derive_title
+
+        msg = self.SHORT + "\n\nHere is a screenshot of the login bug"
+        assert derive_title(msg) == "Here is a screenshot of the login bug"
+
+    def test_caption_after_described_notes_titles_from_caption(self):
+        from agent.title_generator import derive_title
+
+        msg = self.DESCRIBED + "\n\nWhat do you think of the framing?"
+        assert derive_title(msg) == "What do you think of the framing?"
+
+    def test_caption_turn_is_titleable(self):
+        from agent.title_generator import is_titleable_user_message
+
+        assert is_titleable_user_message(self.SHORT + "\n\nPlease fix this") is True
+
+    def test_plain_text_unaffected(self):
+        from agent.title_generator import derive_title, is_titleable_user_message
+
+        assert derive_title("Fix the login button") == "Fix the login button"
+        assert is_titleable_user_message("Fix the login button") is True
+        assert is_titleable_user_message("[The user attached an image: x.png]") is True
+
+    def test_image_only_writes_instant_title_and_skips_llm_upgrade(self):
+        """The deterministic "Image" name must land, with no LLM call spent on
+        scaffolding the text-only titler can't improve on."""
+        db = MagicMock()
+        db.get_session.return_value = None
+        db.get_session_title_source.return_value = None
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", self.SHORT, [])
+            mock_auto.assert_not_called()
+
+        db.set_auto_title.assert_called_once_with("sess-1", "Image", source="derived")
+
+    def test_caption_still_gets_llm_upgrade(self):
+        """A captioned image turn is a real ask: instant title from the caption,
+        then the normal model upgrade."""
+        db = MagicMock()
+        db.get_session.return_value = None
+        db.get_session_title_source.return_value = None
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-1", self.SHORT + "\n\nPlease fix this", [])
+            assert called.wait(timeout=10), "auto_title thread never ran"
+
+        db.set_auto_title.assert_called_once_with(
+            "sess-1", "Please fix this", source="derived"
+        )
+
+
 class TestDisposableProbeDetection:
     """Tests for _is_disposable_probe and auto-archive of PONG/smoke sessions."""
 

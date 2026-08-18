@@ -132,6 +132,55 @@ def test_provider_is_not_called_after_compression_stalls_above_ceiling(
     )
 
 
+def test_split_ceiling_sends_below_ceiling_despite_stalled_compression(
+    monkeypatch, tmp_path
+):
+    """A stalled compressor below the split hard ceiling must not fail closed.
+
+    compression.threshold_tokens (trigger) and compression.hard_ceiling_tokens
+    (send ceiling) are independent: a request over the trigger but under the
+    ceiling is legal to send even when compression is stalled/exhausted. The
+    stall only fails closed once the request is actually over the ceiling.
+    """
+    agent, _db = _make_agent(monkeypatch, tmp_path)
+    agent.context_compressor.threshold_tokens = 1_000  # trigger: compress early
+    agent._hard_ceiling_tokens = 5_000  # ceiling: stop late
+
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+        for i in range(60)
+    ]
+
+    def _no_progress(messages, system_message, **_kwargs):
+        active_prompt = (
+            system_message.get("content", "")
+            if isinstance(system_message, dict)
+            else agent._cached_system_prompt
+        )
+        return messages, active_prompt
+
+    with (
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            return_value=2_000,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=2_000,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_no_progress),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("keep this turn", conversation_history=history)
+
+    # 2_000 is over the 1_000 trigger (compression fires and stalls) but under
+    # the 5_000 ceiling, so the send must still reach the provider.
+    agent.client.chat.completions.create.assert_called_once()
+    assert result.get("hard_context_ceiling_blocked") is not True
+    assert result["completed"] is True
+
+
 def test_pre_api_compression_rebinds_before_next_iteration_hard_ceiling(
     monkeypatch, tmp_path
 ):
