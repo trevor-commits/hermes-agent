@@ -2621,6 +2621,63 @@ def test_typed_analysis_is_optional_and_absent_payloads_still_parse(tmp_path):
     assert "- downstream learning targets: hermes" in content
 
 
+def test_none_relevance_with_empty_target_list_is_the_live_natebjones_failure(tmp_path):
+    """Live 2026-08-18 01:00 PT X-link: worker JSON was correct, parser was not.
+
+    DeepSeek returned hermes_relevance=`none: <reason>` and
+    downstream_learning_targets=`[]` for a commentary post with no repo.
+    The card body already had matching `none:` lines. The parser required
+    1-16 slugs and failed the whole intake.
+    """
+    from gateway.run import _parse_source_card_worker_draft
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    body = _REPLAY_CARD.replace(
+        "- downstream learning targets: hermes",
+        "- downstream learning targets: none: no verified implementation target was prefetched",
+    ).replace(
+        "- Hermes relevance: adjacent",
+        "- Hermes relevance: none: no verified Hermes integration surface was prefetched",
+    )
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "x-post-natebjones-google-docs-style-guide-ai-skill.md"),
+            "card_content": body,
+            "analysis": {
+                "hermes_relevance": (
+                    "none: no verified Hermes integration surface or "
+                    "implementation target was prefetched"
+                ),
+                "downstream_learning_targets": [],
+            },
+        }
+    )
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+    assert "- Hermes relevance: none: no verified Hermes integration surface or implementation target was prefetched\n" in content + "\n"
+    assert "- downstream learning targets: none: no verified Hermes integration surface or implementation target was prefetched\n" in content + "\n"
+
+
+def test_enum_relevance_with_empty_target_list_inserts_hermes(tmp_path):
+    from gateway.run import _parse_source_card_worker_draft
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "empty-enum-targets.md"),
+            "card_content": _REPLAY_CARD,
+            "analysis": {
+                "hermes_relevance": "adjacent",
+                "downstream_learning_targets": [],
+            },
+        }
+    )
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+    assert "- downstream learning targets: hermes\n" in content + "\n"
+    assert "- Hermes relevance: adjacent\n" in content + "\n"
+
+
 @pytest.mark.parametrize(
     "analysis",
     [
