@@ -293,7 +293,16 @@ class TestSend:
 class TestOnMessage:
 
     def _make_adapter(self):
-        return NtfyAdapter(PlatformConfig(enabled=True, extra={"topic": "hermes-in"}))
+        # typing_indicator=False: this suite asserts handler dispatch
+        # synchronously right after _on_message returns. Keeper's
+        # first-typing-tick acknowledgement awaits up to 1.75s before the
+        # message handler runs, which defers the assert past the test's
+        # synchronous check. Inbound identity semantics are typing-independent.
+        return NtfyAdapter(
+            PlatformConfig(
+                enabled=True, extra={"topic": "hermes-in"}, typing_indicator=False
+            )
+        )
 
     def test_message_dispatched_to_handler(self):
         adapter = self._make_adapter()
