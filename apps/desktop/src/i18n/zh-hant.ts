@@ -52,6 +52,9 @@ export const zhHant = defineLocale({
     revealInSidebar: '在檔案樹中顯示',
     copyPath: '複製路徑',
     copyRelativePath: '複製相對路徑',
+    download: '下載',
+    downloadSaved: '已儲存',
+    downloadFailed: '下載失敗',
     rename: '重新命名…',
     delete: '刪除',
     renameTitle: '重新命名',
@@ -1426,6 +1429,8 @@ export const zhHant = defineLocale({
     allProfiles: '全部設定檔',
     showAllProfiles: '顯示全部設定檔',
     switchToProfile: name => `切換至 ${name}`,
+    switchToConnection: name => `切換至 ${name}`,
+    switchConnectionFailed: name => `無法連線至 ${name}`,
     manageProfiles: '管理設定檔…',
     actions: '動作',
     color: '顏色…',
@@ -2532,6 +2537,11 @@ export const zhHant = defineLocale({
   zones: {
     showHeader: '顯示標題列',
     hideHeader: '隱藏標題列',
+    showStripTab: title => `顯示 ${title}`,
+    hideStripTab: title => `隱藏 ${title}`,
+    lastTabKeptTitle: '保留最後一個分頁',
+    lastTabKeptBody: '此區域至少需要一個可見分頁。請先顯示另一個分頁，或收合整個側邊欄。',
+    toggleStripTab: title => `切換 ${title} 分頁`,
     minimize: '最小化',
     restore: '還原',
     reload: '重新載入',
@@ -2566,6 +2576,30 @@ export const zhHant = defineLocale({
     notExpressible: '此排列互相咬合（風車形）——暫時無法表示為巢狀分割',
     zoneCount: count => `${count} 個區域`,
     tabCount: count => `${count} 個分頁`
+  },
+
+  contextMenu: {
+    link: {
+      openInApp: '在應用程式內瀏覽器中開啟',
+      openExternal: '在外部瀏覽器中開啟',
+      copyUrl: '複製 URL',
+      copyResolvedUrl: '複製解析後的 URL'
+    },
+    image: {
+      copyImage: '複製圖片',
+      copyImageAddress: '複製圖片位址',
+      saveImageAs: '圖片另存為…'
+    },
+    edit: {
+      cut: '剪下',
+      paste: '貼上',
+      selectAll: '全選',
+      addToDictionary: '新增至字典'
+    },
+    page: {
+      copyPageUrl: '複製頁面 URL',
+      inspectElement: '檢查元素'
+    }
   },
 
   assistant: {
@@ -2632,6 +2666,9 @@ export const zhHant = defineLocale({
       skip: '略過',
       skipped: '已略過',
       continueLabel: '繼續',
+      confirmAndContinueLabel: '確認並繼續',
+      answeredBadge: '已回答',
+      questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `關於「${question}」 — 我的回答: ${choice}`,
       lateAnswerTip: '將此回答起草為後續訊息',
       lateAnswerHint: '此問題已不再等待回答。選擇一個選項會將其起草為後續訊息。'
