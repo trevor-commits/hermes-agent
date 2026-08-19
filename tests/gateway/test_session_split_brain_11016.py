@@ -51,7 +51,12 @@ class _StubAdapter(BasePlatformAdapter):
 
 
 def _make_adapter():
-    config = PlatformConfig(enabled=True, token="test-token")
+    # typing_indicator=False: this suite tests session cancellation semantics,
+    # not typing. Keeper's first-typing-tick acknowledgement awaits up to 1.75s
+    # before dispatching (see _keep_typing first_tick_done), which both delays
+    # the follow-up assertions past their two-sleep(0) waits and leaves a live
+    # typing task that stalls event-loop teardown when a test fails.
+    config = PlatformConfig(enabled=True, token="test-token", typing_indicator=False)
     adapter = _StubAdapter(config, Platform.TELEGRAM)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
