@@ -85,7 +85,11 @@ def _make_initialized_adapter() -> BasePlatformAdapter:
 def _make_adapter() -> BasePlatformAdapter:
     """Build a BasePlatformAdapter without running its heavy __init__."""
     adapter = object.__new__(_DummyAdapter)
-    adapter.config = PlatformConfig(enabled=True, token="***")
+    # typing_indicator=False: these tests never test typing, and the leaked
+    # _keep_typing refresh task otherwise blocks event-loop teardown for its
+    # full interval when handle_message spawns it via _process_message_background
+    # (observed as the deterministic 3% stall in the full gateway suite).
+    adapter.config = PlatformConfig(enabled=True, token="***", typing_indicator=False)
     adapter.platform = Platform.TELEGRAM
     adapter._message_handler = AsyncMock(return_value=None)
     adapter._busy_session_handler = None
