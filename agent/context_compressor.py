@@ -19,6 +19,7 @@ Improvements over v2:
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import re
 import time
@@ -42,6 +43,16 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
+
+# Main-model families that must never receive compression-fallback traffic
+# (substring match against the lowercased main model id). Override via
+# HERMES_COMPRESSION_FALLBACK_DENYLIST (comma-separated; empty string
+# disables). See _fallback_to_main_for_compression for the 2026-08-18 incident.
+_COMPRESSION_MAIN_FALLBACK_DENYLIST = tuple(
+    s.strip().lower()
+    for s in os.environ.get("HERMES_COMPRESSION_FALLBACK_DENYLIST", "kimi").split(",")
+    if s.strip()
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4479,7 +4490,37 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         ``reason`` is a short human-readable phrase ("unavailable",
         "timed out", "returned invalid JSON", "failed") that is interpolated
         into the warning log.
+
+        Denylisted main models never receive this fallback traffic
+        (2026-08-18 kimi burn: with the auxiliary summary model rate-limited,
+        this fallback re-billed an already-burning sticky kimi-k3 session on
+        every compression attempt — 12.7M uncached tokens in one morning).
+        For those, keep the auxiliary model and let compression fail closed:
+        the hard-context-ceiling machinery blocks the oversized send instead.
+        ``_summary_model_fallen_back`` is still set so the retry branches in
+        :meth:`_generate_summary` stay bounded (one more aux attempt, then
+        cooldown).
         """
+        main_model = (self.model or "").lower()
+        if any(d in main_model for d in _COMPRESSION_MAIN_FALLBACK_DENYLIST):
+            self._summary_model_fallen_back = True
+            logger.warning(
+                "Summary model '%s' %s (%s) but main model '%s' is denylisted "
+                "for compression fallback — keeping the auxiliary model; "
+                "compression fails closed rather than re-billing this session.",
+                self.summary_model, reason, e, self.model,
+            )
+            _err_text = str(e).strip() or e.__class__.__name__
+            if len(_err_text) > 220:
+                _err_text = _err_text[:217].rstrip() + "..."
+            self._last_aux_model_failure_error = _err_text
+            self._last_aux_model_failure_model = self.summary_model
+            telemetry = getattr(self, "_active_compression_telemetry", None)
+            if isinstance(telemetry, dict):
+                telemetry["failure_class"] = (
+                    telemetry.get("failure_class") or "aux_fallback_denied"
+                )
+            return
         self._summary_model_fallen_back = True
         logger.warning(
             "Summary model '%s' %s (%s). "

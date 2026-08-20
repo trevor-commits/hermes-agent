@@ -34598,18 +34598,33 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
+        # Name the shutdown cause so the terminal _update_runtime_status()
+        # write is interpretable from outside: gateway_state.json previously
+        # carried exit_reason=null for every signal-initiated exit, making a
+        # requested respawn indistinguishable from a crash (94 uninterpretable
+        # exit_nonzero events in the 26-day exit census, 2026-08-20).
+        _signame = _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT"
         if planned_takeover:
+            runner._exit_reason = runner._exit_reason or (
+                f"planned --replace takeover ({_signame})"
+            )
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
         elif planned_stop:
+            runner._exit_reason = runner._exit_reason or (
+                f"planned gateway stop ({_signame})"
+            )
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
         else:
             _signal_initiated_shutdown = True
+            runner._exit_reason = runner._exit_reason or (
+                f"external signal ({_signame})"
+            )
             # Mirror onto the runner so _stop_impl can suppress the
             # gateway_state=stopped persist for unexpected signals
             # (container/s6 SIGTERM on restart, OOM, bare kill) — see
