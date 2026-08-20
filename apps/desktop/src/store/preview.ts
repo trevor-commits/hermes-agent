@@ -14,8 +14,9 @@ import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '
  * a tool result, a file-browser click, and an artifact card all travel the
  * same road and behave identically once open.
  *
- * Tabs are global and outlive the session that created them, like tabs
- * anywhere else — they close when you close them.
+ * Tabs are global for the life of the window and deliberately ephemeral. A
+ * preview is presentation state, not durable work; restoring any old tab would
+ * resurrect the right rail on the next launch.
  */
 
 export interface PreviewTarget {
@@ -64,90 +65,15 @@ const TABS_STORAGE_KEY = 'hermes.desktop.previewTabs.v2'
 /** Superseded by the tab list above; cleared so it can't leak forever. */
 const LEGACY_SESSION_REGISTRY_KEY = 'hermes.desktop.sessionPreviews.v1'
 
-function isPreviewTarget(value: unknown): value is PreviewTarget {
-  if (!value || typeof value !== 'object') {
-    return false
-  }
-
-  const r = value as Record<string, unknown>
-
-  return (
-    (r.kind === 'artifact' || r.kind === 'file' || r.kind === 'url') &&
-    typeof r.label === 'string' &&
-    typeof r.source === 'string' &&
-    typeof r.url === 'string'
-  )
-}
-
-// Artifact tabs are never written (their registry is memory-only), so a
-// restored artifact row is stale storage — drop it rather than reviving a tab
-// with nothing behind it.
-function isPreviewTab(value: unknown): value is PreviewTab {
-  if (!value || typeof value !== 'object') {
-    return false
-  }
-
-  const r = value as Record<string, unknown>
-
-  return typeof r.id === 'string' && (r.id.startsWith('file:') || r.id.startsWith('url:')) && isPreviewTarget(r.target)
-}
-
-function isPdfFileTarget(target: PreviewTarget): boolean {
-  if (target.kind !== 'file') {
-    return false
-  }
-
-  if (target.mimeType?.toLowerCase() === 'application/pdf') {
-    return true
-  }
-
-  if ([target.path, target.source].some(value => (value ? /\.pdf$/i.test(value) : false))) {
-    return true
-  }
-
-  try {
-    return /\.pdf$/i.test(new URL(target.url).pathname)
-  } catch {
-    return false
-  }
-}
-
-/** Upgrade tabs persisted by builds that classified PDFs as generic binary.
- * Without this restore-time migration, an already-open PDF keeps taking the
- * obsolete raw-binary path after Desktop itself has been upgraded. */
-export function decodePreviewTabs(raw: string): PreviewTab[] {
-  const parsed = JSON.parse(raw) as unknown
-
-  const tabs = (Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []).map(tab =>
-    isPdfFileTarget(tab.target) && tab.target.previewKind === 'binary'
-      ? { ...tab, target: { ...tab.target, previewKind: 'pdf' as const } }
-      : tab
-  )
-
-  // One Browser: rekey restored URL tabs onto the singleton id (rows written
-  // before the id existed carried one id per address) and keep only the
-  // LAST — the most recently opened page is the one the browser shows.
-  const lastUrl = tabs.findLast(tab => tab.target.kind === 'url')
-
-  return tabs
-    .filter(tab => tab.target.kind !== 'url' || tab === lastUrl)
-    .map(tab => (tab.target.kind === 'url' ? { ...tab, id: previewTabId(tab.target) } : tab))
+/** Older builds wrote preview tabs to localStorage. Decode every historical
+ * shape to an empty window so no file, website, or artifact can reopen a rail. */
+export function decodePreviewTabs(_raw: string): PreviewTab[] {
+  return []
 }
 
 export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
   decode: decodePreviewTabs,
-  // Inline bytes are not restorable. Strip them from images, and skip remote
-  // HTML and artifact tabs that cannot render without their in-memory payload.
-  encode: tabs =>
-    JSON.stringify(
-      tabs.filter(
-        tab =>
-          tab.target.kind !== 'artifact' &&
-          !tab.target.transient &&
-          !(tab.target.previewKind === 'html' && tab.target.dataUrl)
-      ),
-      (key, value) => (key === 'dataUrl' ? undefined : value)
-    )
+  encode: () => '[]'
 })
 
 if (typeof window !== 'undefined') {

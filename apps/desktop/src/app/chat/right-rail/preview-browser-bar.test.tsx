@@ -10,6 +10,7 @@ const baseProps = {
   devToolsOpen: false,
   loading: false,
   onBack: vi.fn(),
+  onClose: vi.fn(),
   onForward: vi.fn(),
   onNavigate: vi.fn(),
   onOpenExternal: vi.fn(),
@@ -89,6 +90,7 @@ describe('PreviewBrowserBar', () => {
     expect(rendered.getByRole('button', { name: 'Open in browser' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Show preview console' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Open preview DevTools' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Close preview pane' })).toBeTruthy()
     expect(address(rendered)).toBeTruthy()
   })
 
@@ -108,6 +110,7 @@ describe('PreviewBrowserBar', () => {
 
   it.each([
     ['Back', 'onBack'],
+    ['Close preview pane', 'onClose'],
     ['Forward', 'onForward'],
     ['Reload page', 'onReload'],
     ['Open in browser', 'onOpenExternal']

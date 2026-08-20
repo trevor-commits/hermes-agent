@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $previewTabs, closeRightRail, openPreview } from '@/store/preview'
 import { $connection } from '@/store/session'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
@@ -25,6 +26,7 @@ function stubPdfObjectUrls() {
 
 describe('PreviewPane console state', () => {
   beforeEach(() => {
+    closeRightRail()
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
       window.setTimeout(() => callback(Date.now()), 0)
     )
@@ -33,6 +35,7 @@ describe('PreviewPane console state', () => {
 
   afterEach(() => {
     cleanup()
+    closeRightRail()
     $connection.set(null)
     vi.unstubAllGlobals()
   })
@@ -140,6 +143,26 @@ describe('PreviewPane console state', () => {
     })
 
     expect(rendered.queryByRole('textbox', { name: 'Address' })).toBeNull()
+  })
+
+  it('always exposes a close button that removes the live browser preview tab', async () => {
+    const target = {
+      kind: 'url' as const,
+      label: 'Preview',
+      source: 'http://localhost:5174',
+      url: 'http://localhost:5174'
+    }
+
+    openPreview(target)
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(<PreviewPane target={target} />)
+    })
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Close preview pane' }))
+
+    expect($previewTabs.get()).toEqual([])
   })
 
   it('drives the webview from the bar and tracks its history', async () => {

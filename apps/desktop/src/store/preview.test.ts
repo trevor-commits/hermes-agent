@@ -152,15 +152,15 @@ describe('preview store', () => {
     expect($previewTabs.get()).toHaveLength(1)
   })
 
-  it('persists file and url tabs but never artifacts, whose content is memory-only', () => {
+  it('keeps every preview tab window-only', () => {
     openPreview(fileTarget('/work/demo.html'), 'file-browser')
     openPreview(urlTarget('http://localhost:5174'), 'tool-result')
     openPreview(artifactTarget('session-1:dashboard'))
 
     const stored = window.localStorage.getItem('hermes.desktop.previewTabs.v2') ?? ''
 
-    expect(stored).toContain('/work/demo.html')
-    expect(stored).toContain('localhost:5174')
+    expect(stored).not.toContain('/work/demo.html')
+    expect(stored).not.toContain('localhost:5174')
     expect(stored).not.toContain('dashboard')
   })
 

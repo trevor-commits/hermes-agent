@@ -18,7 +18,13 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
+import {
+  $previewServerRestart,
+  closeRightRailTab,
+  failPreviewServerRestart,
+  previewTabId,
+  type PreviewTarget
+} from '@/store/preview'
 
 import { ArtifactPreview } from './preview-artifact'
 import { PreviewBrowserBar } from './preview-browser-bar'
@@ -956,6 +962,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             devToolsOpen={devtoolsOpen}
             loading={loading}
             onBack={goBack}
+            onClose={() => closeRightRailTab(tabId ?? previewTabId(target))}
             onForward={goForward}
             onNavigate={navigateTo}
             onOpenExternal={() => void window.hermesDesktop?.openExternal(currentUrl)}
