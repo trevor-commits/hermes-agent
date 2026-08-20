@@ -10035,14 +10035,17 @@ def _finalize_update_output(state):
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name.
+    """Resolve the update branch every consumer of ``--branch`` agrees on.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Delegates to :mod:`hermes_cli.update_branch`: explicit ``--branch`` wins,
+    then ``$HERMES_UPDATE_BRANCH``, then the current HEAD branch when it
+    exists on origin, then ``main``. A carried-branch checkout (e.g. a
+    ``keeper``) therefore updates against its own branch by default instead
+    of resolving ``main`` and refusing at the parked-branch guard.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    from hermes_cli.update_branch import resolve_update_branch
+
+    return resolve_update_branch(explicit=getattr(args, "branch", None))
 
 
 def _size_delta_label(saved_mb: float) -> str:

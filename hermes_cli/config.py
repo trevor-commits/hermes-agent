@@ -598,7 +598,13 @@ def recommended_update_command() -> str:
     if managed_cmd:
         return managed_cmd
     method = detect_install_method(get_project_root())
-    return recommended_update_command_for_method(method)
+    # Branch-pin the bare git command: on a carried-branch checkout an
+    # unpinned `hermes update` resolves `main` and refuses at the
+    # parked-branch guard, so the banner would nag with a command that
+    # can never clear the nag.
+    from hermes_cli.update_branch import branch_pinned_update_command
+
+    return branch_pinned_update_command(recommended_update_command_for_method(method))
 
 
 # Long-form text for ``hermes update`` / ``--check`` when running inside the

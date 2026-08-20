@@ -275,8 +275,8 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+def _check_via_local_git(repo_dir: Path, branch: str = "main") -> Optional[int]:
+    """Count commits behind ``origin/<branch>`` in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
@@ -314,7 +314,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
     # --depth 1 to preserve the boundary and compare tip SHAs instead of
     # counting. Full clones (developers, Docker dev images) keep the exact
-    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
+    # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.ts.
     shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
     is_shallow = shallow == "true"
 
@@ -336,7 +336,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        fetch_args = ["git", "fetch", "origin", branch]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -355,7 +355,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", f"origin/{branch}"], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -370,7 +370,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..origin/{branch}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -387,7 +387,10 @@ def check_for_updates() -> Optional[int]:
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
     it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    git checkout and count commits behind ``origin/<update branch>`` (the
+    branch ``hermes_cli.update_branch.resolve_update_branch`` resolves — the
+    same one ``hermes update`` would pull, so the nag and the suggested
+    command can never disagree again).
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -411,8 +414,16 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
+    try:
+        from hermes_cli.update_branch import resolve_update_branch
+
+        update_branch = resolve_update_branch()
+    except Exception:
+        update_branch = "main"
+
+    # Read cache — invalidate if the embedded rev, installed version, OR
+    # resolved update branch has changed since the last check (a healed
+    # branch flip must never serve the other branch's stale count).
     now = time.time()
     try:
         if cache_file.exists():
@@ -421,6 +432,7 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("branch", "main") == update_branch
             ):
                 return cached.get("behind")
     except Exception:
@@ -441,11 +453,12 @@ def check_for_updates() -> Optional[int]:
             # above) or an unsupported install without a source tree.
             behind = None
         else:
-            behind = _check_via_local_git(repo_dir)
+            behind = _check_via_local_git(repo_dir, update_branch)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
+            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev,
+                        "ver": VERSION, "branch": update_branch}),
             encoding="utf-8",
         )
     except Exception:

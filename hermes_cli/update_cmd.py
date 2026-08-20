@@ -5376,14 +5376,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"  ✓ Checkout was parked on '{current_branch}' (fully "
                     f"merged) — switched back to {branch}."
                 )
-            elif current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    check=False,
-                )
+            # (No restore-original-branch case remains: reaching here with
+            # current_branch not in {branch, "HEAD"} implies the parked-branch
+            # guard already switched — it either exits 1 or sets
+            # parked_branch_switched=True.)
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone

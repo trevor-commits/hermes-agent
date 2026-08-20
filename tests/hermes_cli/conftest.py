@@ -20,6 +20,28 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_update_branch(monkeypatch):
+    """Pin the resolved update branch to ``main`` for every test.
+
+    ``hermes_cli.update_branch.resolve_update_branch`` derives its default
+    from the REAL installed checkout's HEAD branch and probes origin with
+    ``git ls-remote`` (network). Unpinned, a test run on a carried-branch
+    dev checkout would resolve that branch — and hit the network — inside
+    tests that assume the stock ``main`` default. The env override is the
+    resolver's own first-class short-circuit, so no code path is bypassed.
+    Tests exercising the resolver itself delete the env var and patch
+    subprocess directly (see test_update_branch.py). Also resets the
+    module's process-lifetime cache so tests can't leak resolutions.
+    """
+    monkeypatch.setenv("HERMES_UPDATE_BRANCH", "main")
+    try:
+        from hermes_cli import update_branch as _ub
+    except Exception:
+        return
+    monkeypatch.setattr(_ub, "_resolved", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 

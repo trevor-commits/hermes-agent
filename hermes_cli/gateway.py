@@ -5250,12 +5250,17 @@ def _restart_system_launchd_gateway() -> None:
         print("✓ System daemon gateway restart requested")
         return
 
-    drain_timeout = _get_restart_drain_timeout()
+    # Wait budget must cover the SIGUSR1 handler's full graceful sequence:
+    # refuse-new-turns -> wait for in-flight work (restart_after_turn_timeout)
+    # -> stop()/drain. Waiting only restart_drain_timeout (a 20s-class value)
+    # made this print a false "✗ did not complete" while the gateway was
+    # still politely finishing a turn it had every right to finish (#77184).
+    wait_budget = _get_restart_exit_wait_budget()
     print(
         f"→ Restarting system daemon gateway (PID {daemon_pid}) — draining "
-        f"in-flight runs (up to {drain_timeout:.0f}s)..."
+        f"in-flight runs (up to {wait_budget:.0f}s)..."
     )
-    if not _graceful_restart_via_sigusr1(daemon_pid, drain_timeout):
+    if not _graceful_restart_via_sigusr1(daemon_pid, wait_budget):
         print("✗ Gateway did not complete its drain-aware restart handoff.")
         raise SystemExit(1)
     print("✓ Restart handed to the system daemon; launchd KeepAlive will relaunch it")
@@ -5291,6 +5296,20 @@ def launchd_restart():
             )
             _escalate_wedged_gateway(pid)
             pid = None
+        if pid is not None:
+            # Prefer the drain-aware SIGUSR1 handoff (refuse new turns, let
+            # in-flight work finish, then exit) before any SIGTERM — the same
+            # preference the systemd and manual-gateway restart branches
+            # already have. SIGTERM's force-interrupt budget
+            # (restart_drain_timeout) can be seconds and cuts a streaming
+            # turn mid-flight; SIGUSR1 lets it finish.
+            wait_budget = _get_restart_exit_wait_budget()
+            print(
+                f"→ Restarting gateway (PID {pid}) — drain-aware handoff "
+                f"(up to {wait_budget:.0f}s)..."
+            )
+            if _graceful_restart_via_sigusr1(pid, wait_budget):
+                pid = None
         if pid is not None:
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway

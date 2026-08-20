@@ -4856,8 +4856,20 @@ async def update_hermes():
 
     action_id = secrets.token_hex(16)
     try:
+        # Pin the branch the spawned update targets to the same one the
+        # check endpoint measured. Unpinned, `hermes update` used to resolve
+        # `main` on a carried-branch checkout and refuse at the parked-branch
+        # guard — the dashboard's Update button could never succeed there.
+        # `main` stays bare (redundant to pin, and keeps stock behavior).
+        from hermes_cli.update_branch import resolve_update_branch
+
+        update_branch = resolve_update_branch()
+        update_args = (
+            ["update"] if update_branch == "main"
+            else ["update", "--branch", update_branch]
+        )
         proc = _spawn_hermes_action(
-            ["update"],
+            update_args,
             "hermes-update",
             env_overrides={"HERMES_ACTION_ID": action_id},
         )
@@ -4872,16 +4884,17 @@ async def update_hermes():
     }
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(branch: str = "main", n: int = 20) -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind ``origin/<branch>`` by, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
+    Logs the SAME range the behind-count uses (``HEAD..origin/<branch>`` — see
     ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
     feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
     commits), which would leave the changelog empty even though the count is
-    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+    non-zero. Pinning to the resolved update branch keeps count and changelog
+    consistent.
 
-    Best-effort: returns [] if not a git checkout, origin/main is unreachable,
+    Best-effort: returns [] if not a git checkout, the ref is unreachable,
     or git is unavailable. Never raises into the request path.
     """
     try:
@@ -4892,7 +4905,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..origin/{branch}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -4967,7 +4980,16 @@ async def check_hermes_update(force: bool = False):
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
-    update_command = recommended_update_command_for_method(install_method)
+    # Branch-pin the suggested command so it matches what the check below
+    # actually measured (and what POST /api/hermes/update will spawn).
+    from hermes_cli.update_branch import (
+        branch_pinned_update_command,
+        resolve_update_branch,
+    )
+
+    update_command = branch_pinned_update_command(
+        recommended_update_command_for_method(install_method)
+    )
 
     payload: Dict[str, Any] = {
         "install_method": install_method,
@@ -5016,7 +5038,9 @@ async def check_hermes_update(force: bool = False):
         # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).
         if install_method == "git":
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            payload["commits"] = await asyncio.to_thread(
+                _recent_upstream_commits, resolve_update_branch()
+            )
 
     return payload
 
