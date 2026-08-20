@@ -5554,6 +5554,52 @@ def set_config_value(key: str, value: str, force: bool = False):
                 )
 
     value = coerced_value
+    # Wrapped-quote normalization (2026-08-20). A caller that passes a
+    # JSON-encoded string — e.g. an agent shelling out
+    #   hermes config set auxiliary.compression.provider '"openai-codex"'
+    # — previously had the quotes stored VERBATIM into YAML ('"openai-codex"'),
+    # which resolve_provider() rejects at runtime with "Unknown provider" deep
+    # inside a worker where no fallback engages (2026-08-20 10:09 PT
+    # source-card outage). Symmetric wrapping quotes are never part of an
+    # intended config scalar: strip exactly one layer and say so. Values with
+    # further embedded quotes are left untouched (conservative).
+    if (
+        isinstance(value, str)
+        and len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        _inner = value[1:-1]
+        if _inner and '"' not in _inner and "'" not in _inner:
+            print(
+                f"Note: stripped wrapping quotes from value "
+                f"({value!r} -> {_inner!r})."
+            )
+            value = _inner
+    # Provider leaves must resolve at WRITE time, not at runtime inside a
+    # Telegram worker with no fallback. Reuses the canonical resolver (same
+    # aliases + registry + custom/openrouter handling the runtime uses).
+    # "auto" and "moa" are virtual sentinels handled downstream; --force
+    # bypasses for keys the running version doesn't know yet.
+    if (
+        isinstance(value, str)
+        and value
+        and not force
+        and key.strip().lower().rsplit(".", 1)[-1] == "provider"
+        and value.strip().lower() not in {"auto", "moa"}
+    ):
+        try:
+            from hermes_cli.auth import AuthError, resolve_provider
+            resolve_provider(value.strip().lower())
+        except AuthError as _pv_err:
+            print(
+                f"✗ Cannot set '{key}': {_pv_err}\n"
+                f"  (Use --force to write it anyway.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except ImportError:
+            pass
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
