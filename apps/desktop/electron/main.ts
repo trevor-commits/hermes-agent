@@ -12129,8 +12129,11 @@ registerPetOverlayIpc({
 })
 
 // --- HUD mode (chrome-free floating chat) — see hud-ipc.ts. ---------------
-registerHudIpc({
+const hudIpc = registerHudIpc({
   isMac: IS_MAC,
+  isWindows: IS_WINDOWS,
+  glassSupported: GLASS_SUPPORTED,
+  getTranslucencyState: () => translucencyState,
   getHudWindow: () => hudWindow,
   openHudWindow,
   closeHudWindow,
@@ -13889,6 +13892,12 @@ ipcMain.on('hermes:translucency', (_event, payload) => {
   }
 
   scheduleTranslucencyWrite()
+
+  // The HUD's frost reads the same setting but answers on its own terms (see
+  // hudFrostFor) — and it is a transparent window, so it is deliberately not
+  // in the chat fan-out below. It self-diffs, so an unrelated change costs
+  // nothing native.
+  hudIpc.applyHudFrost()
 
   if (changed.backing || changed.material || changed.opacity) {
     for (const win of BrowserWindow.getAllWindows()) {
