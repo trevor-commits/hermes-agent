@@ -88,7 +88,10 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        budget = budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        # budget_for_context_window(None) (rather than DEFAULT_BUDGET) so the
+        # config-driven MCP threshold override still applies when the context
+        # length isn't resolvable.
+        budget = budget_for_context_window(int(ctx) if ctx else None)
     except Exception:
         budget = DEFAULT_BUDGET
 
