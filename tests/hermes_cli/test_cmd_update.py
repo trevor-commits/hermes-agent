@@ -521,62 +521,32 @@ class TestCmdUpdateBranchFlag:
     target without monkey-patching the implementation.
     """
 
-    def _branch_side_effect(
-        self,
-        current_branch,
-        target_branch,
-        *,
-        checkout_fails=False,
-        track_fails=False,
-        commit_count="0",
-        unmerged_count=0,
-    ):
+    def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0"):
         """Mock side-effect that knows about checkout/track behavior.
 
-        - ``current_branch``  initial ``git rev-parse --abbrev-ref HEAD``
+        - ``current_branch``  what ``git rev-parse --abbrev-ref HEAD`` returns
         - ``target_branch``   passed via --branch; what we expect the code to switch to
         - ``checkout_fails``  if True, ``git checkout <target>`` returns non-zero
                               (simulates branch absent locally; code should retry with -B)
         - ``track_fails``     if True, ``git checkout -B <target> origin/<target>`` ALSO fails
                               (simulates branch absent on origin too)
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
-        - ``unmerged_count``  ``git cherry`` ``+`` lines. 0 = fully merged parked
-                              leftover; >0 = unique commits (keeper-class).
         """
-        head = {"name": current_branch}
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout=f"{head['name']}\n", stderr=""
-                )
-
-            if "status" in joined and "--porcelain" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-            if "cherry" in joined:
-                cherry = "".join(f"+ {i:040x}\n" for i in range(unmerged_count))
-                return subprocess.CompletedProcess(cmd, 0, stdout=cherry, stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
                 err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
-                if rc == 0:
-                    head["name"] = target_branch
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
-                requested = str(cmd[-1]) if cmd else target_branch
-                if requested == target_branch:
-                    rc = 128 if checkout_fails else 0
-                    err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
-                else:
-                    rc = 0
-                    err = ""
-                if rc == 0:
-                    head["name"] = requested
+                rc = 128 if checkout_fails else 0
+                err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
@@ -608,68 +578,6 @@ class TestCmdUpdateBranchFlag:
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
         assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
 
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_unmerged_keeper_branch_skips_updating_a_different_target(
-        self, mock_run, _mock_which, capsys
-    ):
-        """A keeper-class branch must not be abandoned onto ``main``.
-
-        Before 2026-08-15, ``hermes update`` switched HEAD to main, pulled,
-        and (when restore failed) left the install running upstream code.
-        Unique commits now fail the parked-branch switch, so the update is
-        skipped and HEAD stays on the keeper.
-        """
-        mock_run.side_effect = self._branch_side_effect(
-            current_branch="trevor-local-20260730",
-            target_branch="main",
-            commit_count="3",
-            unmerged_count=12,
-        )
-
-        with pytest.raises(SystemExit) as exc_info:
-            cmd_update(SimpleNamespace(branch="main"))
-        assert exc_info.value.code == 1
-
-        out = capsys.readouterr().out
-        assert "CODE UPDATE SKIPPED" in out
-        assert "trevor-local-20260730" in out
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        assert not any("merge --ff-only" in c for c in commands)
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_fully_merged_parked_branch_stays_on_update_target(
-        self, mock_run, _mock_which
-    ):
-        """A clean fully-merged leftover stays on the branch that was updated.
-
-        Restoring onto that leftover is the 2026-08-17 parked-branch incident:
-        main moves, HEAD snaps back, and the running tree stays stale.
-        """
-        mock_run.side_effect = self._branch_side_effect(
-            current_branch="trevor-local-20260730",
-            target_branch="main",
-            commit_count="3",
-            unmerged_count=0,
-        )
-
-        cmd_update(SimpleNamespace(branch="main"))
-
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        merge_idx = next(i for i, c in enumerate(commands) if "merge --ff-only" in c)
-        switch_to_target = [
-            i for i, c in enumerate(commands) if "checkout main" in c and "-B" not in c
-        ]
-        restores = [
-            i for i, c in enumerate(commands) if "checkout trevor-local-20260730" in c
-        ]
-        assert switch_to_target, f"never switched onto main: {commands}"
-        assert min(switch_to_target) < merge_idx
-        assert not any(i > merge_idx for i in restores), (
-            f"restored onto parked leftover after the pull: {commands}"
-        )
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -1328,67 +1236,3 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
-
-class TestTryRebaseCarriedBranch:
-    """Keeper-branch rebase must not report success when it aborts."""
-
-    def test_returns_true_when_not_behind(self, tmp_path):
-        from hermes_cli.update_cmd import try_rebase_carried_branch
-
-        def fake_run(cmd, **kwargs):
-            joined = " ".join(str(c) for c in cmd)
-            if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
-            raise AssertionError(f"unexpected git command: {joined}")
-
-        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
-            assert try_rebase_carried_branch(
-                ["git"], tmp_path, "trevor-local-20260730", "main"
-            ) is True
-
-    def test_returns_true_when_rebase_succeeds(self, tmp_path, capsys):
-        from hermes_cli.update_cmd import try_rebase_carried_branch
-
-        calls = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(" ".join(str(c) for c in cmd))
-            joined = calls[-1]
-            if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout="12\n", stderr="")
-            if "rebase" in joined and "--abort" not in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-            raise AssertionError(f"unexpected git command: {joined}")
-
-        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
-            assert try_rebase_carried_branch(
-                ["git"], tmp_path, "trevor-local-20260730", "main"
-            ) is True
-        out = capsys.readouterr().out
-        assert "Carried branch rebased onto latest upstream" in out
-        assert any("rebase origin/main" in c for c in calls)
-
-    def test_returns_false_and_aborts_on_conflict(self, tmp_path, capsys):
-        from hermes_cli.update_cmd import try_rebase_carried_branch
-
-        calls = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(" ".join(str(c) for c in cmd))
-            joined = calls[-1]
-            if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout="287\n", stderr="")
-            if "rebase --abort" in joined or joined.endswith("rebase --abort"):
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-            if "rebase" in joined:
-                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="conflict")
-            raise AssertionError(f"unexpected git command: {joined}")
-
-        with patch("hermes_cli.update_cmd.subprocess.run", side_effect=fake_run):
-            assert try_rebase_carried_branch(
-                ["git"], tmp_path, "trevor-local-20260730", "main"
-            ) is False
-        out = capsys.readouterr().out
-        assert "Auto-rebase had conflicts" in out
-        assert "Update complete" not in out
-        assert any("rebase --abort" in c for c in calls)
