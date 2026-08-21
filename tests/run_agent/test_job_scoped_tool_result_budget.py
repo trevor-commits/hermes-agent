@@ -25,8 +25,9 @@ def test_job_scoped_budget_caps_large_tool_results_and_each_turn():
         env=None,
         config=budget,
     )
-    assert len(bounded) < 2_000
-    assert "tool response was 50,872 chars" in bounded
+    assert len(bounded) < budget.resolve_threshold("execute_code")
+    assert bounded.startswith("<persisted-output>")
+    assert "50,872 characters" in bounded
 
 
 def test_missing_job_scoped_budget_preserves_default_large_model_budget():

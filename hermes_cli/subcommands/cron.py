@@ -106,6 +106,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
     cron_create.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
+            "and agent.reasoning_overrides for this job; unsupported levels are "
+            "clamped by the provider at request time. Omit to follow config."
+        ),
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -270,6 +280,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--tool-result-total-max-chars",
         type=int,
         help="Set the per-run cumulative tool-output budget for this job.",
+    )
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Pass empty string to clear "
+            "the pin and follow config resolution."
+        ),
     )
 
     # lifecycle actions
