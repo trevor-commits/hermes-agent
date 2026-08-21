@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { orderProjectsByIds, sortProjectsForOverview } from './model'
+import { orderProjectsByIds, PROJECT_PREVIEW_COUNT, sortProjectsForOverview } from './model'
 import { NO_PROJECT_ID, type SidebarProjectTree } from './workspace-groups'
 
 function makeProject(id: string, sessionCount: number): SidebarProjectTree {
@@ -24,6 +24,12 @@ const home = (): SidebarProjectTree => ({
 })
 
 const ids = (projects: SidebarProjectTree[]) => projects.map(project => project.id)
+
+describe('project overview preview', () => {
+  it('shows the five latest chats without entering the project', () => {
+    expect(PROJECT_PREVIEW_COUNT).toBe(5)
+  })
+})
 
 describe('orderProjectsByIds', () => {
   it('leaves the deterministic sort alone when nothing has been dragged', () => {

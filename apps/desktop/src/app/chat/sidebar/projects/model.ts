@@ -14,7 +14,7 @@ import { sessionRecency, type SidebarProjectTree } from './workspace-groups'
 export const SIDEBAR_GROUP_PAGE = 5
 
 // Recent sessions previewed under each project in the overview.
-export const PROJECT_PREVIEW_COUNT = 3
+export const PROJECT_PREVIEW_COUNT = 5
 
 // Max concurrent `git worktree list` probes when a project spans many repos.
 const WORKTREE_PROBE_CONCURRENCY = 4
