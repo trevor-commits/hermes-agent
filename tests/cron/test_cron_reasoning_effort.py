@@ -39,12 +39,11 @@ def _create(**kw):
 
 
 class TestJobStoreReasoningEffort:
-    def test_absent_field_stores_none_and_shape_unchanged(self, tmp_cron_dir):
-        """No reasoning_effort arg => None in the record; the rest of the job
-        dict keeps exactly the keys pre-feature jobs had (plus the new field),
-        so existing consumers see no shape drift."""
+    def test_absent_field_is_omitted_and_shape_unchanged(self, tmp_cron_dir):
+        """No reasoning_effort arg keeps pre-feature record shape unchanged."""
         job = _create()
-        assert job.get("reasoning_effort") is None
+        assert "reasoning_effort" not in job
+        assert "reasoning_effort" not in load_jobs()[0]
         # The new field must not perturb sibling inference axes.
         assert job["model"] is None
         assert job["provider"] is None
