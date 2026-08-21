@@ -316,7 +316,7 @@ def test_x_prefetch_runs_each_status_once_and_normalizes_untrusted_json(
         assert argv[:2] == [str(fixture["x_lookup"].resolve()), "--json"]
         assert "/i/web/status/" not in argv[-1]
         assert argv[-1].startswith("https://x.com/i/status/")
-        assert kwargs["timeout"] == 10
+        assert kwargs["timeout"] == gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
 
@@ -502,9 +502,11 @@ async def test_real_x_prefetch_failure_starts_no_worker(
         monkeypatch.setattr(
             gateway_run.subprocess,
             "run",
-            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], 10)),
+            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
         )
-        expected_error = "timeout after 10 seconds"
+        expected_error = (
+            f"timeout after {gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
+        )
     load_skill = MagicMock(side_effect=AssertionError("skill was loaded"))
     monkeypatch.setattr(skill_commands, "_load_skill_payload", load_skill)
 
@@ -589,9 +591,11 @@ async def test_real_x_prefetch_failure_returns_exact_user_message_without_worker
         monkeypatch.setattr(
             gateway_run.subprocess,
             "run",
-            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], 10)),
+            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
         )
-        expected_error = "timeout after 10 seconds"
+        expected_error = (
+            f"timeout after {gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
+        )
 
     response = await runner._handle_message_with_agent(
         _event(text="https://x.com/i/status/2088573393121509655"),
@@ -2328,7 +2332,9 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     assert worker_result["tool_result_chars"] == 0
     assert worker_result["worker_api_call_budget"] == worker_result["api_calls"] + 1
     assert worker_result["worker_goal_byte_budget"] == 16_384
-    assert worker_result["worker_result_byte_budget"] == 16_384
+    assert worker_result["worker_result_byte_budget"] == (
+        gateway_run._SOURCE_CARD_WORKER_RESULT_MAX_BYTES
+    )
     assert worker_result["worker_system_byte_budget"] == 24_576
     assert (
         worker_result["worker_goal_byte_budget"]

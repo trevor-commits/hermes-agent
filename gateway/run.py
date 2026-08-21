@@ -130,7 +130,12 @@ _SOURCE_CARD_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _SOURCE_CARD_WORKER_MAX_ITERATIONS = 2
 _SOURCE_CARD_WORKER_SYSTEM_MAX_BYTES = 24_576
 _SOURCE_CARD_WORKER_GOAL_MAX_BYTES = 16_384
-_SOURCE_CARD_WORKER_RESULT_MAX_BYTES = 16_384
+_SOURCE_CARD_WORKER_RESULT_MAX_BYTES = 32_768
+# Network-bound prefetches (X post lookup, GitHub repo lookup) cross the real
+# internet; local template/duplicate helpers stay disk-speed at their own 10s
+# call sites. One shared constant keeps the timeouts and their error strings
+# honest (#flap-era: 10s was too tight when the upstream path hiccups).
+_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT = 25
 _SOURCE_CARD_WORKER_TOOLSETS: tuple[str, ...] = ()
 _SOURCE_CARD_WORKER_REFERENCES = (
     "references/research-method.md",
@@ -4587,13 +4592,15 @@ def _prefetch_source_card_x_posts(intake_text: str, x_lookup: Path) -> list[dict
         try:
             result = subprocess.run(
                 [str(x_lookup), "--json", url],
-                timeout=10,
+                timeout=_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT,
                 capture_output=True,
                 text=True,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise _SourceCardPrefetchError("timeout after 10 seconds") from exc
+            raise _SourceCardPrefetchError(
+                f"timeout after {_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
+            ) from exc
         except OSError as exc:
             raise _SourceCardPrefetchError(f"launch failed: {exc}") from exc
         if result.returncode != 0:
@@ -4804,14 +4811,15 @@ def _prefetch_source_card_github_repositories(
         try:
             result = subprocess.run(
                 [str(helper), owner_name, "--compact"],
-                timeout=10,
+                timeout=_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT,
                 capture_output=True,
                 text=True,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise _SourceCardPrefetchError(
-                f"GitHub prefetch timeout after 10 seconds: {owner_name}"
+                f"GitHub prefetch timeout after "
+                f"{_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds: {owner_name}"
             ) from exc
         except OSError as exc:
             raise _SourceCardPrefetchError(
