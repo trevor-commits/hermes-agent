@@ -105,6 +105,13 @@ export const transcriptPaneBudget = (mountedPanes: number, hidden: boolean): num
   hidden
     ? HIDDEN_TRANSCRIPT_RENDER_BUDGET
     : Math.max(Math.ceil(RENDER_BUDGET / Math.max(1, mountedPanes)), RENDER_BUDGET / 4)
+
+export const shouldClampTranscriptRenderBudget = (
+  renderBudget: number,
+  paneBudget: number,
+  hidden: boolean
+): boolean => hidden && renderBudget > paneBudget
+
 // Units the backfill adds per committed step (see the backfill effect). ~8-15
 // ordinary turns or 1-2 tool-heavy ones per frame — big enough to fill a page
 // in ~10 frames, small enough that no single commit approaches a frame budget.
@@ -433,7 +440,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     setBudgetSessionKey(sessionKey)
     setHadGroups(hasGroups)
     setRenderBudget(FIRST_PAINT_BUDGET)
-  } else if (renderBudget > paneBudget) {
+  } else if (shouldClampTranscriptRenderBudget(renderBudget, paneBudget, paneLifecycle === 'hot-hidden')) {
     // Apply the hidden budget during render so React never first commits the
     // stale full transcript after this pane moves to the background.
     setRenderBudget(paneBudget)

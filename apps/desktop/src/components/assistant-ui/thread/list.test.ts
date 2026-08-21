@@ -9,6 +9,7 @@ import {
   liveTailStart,
   type MessageGroup,
   resolveThreadScrollTarget,
+  shouldClampTranscriptRenderBudget,
   subscribeToThreadForeground,
   transcriptPaneBudget
 } from './list'
@@ -95,6 +96,20 @@ describe('transcriptPaneBudget', () => {
     expect(transcriptPaneBudget(1, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(4, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(1, false)).toBeGreaterThan(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
+  })
+})
+
+describe('shouldClampTranscriptRenderBudget', () => {
+  it('preserves an explicitly expanded history page while the pane is visible', () => {
+    expect(shouldClampTranscriptRenderBudget(1200, 600, false)).toBe(false)
+  })
+
+  it('reclaims expanded history when the pane becomes hidden', () => {
+    expect(shouldClampTranscriptRenderBudget(1200, 40, true)).toBe(true)
+  })
+
+  it('does not re-clamp a hidden pane already at its budget', () => {
+    expect(shouldClampTranscriptRenderBudget(40, 40, true)).toBe(false)
   })
 })
 
