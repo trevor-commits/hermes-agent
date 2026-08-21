@@ -18,6 +18,43 @@ import type { ChatMessage, ChatMessagePart } from './types'
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
 const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
+// Keep in sync with tools/todo_tool.py::TODO_INJECTION_HEADER. The compressor
+// persists this continuity payload as role=user for provider alternation, but
+// it is not a prompt the human typed. Older rows have no display_kind, so the
+// exact opening marker is also the migration signal. Starts-with is deliberate:
+// a real prompt may quote the marker later in its body while asking about it.
+const CONTEXT_HANDOFF_HEADER = '[Your active task list was preserved across context compression]'
+const CONTEXT_HANDOFF_TASK_RE = /^- \[(?:>| )\]\s+/gm
+
+function contextHandoffForMessage(
+  message: SessionMessage,
+  rawContent: string
+): ChatMessage['contextHandoff'] | undefined {
+  if (
+    message.role !== 'user' ||
+    (message.display_kind !== 'context_handoff' && !rawContent.startsWith(CONTEXT_HANDOFF_HEADER))
+  ) {
+    return undefined
+  }
+
+  const taskCount = Array.from(rawContent.matchAll(CONTEXT_HANDOFF_TASK_RE)).length
+
+  // Untyped legacy inference requires the complete todo shape, not merely the
+  // header, so a human pasting the marker by itself still renders as their text.
+  if (message.display_kind !== 'context_handoff' && taskCount === 0) {
+    return undefined
+  }
+
+  return { detail: rawContent, taskCount }
+}
+
+function contextHandoffLabel(taskCount: number): string {
+  if (taskCount === 0) {
+    return 'Context handoff'
+  }
+
+  return `Context handoff — ${taskCount} task${taskCount === 1 ? '' : 's'} preserved`
+}
 
 function displayContentForMessage(role: SessionMessage['role'], content: unknown): string {
   const textContent = textFromUnknown(content)
@@ -191,16 +228,26 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     const content = message.content || message.text || message.context || message.name
 
+    // Classify before display normalization: displayContentForMessage trims
+    // ordinary user text, and trimming first could turn a real prompt with a
+    // leading newline into an apparent exact-prefix synthetic row.
+    const rawContent = textFromUnknown(content)
+    const normalizedDisplayContent = displayContentForMessage(message.role, content)
+    const contextHandoff = contextHandoffForMessage(message, rawContent)
+
     const rawDisplayContent = transcriptContent(
       message.display_kind,
-      timelineDisplayContent(message, displayContentForMessage(message.role, content))
+      contextHandoff
+        ? contextHandoffLabel(contextHandoff.taskCount)
+        : timelineDisplayContent(message, normalizedDisplayContent)
     )
 
     const displayRole =
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
-      message.display_kind === 'personality_switch'
+      message.display_kind === 'personality_switch' ||
+      Boolean(contextHandoff)
         ? 'system'
         : message.role
 
@@ -303,7 +350,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
-      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
+      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {}),
+      ...(contextHandoff ? { contextHandoff } : {})
     })
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null

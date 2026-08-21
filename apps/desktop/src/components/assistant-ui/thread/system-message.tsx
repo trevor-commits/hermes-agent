@@ -13,11 +13,56 @@ const SLASH_STATUS_RE = /^slash:(?<command>\/[^\n]+)\n(?<output>[\s\S]*)$/
 const STEER_NOTE_RE = /^steer:(?<text>[\s\S]+)$/
 const REVIEW_NOTE_RE = /^review:(?<label>[^:\n]+):?\s*(?<detail>[\s\S]*)$/
 
+function contextHandoffMetadata(value: unknown): null | { detail: string; taskCount: number } {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const detail = (value as { detail?: unknown }).detail
+  const taskCount = (value as { taskCount?: unknown }).taskCount
+
+  return typeof detail === 'string' && typeof taskCount === 'number' ? { detail, taskCount } : null
+}
+
 export const SystemMessage: FC = () => {
   const text = useAuiState(s => messageContentText(s.message.content))
 
+  const contextHandoffValue = useAuiState(s => {
+    const custom = (s.message.metadata?.custom ?? {}) as Record<string, unknown>
+
+    return custom.contextHandoff
+  })
+
+  // Select the stored metadata object by identity above. Returning a freshly
+  // parsed object from useAuiState's selector makes useSyncExternalStore see a
+  // different snapshot on every read and re-render forever.
+  const contextHandoff = contextHandoffMetadata(contextHandoffValue)
+
   if (!text) {
     return null
+  }
+
+  if (contextHandoff) {
+    return (
+      <MessagePrimitive.Root
+        className="flex w-[60%] max-w-[44rem] items-start justify-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55"
+        data-role="system"
+        data-slot="aui_system-message-root"
+      >
+        <details className="min-w-0" data-slot="context-handoff">
+          <summary className="cursor-pointer select-none text-center text-muted-foreground/55 hover:text-muted-foreground/80">
+            {text}
+          </summary>
+          <pre
+            className="mt-1 max-h-64 max-w-[44rem] overflow-auto whitespace-pre-wrap rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left font-mono text-[0.625rem] leading-4 text-muted-foreground/70"
+            data-selectable-text="true"
+          >
+            {contextHandoff.detail}
+          </pre>
+        </details>
+        <MessageTimelineTimestamp className="shrink-0" />
+      </MessagePrimitive.Root>
+    )
   }
 
   // The self-improvement review saved something to memory/skills — the same

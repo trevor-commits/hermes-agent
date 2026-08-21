@@ -250,4 +250,23 @@ describe('toRuntimeMessage timeline metadata', () => {
 
     expect((runtime.metadata?.custom as { timelineTimestamp?: number }).timelineTimestamp).toBeUndefined()
   })
+
+  it('carries context-handoff detail to the system renderer', () => {
+    const runtime = toRuntimeMessage({
+      contextHandoff: {
+        detail: '[Your active task list was preserved across context compression]\n- [ ] audit. Audit it (pending)',
+        taskCount: 1
+      },
+      id: 'context-handoff',
+      parts: [{ text: 'Context handoff — 1 task preserved', type: 'text' }],
+      role: 'system'
+    })
+
+    expect(runtime.metadata?.custom).toMatchObject({
+      contextHandoff: {
+        detail: '[Your active task list was preserved across context compression]\n- [ ] audit. Audit it (pending)',
+        taskCount: 1
+      }
+    })
+  })
 })

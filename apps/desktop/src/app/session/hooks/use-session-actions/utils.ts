@@ -150,6 +150,7 @@ const COMPARED_FIELDS = [
   'branchGroupId',
   'interim',
   'reactions',
+  'contextHandoff',
   'timestamp',
   'completedAt',
   // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
@@ -248,6 +249,13 @@ export function chatReactionsEquivalent(a: ChatMessage['reactions'], b: ChatMess
   )
 }
 
+function chatContextHandoffsEquivalent(
+  a: ChatMessage['contextHandoff'],
+  b: ChatMessage['contextHandoff']
+): boolean {
+  return a === b || (a?.detail === b?.detail && a?.taskCount === b?.taskCount)
+}
+
 export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
   if (
     a.id !== b.id ||
@@ -261,7 +269,8 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     // Interim gates the action footer, so flipping it must repaint (e.g. a
     // previewed final settling onto a sealed interim bubble restores the bar).
     (a.interim ?? false) !== (b.interim ?? false) ||
-    !chatReactionsEquivalent(a.reactions, b.reactions)
+    !chatReactionsEquivalent(a.reactions, b.reactions) ||
+    !chatContextHandoffsEquivalent(a.contextHandoff, b.contextHandoff)
   ) {
     return false
   }

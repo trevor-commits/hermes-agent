@@ -19,6 +19,41 @@ import {
 } from './chat-messages'
 
 describe('toChatMessages', () => {
+  const contextHandoff = [
+    '[Your active task list was preserved across context compression]',
+    '- [>] locate. Locate the interrupted chat (in_progress)',
+    '- [ ] audit. Audit what it left incomplete (pending)',
+    '- [ ] verify. Verify the live stop mechanism (pending)',
+    '- [ ] repair. Repair the root cause (pending)',
+    '',
+    '[Skills pruned during compression — reload before acting on these tasks]',
+    "Reload first: skill_view(name='ops-runbooks')."
+  ].join('\n')
+
+  it('projects a preserved-task compression handoff as one compact system event', () => {
+    const [message] = toChatMessages([{ role: 'user', content: contextHandoff, timestamp: 1 }])
+
+    expect(message.role).toBe('system')
+    expect(chatMessageText(message)).toBe('Context handoff — 4 tasks preserved')
+    expect(message.contextHandoff).toEqual({ detail: contextHandoff, taskCount: 4 })
+  })
+
+  it('does not mistake a human prompt quoting the handoff marker for a synthetic row', () => {
+    const quoted = `Why does this appear?\n${contextHandoff}`
+    const [message] = toChatMessages([{ role: 'user', content: quoted, timestamp: 1 }])
+
+    expect(message.role).toBe('user')
+    expect(chatMessageText(message)).toBe(quoted)
+  })
+
+  it('does not trim into a false handoff when a human prompt starts with a newline', () => {
+    const quoted = `\n${contextHandoff}`
+    const [message] = toChatMessages([{ role: 'user', content: quoted, timestamp: 1 }])
+
+    expect(message.role).toBe('user')
+    expect(message.contextHandoff).toBeUndefined()
+  })
+
   it('rebuilds the full command from a gateway tool row carrying args', () => {
     // Gateway watch-window hydration projects tool rows as
     // {role:'tool', name, context, args?}. `context` is an 80-char preview;

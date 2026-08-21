@@ -37,6 +37,14 @@ export type ChatMessage = {
   rowId?: number
   /** Emoji reactions on this message — one per author (see MessageReaction). */
   reactions?: MessageReaction[]
+  /** Internal post-compression task/skill handoff. This is model-facing
+   * continuity metadata, not a prompt the human typed. The desktop renders the
+   * short text part as a collapsed system event and keeps this full detail one
+   * disclosure click away. */
+  contextHandoff?: {
+    detail: string
+    taskCount: number
+  }
 }
 
 export type GatewayEventPayload = {
