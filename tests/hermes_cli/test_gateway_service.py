@@ -730,6 +730,13 @@ class TestLaunchdServiceRecovery:
             "get_system_launchd_gateway_plist_path",
             lambda: system_plist,
         )
+        # Stage 2: launchd_restart identity-gates the daemon; this test owns
+        # the restart handoff path, so declare the daemon "ours" here.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_daemon_identity_matches",
+            lambda plist_path=None: True,
+        )
         monkeypatch.setattr(
             gateway_cli,
             "_probe_system_launchd_gateway",
@@ -741,6 +748,14 @@ class TestLaunchdServiceRecovery:
             gateway_cli,
             "_graceful_restart_via_sigusr1",
             lambda pid, timeout: pid == 86231 and timeout > 0,
+        )
+        # Stage 2: the restart path now verifies a fresh daemon PID before
+        # declaring success; this test owns the handoff, so KeepAlive
+        # "respawns" instantly here.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_system_daemon_pid",
+            lambda old_pid, timeout=30.0: True,
         )
         monkeypatch.setattr(
             gateway_cli.subprocess,

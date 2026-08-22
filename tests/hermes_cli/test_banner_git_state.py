@@ -26,7 +26,12 @@ def test_get_git_banner_state_reads_origin_and_head(tmp_path):
     results = {
         ("git", "rev-parse", "--short=8", "origin/main"): MagicMock(returncode=0, stdout="b2f477a3\n"),
         ("git", "rev-parse", "--short=8", "HEAD"): MagicMock(returncode=0, stdout="af8aad31\n"),
-        ("git", "rev-list", "--count", "origin/main..HEAD"): MagicMock(returncode=0, stdout="3\n"),
+        # D2 metric: patch-unique non-merge commits (cherry-pick form).
+        (
+            "git", "rev-list", "--count",
+            "--no-merges", "--cherry-pick", "--right-only",
+            "origin/main...HEAD",
+        ): MagicMock(returncode=0, stdout="3\n"),
     }
 
     def fake_run(cmd, **kwargs):

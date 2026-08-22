@@ -1436,8 +1436,18 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
 
 
 def _probe_system_launchd_gateway() -> tuple[bool, int | None, str]:
-    """Return ``(loaded, pid, output)`` for the system-domain gateway."""
+    """Return ``(loaded, pid, output)`` for the system-domain gateway.
+
+    Stage 2 hardening: identity-gated. A plist merely *named*
+    ``ai.hermes.gateway.daemon.plist`` is not enough —
+    ``_system_daemon_identity_matches`` must confirm it points at THIS
+    checkout/venv/HERMES_HOME before we report (or later restart) its PID.
+    A foreign or unidentifiable daemon returns not-loaded rather than being
+    adopted as ours.
+    """
     if not get_system_launchd_gateway_plist_path().exists():
+        return False, None, ""
+    if not _system_daemon_identity_matches():
         return False, None, ""
     target = f"system/{get_system_launchd_gateway_label()}"
     try:
@@ -3141,6 +3151,75 @@ def get_system_launchd_gateway_plist_path() -> Path:
 
 def get_system_launchd_gateway_label() -> str:
     return "ai.hermes.gateway.daemon"
+
+
+def _system_daemon_identity_matches(plist_path: Path | None = None) -> bool:
+    """True when the system LaunchDaemon plist belongs to THIS install.
+
+    Keeper carry hardening (keeper-sync-rebuild Stage 2, 2026-08-21): the old
+    probe trusted any plist named ``ai.hermes.gateway.daemon.plist`` and
+    treated its PID as ours — a side-by-side install (or a stale leftover)
+    would be adopted as "our" gateway for status, protect-sets, and restarts.
+    Identity is checked against the fields that actually define ownership:
+
+      - ``Label`` equals ``get_system_launchd_gateway_label()``,
+      - the ProgramArguments script lives under this checkout
+        (``PROJECT_ROOT``),
+      - ``VIRTUAL_ENV``/PATH reference THIS checkout's venv,
+      - ``HERMES_HOME`` equals this process's resolved Hermes home.
+
+    Read failures are treated as NOT-matching (fail closed): lifecycle
+    actions on an unverified daemon are worse than skipping them.
+    """
+    path = plist_path or get_system_launchd_gateway_plist_path()
+    try:
+        if not path.exists():
+            return False
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    # Minimal plist field extraction without plib: labels/values appear as
+    # <key>Name</key> followed by the value element. Sufficient for the four
+    # string fields we own; anything malformed fails closed.
+    import re as _re
+
+    def _string_after(key: str) -> str | None:
+        m = _re.search(
+            r"<key>\s*%s\s*</key>\s*<string>(.*?)</string>" % _re.escape(key),
+            raw,
+            _re.DOTALL,
+        )
+        return m.group(1).strip() if m else None
+
+    def _first_string_in_array(key: str) -> str | None:
+        m = _re.search(
+            r"<key>\s*%s\s*</key>\s*<array>(.*?)</array>" % _re.escape(key),
+            raw,
+            _re.DOTALL,
+        )
+        if not m:
+            return None
+        first = _re.search(r"<string>(.*?)</string>", m.group(1), _re.DOTALL)
+        return first.group(1).strip() if first else None
+
+    label = _string_after("Label")
+    if label != get_system_launchd_gateway_label():
+        return False
+
+    program = _first_string_in_array("ProgramArguments") or ""
+    venv = _string_after("VIRTUAL_ENV") or ""
+    home = _string_after("HERMES_HOME") or ""
+
+    root = str(PROJECT_ROOT)
+    if not (program.startswith(root) or venv.startswith(root)):
+        return False
+    try:
+        if home != str(get_hermes_home().resolve()):
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def _launchd_gateway_service_installed() -> bool:
@@ -5383,6 +5462,31 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _wait_for_system_daemon_pid(
+    old_pid: int | None, timeout: float = 30.0
+) -> bool:
+    """Poll ``system/<daemon label>`` until it runs on a fresh PID.
+
+    Keeper Stage 2 (PR #88949 parity for the system-domain daemon): a
+    successful drain handoff only proves the OLD process agreed to exit;
+    launchd's KeepAlive respawn is asynchronous. Callers must verify launchd
+    actually supervises a fresh gateway before declaring victory, or an
+    update reports success while nothing is serving (the exact gap #88949
+    fixes for per-user agents). Polls every 0.5s up to ``timeout`` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _loaded, pid, _out = _probe_system_launchd_gateway()
+        except subprocess.TimeoutExpired:
+            return False
+        if _loaded and pid is not None and pid > 0 and pid != old_pid:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def _restart_system_launchd_gateway() -> None:
     """Drain the gateway and let system-domain KeepAlive relaunch it."""
     loaded, daemon_pid, _output = _probe_system_launchd_gateway()
@@ -5391,10 +5495,27 @@ def _restart_system_launchd_gateway() -> None:
         raise SystemExit(1)
     if daemon_pid is None:
         print("⏳ System gateway daemon is loaded; KeepAlive restart is already pending")
+        # Still verify launchd brings one up before returning (#88949 parity).
+        if not _wait_for_system_daemon_pid(old_pid=None, timeout=30.0):
+            print(
+                "✗ KeepAlive did not produce a running gateway within 30s.\n"
+                "    Check logs: tail -40 ~/Library/Logs/hermes/ai.hermes.gateway.daemon.error.log"
+            )
+            raise SystemExit(1)
+        print("✓ System gateway daemon came back up under launchd supervision")
         return
 
     if _request_gateway_self_restart(daemon_pid):
         print("✓ System daemon gateway restart requested")
+        # Self-restart is asynchronous: verify launchd actually supervises a
+        # fresh gateway before declaring victory (#88949 parity, Stage 2).
+        if not _wait_for_system_daemon_pid(old_pid=daemon_pid, timeout=30.0):
+            print(
+                "⚠ Restart was accepted but no fresh gateway PID appeared "
+                "within 30s — check the daemon logs."
+            )
+            raise SystemExit(1)
+        print("✓ Verified: system daemon is serving on a fresh PID")
         return
 
     # Wait budget must cover the SIGUSR1 handler's full graceful sequence:
@@ -5410,7 +5531,16 @@ def _restart_system_launchd_gateway() -> None:
     if not _graceful_restart_via_sigusr1(daemon_pid, wait_budget):
         print("✗ Gateway did not complete its drain-aware restart handoff.")
         raise SystemExit(1)
-    print("✓ Restart handed to the system daemon; launchd KeepAlive will relaunch it")
+    # Drain handoff accepted != gateway serving. Verify launchd supervises a
+    # fresh PID before reporting success (#88949 parity, Stage 2) — otherwise
+    # `hermes update` exits 0 while nothing is listening.
+    if not _wait_for_system_daemon_pid(old_pid=daemon_pid, timeout=30.0):
+        print(
+            "✗ KeepAlive did not relaunch the gateway within 30s after drain.\n"
+            "    Check logs: tail -40 ~/Library/Logs/hermes/ai.hermes.gateway.daemon.error.log"
+        )
+        raise SystemExit(1)
+    print("✓ Verified: system daemon relaunched on a fresh PID")
 
 def _launchd_kickstart(label: str, domain: str) -> None:
     """Hard-restart ``domain/label`` via ``launchctl kickstart -k``.
@@ -5451,8 +5581,18 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     if get_system_launchd_gateway_plist_path().exists():
-        _restart_system_launchd_gateway()
-        return
+        if not _system_daemon_identity_matches():
+            # A daemon plist exists but does not belong to this install
+            # (side-by-side checkout, stale leftover). Never drain/kickstart
+            # someone else's service — fall through to the per-user path,
+            # which is scoped to THIS profile's plist.
+            print(
+                "⚠ System gateway daemon plist exists but is not ours "
+                "(checkout/venv/HERMES_HOME mismatch) — leaving it alone"
+            )
+        else:
+            _restart_system_launchd_gateway()
+            return
 
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"

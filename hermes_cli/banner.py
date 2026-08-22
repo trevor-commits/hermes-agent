@@ -559,10 +559,31 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             pass
         return None
 
-    ahead = 0
+    ahead = _carried_commit_count(repo_dir)
+
+    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+
+
+def _carried_commit_count(repo_dir: Path) -> int:
+    """Count carried commits with the standardized divergence metric.
+
+    keeper-sync-rebuild D2 (2026-08-21): three surfaces previously reported
+    three different numbers (rev-list --count includes merge commits —
+    111; ``git cherry`` counts patch-unique non-merge commits — 98; the old
+    banner used rev-list). The metric everywhere is now **patch-unique
+    non-merge commits** (``git cherry``-equivalent), so the banner, status,
+    and diet docs can never disagree about how divergent keeper is.
+
+    Falls back to the plain rev-list count when ``--cherry-pick`` is
+    unavailable (very old git) — still better than reporting nothing.
+    """
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            [
+                "git", "rev-list", "--count",
+                "--no-merges", "--cherry-pick", "--right-only",
+                "origin/main...HEAD",
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -571,11 +592,24 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             cwd=str(repo_dir),
         )
         if result.returncode == 0:
-            ahead = int((result.stdout or "0").strip() or "0")
+            return int((result.stdout or "0").strip() or "0")
     except Exception:
-        ahead = 0
-
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+        pass
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "--no-merges", "origin/main..HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        if result.returncode == 0:
+            return int((result.stdout or "0").strip() or "0")
+    except Exception:
+        pass
+    return 0
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
