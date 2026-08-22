@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -199,6 +200,14 @@ class TestGetServicePidsScoping:
     def _wire(self, monkeypatch):
         monkeypatch.setattr(gw, "is_macos", lambda: True)
         monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
+        # Hermetic: this Mac HAS the system-domain daemon plist, so the
+        # keeper-carried probe would leak its real PID into exact-set
+        # assertions. Pretend it's absent (upstream's assumption).
+        monkeypatch.setattr(
+            gw,
+            "get_system_launchd_gateway_plist_path",
+            lambda: Path("/nonexistent/ai.hermes.gateway.daemon.plist"),
+        )
         monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(
             gw,
@@ -227,6 +236,26 @@ class TestGetServicePidsScoping:
         service PIDs — the reaper SIGTERM/SIGKILLs what they feed it."""
         self._wire(monkeypatch)
         assert gw._get_service_pids() == {100}
+
+    def test_system_daemon_pid_included_when_plist_present(self, monkeypatch):
+        """Keeper carry: the system-domain LaunchDaemon gateway
+        (/Library/LaunchDaemons/ai.hermes.gateway.daemon.plist) is probed
+        and its PID joins the protect set in BOTH scopes — it is never a
+        stale manual process, and status must show it."""
+        self._wire(monkeypatch)
+        monkeypatch.setattr(
+            gw,
+            "get_system_launchd_gateway_plist_path",
+            lambda: Path("/Library/LaunchDaemons/ai.hermes.gateway.daemon.plist"),
+        )
+        monkeypatch.setattr(
+            gw,
+            "_probe_system_launchd_gateway",
+            lambda: (True, 36573, "pid = 36573"),
+        )
+
+        assert 36573 in gw._get_service_pids()
+        assert 36573 in gw._get_service_pids(all_profiles=True)
 
     def test_find_gateway_pids_passes_profile_scope_through(self, monkeypatch):
         calls: list[bool] = []

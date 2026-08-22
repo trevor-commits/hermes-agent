@@ -7,11 +7,23 @@ See: NousResearch/hermes-agent#7622
 """
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import hermes_cli.gateway as gateway_mod
+
+
+def _no_system_daemon():
+    """Hermetic seam: pretend this Mac has no system-domain gateway daemon.
+
+    The keeper carry adds a system-daemon probe to ``_get_service_pids``
+    that fires whenever /Library/LaunchDaemons/ai.hermes.gateway.daemon.plist
+    exists — true on Trevor's box, absent upstream. Without this stub the
+    probe leaks the real daemon PID into exact-set assertions below.
+    """
+    return Path("/nonexistent/ai.hermes.gateway.daemon.plist")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +205,10 @@ class TestGetServicePidsAllProfiles:
             patch("hermes_cli.gateway.is_macos", return_value=True),
             patch("hermes_cli.gateway.supports_systemd_services", return_value=False),
             patch(
+                "hermes_cli.gateway.get_system_launchd_gateway_plist_path",
+                _no_system_daemon,
+            ),
+            patch(
                 "hermes_cli.gateway.get_launchd_label",
                 return_value="ai.hermes.gateway.myprofile",
             ),
@@ -234,6 +250,10 @@ class TestGetServicePidsAllProfiles:
         with (
             patch("hermes_cli.gateway.is_macos", return_value=True),
             patch("hermes_cli.gateway.supports_systemd_services", return_value=False),
+            patch(
+                "hermes_cli.gateway.get_system_launchd_gateway_plist_path",
+                _no_system_daemon,
+            ),
             patch(
                 "hermes_cli.gateway.get_launchd_label",
                 return_value="ai.hermes.gateway",
