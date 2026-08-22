@@ -79,11 +79,19 @@ class UpdatePlan:
 
 
 def _detect_supervisor_for_pid(pid: int, service_pids: set) -> str:
-    """Classify how a live gateway PID is supervised."""
+    """Classify a PID without mutating services."""
+    try:
+        from hermes_cli.gateway import is_macos
+        from hermes_cli.gateway import _probe_system_launchd_gateway_for_install
+        if is_macos():
+            loaded, system_pid, _ = _probe_system_launchd_gateway_for_install()
+            if loaded and system_pid == pid:
+                return "launchd-system"
+    except Exception:
+        pass
     if pid in service_pids:
         try:
             from hermes_cli.gateway import is_macos, supports_systemd_services
-
             if supports_systemd_services():
                 return "systemd"
             if is_macos():
@@ -97,6 +105,8 @@ def _detect_supervisor_for_pid(pid: int, service_pids: set) -> str:
 def _restart_mechanism(supervisor: str, profile: str) -> str:
     if supervisor == "systemd":
         return "systemctl restart (drain-first SIGUSR1 when supported)"
+    if supervisor == "launchd-system":
+        return "system LaunchDaemon drain + fresh-PID verification"
     if supervisor == "launchd":
         return "launchctl kickstart -k (drain-first, per-label domain)"
     if supervisor == "desktop":
