@@ -1517,14 +1517,29 @@ def test_landing_error_redacts_validator_temporary_paths():
     assert "[temporary card validation]" in safe
 
 
-def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
+def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
+    tmp_path,
+    monkeypatch,
+):
+    import gateway.run as gateway_run
     from gateway.run import (
+        _SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT,
         _prefetch_source_card_github_repositories,
         _source_card_github_prefetch_bound_note,
         _source_card_github_repositories,
     )
 
     fixture = _write_offline_route_fixture(tmp_path)
+    helper = fixture["repo"] / "scripts" / "source-card-prefetch"
+    real_run = gateway_run.subprocess.run
+    observed_timeouts = []
+
+    def record_network_timeout(*args, **kwargs):
+        if args and args[0] and Path(args[0][0]) == helper:
+            observed_timeouts.append(kwargs.get("timeout"))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(gateway_run.subprocess, "run", record_network_timeout)
     posts = [
         {
             "links": [
@@ -1544,6 +1559,7 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(tmp_path):
     assert prefetched[0]["fields"]["head"] == (
         "8d63d300597488e6fa4c30ccd6a3eb0fed2d4304"
     )
+    assert observed_timeouts == [_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT]
     empty, empty_omitted = _prefetch_source_card_github_repositories(
         [{"links": ["https://github.com/settings/profile"]}],
         fixture["repo"] / "scripts" / "source-card-prefetch",
@@ -2662,6 +2678,30 @@ def test_typed_analysis_overrides_routing_prose_in_the_card_body(tmp_path):
     _path, content = _parse_source_card_worker_draft(response, cards_root)
     assert "- downstream learning targets: hermes, codex-cli\n" in content + "\n"
     assert "probably worth a look someday" not in content
+
+
+def test_worker_json_above_the_old_16kb_limit_is_accepted(tmp_path):
+    from gateway.run import (
+        _SOURCE_CARD_WORKER_RESULT_MAX_BYTES,
+        _parse_source_card_worker_draft,
+    )
+
+    cards_root = tmp_path / "researched-repos"
+    cards_root.mkdir()
+    body = _REPLAY_CARD + "\n" + ("x" * 12_000)
+    response = json.dumps(
+        {
+            "card_path": str(cards_root / "wide-result-card.md"),
+            "card_content": body,
+        }
+    )
+    result_bytes = len(response.encode("utf-8"))
+    assert 16_384 < result_bytes <= _SOURCE_CARD_WORKER_RESULT_MAX_BYTES
+
+    _path, content = _parse_source_card_worker_draft(response, cards_root)
+
+    assert _path.name == "wide-result-card.md"
+    assert content.endswith("x" * 12_000)
 
 
 def test_typed_analysis_is_optional_and_absent_payloads_still_parse(tmp_path):
