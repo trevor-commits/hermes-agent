@@ -1466,6 +1466,25 @@ def _probe_system_launchd_gateway() -> tuple[bool, int | None, str]:
         return False, None, output
     return True, _parse_launchd_pid_from_list_output(output), output
 
+
+def _probe_system_launchd_gateway_for_install() -> tuple[bool, int | None, str]:
+    """Probe a system daemon that belongs to this checkout (any profile home)."""
+    if not _system_daemon_install_matches():
+        return False, None, ""
+    target = f"system/{get_system_launchd_gateway_label()}"
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", target], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, None, ""
+    output = result.stdout or ""
+    if result.returncode != 0:
+        return False, None, output
+    return True, _parse_launchd_pid_from_list_output(output), output
+
+
 def _parse_launchd_pid_from_print_output(output: str) -> int | None:
     """Extract the live PID from ``launchctl print`` output (``pid = <N>``).
 
@@ -1632,15 +1651,22 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
 
     if is_macos():
         system_plist = get_system_launchd_gateway_plist_path()
-        if system_plist.exists():
+        if system_plist.exists() and _system_daemon_blocks_current_profile():
             loaded, daemon_pid, _output = _probe_system_launchd_gateway()
+            identity = _system_daemon_identity_details()
             return GatewayRuntimeSnapshot(
-                manager="launchd (system daemon)",
+                manager=(
+                    "launchd (system daemon)"
+                    if identity["matches"]
+                    else "launchd (system daemon, install mismatch)"
+                ),
                 service_installed=True,
                 service_running=loaded and daemon_pid is not None,
                 gateway_pids=gateway_pids,
                 service_scope="system",
             )
+        # A same-label daemon for another HERMES_HOME is not this profile's
+        # owner. Continue to the per-user LaunchAgent snapshot below.
         return GatewayRuntimeSnapshot(
             manager="launchd",
             service_installed=get_launchd_plist_path().exists(),
@@ -3153,78 +3179,115 @@ def get_system_launchd_gateway_label() -> str:
     return "ai.hermes.gateway.daemon"
 
 
-def _system_daemon_identity_matches(plist_path: Path | None = None) -> bool:
-    """True when the system LaunchDaemon plist belongs to THIS install.
+def _system_daemon_identity_details(plist_path: Path | None = None) -> dict:
+    """Return the system daemon's ownership facts relative to this process.
 
-    Keeper carry hardening (keeper-sync-rebuild Stage 2, 2026-08-21): the old
-    probe trusted any plist named ``ai.hermes.gateway.daemon.plist`` and
-    treated its PID as ours — a side-by-side install (or a stale leftover)
-    would be adopted as "our" gateway for status, protect-sets, and restarts.
-    Identity is checked against the fields that actually define ownership:
+    A name alone is not ownership.  Parse the plist using the standard
+    library, then compare its label, declared Hermes home, and either its
+    declared virtualenv or a program argument against this install.  Failed
+    parsing is intentionally a non-match: lifecycle code must never adopt an
+    unverified daemon.
 
-      - ``Label`` equals ``get_system_launchd_gateway_label()``,
-      - the ProgramArguments script lives under this checkout
-        (``PROJECT_ROOT``),
-      - ``VIRTUAL_ENV``/PATH reference THIS checkout's venv,
-      - ``HERMES_HOME`` equals this process's resolved Hermes home.
-
-    Read failures are treated as NOT-matching (fail closed): lifecycle
-    actions on an unverified daemon are worse than skipping them.
+    ``home_matches`` is separate from full ``matches``.  A daemon for another
+    home is merely a separate profile/install and a scoped user service may be
+    valid.  A daemon using *this* home but a different checkout/venv is an
+    ambiguous partial-update condition and must fail closed.
     """
+    import plistlib
+    from xml.parsers.expat import ExpatError
+
     path = plist_path or get_system_launchd_gateway_plist_path()
+    details = {
+        "present": False,
+        "parsed": False,
+        "label_matches": False,
+        "home_matches": False,
+        "install_matches": False,
+        "matches": False,
+        "daemon_home": "",
+        "reason": "missing",
+    }
     try:
         if not path.exists():
-            return False
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
+            return details
+        details["present"] = True
+        with path.open("rb") as f:
+            payload = plistlib.load(f)
+    except (OSError, ValueError, ExpatError, plistlib.InvalidFileException):
+        details["reason"] = "unreadable"
+        return details
 
-    # Minimal plist field extraction without plib: labels/values appear as
-    # <key>Name</key> followed by the value element. Sufficient for the four
-    # string fields we own; anything malformed fails closed.
-    import re as _re
+    if not isinstance(payload, dict):
+        details["reason"] = "malformed"
+        return details
+    details["parsed"] = True
+    label = str(payload.get("Label") or "")
+    argv = payload.get("ProgramArguments") or []
+    env = payload.get("EnvironmentVariables") or {}
+    if not isinstance(argv, list):
+        argv = []
+    if not isinstance(env, dict):
+        env = {}
 
-    def _string_after(key: str) -> str | None:
-        m = _re.search(
-            r"<key>\s*%s\s*</key>\s*<string>(.*?)</string>" % _re.escape(key),
-            raw,
-            _re.DOTALL,
-        )
-        return m.group(1).strip() if m else None
-
-    def _first_string_in_array(key: str) -> str | None:
-        m = _re.search(
-            r"<key>\s*%s\s*</key>\s*<array>(.*?)</array>" % _re.escape(key),
-            raw,
-            _re.DOTALL,
-        )
-        if not m:
-            return None
-        first = _re.search(r"<string>(.*?)</string>", m.group(1), _re.DOTALL)
-        return first.group(1).strip() if first else None
-
-    label = _string_after("Label")
-    if label != get_system_launchd_gateway_label():
-        return False
-
-    program = _first_string_in_array("ProgramArguments") or ""
-    venv = _string_after("VIRTUAL_ENV") or ""
-    home = _string_after("HERMES_HOME") or ""
-
-    root = str(PROJECT_ROOT)
-    if not (program.startswith(root) or venv.startswith(root)):
-        return False
+    daemon_home = str(env.get("HERMES_HOME") or "")
+    venv = str(env.get("VIRTUAL_ENV") or "")
+    details["daemon_home"] = daemon_home
+    details["label_matches"] = label == get_system_launchd_gateway_label()
     try:
-        if home != str(get_hermes_home().resolve()):
-            return False
+        current_home = str(get_hermes_home().resolve())
+        daemon_home_resolved = str(Path(daemon_home).resolve()) if daemon_home else ""
+        details["home_matches"] = daemon_home_resolved == current_home
     except Exception:
-        return False
-    return True
+        details["reason"] = "home-unavailable"
+        return details
+
+    root = str(PROJECT_ROOT.resolve())
+    argv_matches = any(
+        isinstance(arg, str) and arg.startswith(root) for arg in argv
+    )
+    details["install_matches"] = venv.startswith(root) or argv_matches
+    details["matches"] = bool(
+        details["label_matches"]
+        and details["home_matches"]
+        and details["install_matches"]
+    )
+    if details["matches"]:
+        details["reason"] = "match"
+    elif not details["label_matches"]:
+        details["reason"] = "label-mismatch"
+    elif not details["home_matches"]:
+        details["reason"] = "other-home"
+    elif not details["install_matches"]:
+        details["reason"] = "same-home-install-mismatch"
+    else:
+        details["reason"] = "mismatch"
+    return details
+
+
+def _system_daemon_identity_matches(plist_path: Path | None = None) -> bool:
+    """True only when the system daemon belongs to this home and install."""
+    return bool(_system_daemon_identity_details(plist_path).get("matches"))
+
+
+def _system_daemon_install_matches(plist_path: Path | None = None) -> bool:
+    """True when label and checkout match, regardless of current profile."""
+    d = _system_daemon_identity_details(plist_path)
+    return bool(d.get("label_matches") and d.get("install_matches"))
+
+
+def _system_daemon_uses_current_home() -> bool:
+    """True when the daemon declares this profile's Hermes home."""
+    return bool(_system_daemon_identity_details().get("home_matches"))
+
+
+def _system_daemon_blocks_current_profile() -> bool:
+    """The daemon is an owner or ambiguous peer for this profile's home."""
+    return _system_daemon_uses_current_home()
 
 
 def _launchd_gateway_service_installed() -> bool:
     return (
-        get_system_launchd_gateway_plist_path().exists()
+        _system_daemon_identity_matches()
         or get_launchd_plist_path().exists()
     )
 
@@ -5235,11 +5298,17 @@ def refresh_launchd_plist_if_needed() -> bool:
 
 
 def launchd_install(force: bool = False):
-    if get_system_launchd_gateway_plist_path().exists():
-        print(
-            "System gateway LaunchDaemon is already installed and is the "
-            "authoritative owner."
-        )
+    if _system_daemon_blocks_current_profile():
+        if _system_daemon_identity_matches():
+            print(
+                "System gateway LaunchDaemon is already installed and is the "
+                "authoritative owner."
+            )
+        else:
+            print(
+                "System gateway LaunchDaemon uses this Hermes home but does not "
+                "match this checkout/venv."
+            )
         print("Refusing to install a competing user LaunchAgent.")
         return
 
@@ -5284,8 +5353,8 @@ def launchd_install(force: bool = False):
 
 
 def launchd_uninstall():
-    if get_system_launchd_gateway_plist_path().exists():
-        print("✗ The system gateway LaunchDaemon is authoritative on this host.")
+    if _system_daemon_blocks_current_profile():
+        print("✗ The system gateway LaunchDaemon owns this Hermes home.")
         print("  Refusing to remove only the retired user LaunchAgent and claim success.")
         raise SystemExit(1)
 
@@ -5305,15 +5374,19 @@ def launchd_uninstall():
 
 
 def launchd_start():
-    if get_system_launchd_gateway_plist_path().exists():
+    if _system_daemon_blocks_current_profile():
+        identity = _system_daemon_identity_details()
         loaded, daemon_pid, _output = _probe_system_launchd_gateway()
-        if loaded and daemon_pid is not None:
+        if identity["matches"] and loaded and daemon_pid is not None:
             print(f"✓ System gateway daemon is already running (PID {daemon_pid})")
             return
-        if loaded:
+        if identity["matches"] and loaded:
             print("⏳ System gateway daemon is loaded; KeepAlive restart is pending")
             return
-        print("✗ System gateway daemon is installed but not loaded.")
+        if not identity["matches"]:
+            print("✗ System gateway daemon uses this home but mismatches this checkout/venv.")
+        else:
+            print("✗ System gateway daemon is installed but not loaded.")
         print("  Refusing to create a competing user LaunchAgent.")
         raise SystemExit(1)
 
@@ -5375,8 +5448,8 @@ def launchd_start():
 
 
 def launchd_stop():
-    if get_system_launchd_gateway_plist_path().exists():
-        print("✗ Gateway stop is blocked while the system LaunchDaemon owns Hermes.")
+    if _system_daemon_blocks_current_profile():
+        print("✗ Gateway stop is blocked while the system LaunchDaemon owns this Hermes home.")
         print("  A user-level stop would be immediately undone by KeepAlive.")
         raise SystemExit(1)
 
@@ -5487,6 +5560,31 @@ def _wait_for_system_daemon_pid(
         time.sleep(0.5)
 
 
+def _wait_for_system_daemon_pid_for_install(old_pid, timeout=30.0):
+    """Fresh-PID poll for a same-checkout daemon in any profile home."""
+    deadline = time.monotonic() + timeout
+    while True:
+        loaded, pid, _ = _probe_system_launchd_gateway_for_install()
+        if loaded and pid and pid != old_pid:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def restart_system_launchd_gateway_for_update() -> bool:
+    """Drain and verify a same-checkout system daemon for fleet updates."""
+    loaded, pid, _ = _probe_system_launchd_gateway_for_install()
+    if not loaded:
+        return False
+    if pid is None:
+        return _wait_for_system_daemon_pid_for_install(None)
+    if _request_gateway_self_restart(pid):
+        return _wait_for_system_daemon_pid_for_install(pid)
+    if not _graceful_restart_via_sigusr1(pid, _get_restart_exit_wait_budget()):
+        return False
+    return _wait_for_system_daemon_pid_for_install(pid)
+
 def _restart_system_launchd_gateway() -> None:
     """Drain the gateway and let system-domain KeepAlive relaunch it."""
     loaded, daemon_pid, _output = _probe_system_launchd_gateway()
@@ -5581,18 +5679,23 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     if get_system_launchd_gateway_plist_path().exists():
-        if not _system_daemon_identity_matches():
-            # A daemon plist exists but does not belong to this install
-            # (side-by-side checkout, stale leftover). Never drain/kickstart
-            # someone else's service — fall through to the per-user path,
-            # which is scoped to THIS profile's plist.
-            print(
-                "⚠ System gateway daemon plist exists but is not ours "
-                "(checkout/venv/HERMES_HOME mismatch) — leaving it alone"
-            )
-        else:
+        identity = _system_daemon_identity_details()
+        if identity["matches"]:
             _restart_system_launchd_gateway()
             return
+        if identity["home_matches"]:
+            # Same Hermes home but a different checkout/venv is a partial
+            # deployment or a manually altered service definition.  Starting
+            # a user agent would compete for exactly the same state, so stop.
+            print(
+                "⚠ System gateway daemon uses this Hermes home but does not "
+                "match this checkout/venv — refusing to touch or start a "
+                "competing gateway"
+            )
+            return
+        # Different HERMES_HOME: this is another profile/install, not the
+        # owner for the current profile.  Fall through to our scoped user
+        # LaunchAgent rather than routing the current profile to it.
 
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
@@ -5696,12 +5799,16 @@ def launchd_restart():
 
 
 def _system_launchd_status(deep: bool = False) -> None:
-    """Report the boot-persistent system LaunchDaemon without GUI guidance."""
+    """Report the system LaunchDaemon when it owns this Hermes home."""
     plist_path = get_system_launchd_gateway_plist_path()
+    identity = _system_daemon_identity_details()
     loaded, daemon_pid, _output = _probe_system_launchd_gateway()
 
     print(f"System LaunchDaemon plist: {plist_path}")
-    if loaded and daemon_pid is not None:
+    if not identity["matches"]:
+        print("⚠ System daemon uses this Hermes home but mismatches this checkout/venv.")
+        print("  Refusing lifecycle actions until the service definition is reconciled.")
+    elif loaded and daemon_pid is not None:
         print(f"✓ Gateway is supervised by the system daemon (PID {daemon_pid})")
         print("  Auto-start at boot and auto-restart on crash are available.")
     elif loaded:
@@ -5734,10 +5841,13 @@ def _system_launchd_status(deep: bool = False) -> None:
 
 
 def launchd_status(deep: bool = False):
-    if get_system_launchd_gateway_plist_path().exists():
+    if _system_daemon_blocks_current_profile():
         _system_launchd_status(deep)
         return
 
+    # A system daemon with the same label but another HERMES_HOME is not this
+    # profile's owner. Report the current profile's user service below instead.
+    foreign_system = get_system_launchd_gateway_plist_path().exists()
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     try:
@@ -5776,6 +5886,11 @@ def launchd_status(deep: bool = False):
     launchd_unsupported = _launchd_unsupported_marker_exists()
 
     # ── Report ──
+    if foreign_system:
+        print(
+            "ℹ A same-label system daemon exists for another Hermes home; "
+            "it is not this profile's owner."
+        )
     print(f"Launchd plist: {plist_path}")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
@@ -6956,7 +7071,7 @@ def _is_service_installed() -> bool:
         )
     elif is_macos():
         return (
-            get_system_launchd_gateway_plist_path().exists()
+            _system_daemon_blocks_current_profile()
             or get_launchd_plist_path().exists()
         )
     elif is_windows():
@@ -7001,7 +7116,7 @@ def _is_service_running() -> bool:
                 pass
 
         return False
-    elif is_macos() and get_system_launchd_gateway_plist_path().exists():
+    elif is_macos() and _system_daemon_blocks_current_profile():
         loaded, daemon_pid, _output = _probe_system_launchd_gateway()
         return loaded and daemon_pid is not None
     elif is_macos() and _launchd_gateway_service_installed():

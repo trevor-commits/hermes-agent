@@ -109,6 +109,15 @@ class TestIdentity:
         )
         assert gw._system_daemon_identity_matches() is False
 
+    def test_other_home_does_not_block_current_profile(self, ours, tmp_path):
+        _write_plist(
+            tmp_path,
+            root="/opt/other-install",
+            home=str(tmp_path / "someone-elses-home"),
+        )
+        assert gw._system_daemon_identity_matches() is False
+        assert gw._system_daemon_blocks_current_profile() is False
+
     def test_wrong_label_rejected(self, ours, tmp_path):
         _write_plist(
             tmp_path,
@@ -247,9 +256,9 @@ class TestVerifiedRestart:
         assert rec.waits == [1234]
         assert "relaunched on a fresh PID" in output
 
-    def test_foreign_daemon_never_restarted(self, ours, monkeypatch, capsys):
-        # Identity fails (foreign root): launchd_restart must not touch the
-        # system daemon at all — falls through to the per-user branch.
+    def test_foreign_daemon_never_restarted_or_replaced(self, ours, monkeypatch, capsys):
+        # Identity fails (foreign root): launchd_restart must neither touch the
+        # system daemon NOR fall through to a competing user LaunchAgent.
         _write_plist(
             tmp_path=ours.plist.parent,
             root="/opt/other-install",
@@ -257,17 +266,35 @@ class TestVerifiedRestart:
         )
         touched = []
         monkeypatch.setattr(gw, "_restart_system_launchd_gateway", lambda: touched.append(1))
-        monkeypatch.setattr(gw, "_launchd_domain", lambda: "gui/501")
-        monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
+        # A test regression here used to fall through into a real detached
+        # gateway spawn. Make that impossible even if the implementation
+        # changes: either seam being touched fails immediately.
         monkeypatch.setattr(
-            gw, "get_launchd_plist_path",
-            lambda: ours.plist.parent / "does-not-exist.plist",
+            gw, "_launchd_fallback_to_detached",
+            lambda *a, **kw: pytest.fail("foreign daemon must not spawn a fallback"),
         )
         gw.launchd_restart()
         assert touched == []
+        assert "refusing to touch" in capsys.readouterr().out
 
 
-class TestPendingKeepalivePath:
+class TestFleetUpdateSystemDaemonRestart:
+    def test_update_restart_verifies_fresh_pid(self, ours, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            gw,
+            "_probe_system_launchd_gateway_for_install",
+            lambda: (True, 1234, "pid = 1234"),
+        )
+        monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: pid == 1234)
+        monkeypatch.setattr(
+            gw,
+            "_wait_for_system_daemon_pid_for_install",
+            lambda old_pid, timeout=30.0: calls.append(old_pid) or True,
+        )
+        assert gw.restart_system_launchd_gateway_for_update() is True
+        assert calls == [1234]
+
     def test_pending_restart_verifies_eventual_pid(self, ours, monkeypatch, capsys):
         # daemon loaded but PID None (KeepAlive respawn pending): the old code
         # returned silently; now we verify a PID appears.

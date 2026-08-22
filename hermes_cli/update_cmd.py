@@ -4733,14 +4733,37 @@ def _restart_macos_launchd_gateways(
     from hermes_cli.gateway import (
         get_launchd_label,
         get_launchd_plist_path,
+        get_system_launchd_gateway_label,
+        get_system_launchd_gateway_plist_path,
         launchd_restart,
         launchd_gateway_labels_for_install,
         _graceful_restart_via_sigusr1,
         _launchd_kickstart,
         _launchd_service_registered,
         _locate_launchd_gateway_service,
+        _system_daemon_install_matches,
+        restart_system_launchd_gateway_for_update,
         _wait_for_launchd_service_pid,
     )
+
+    # --- System LaunchDaemon -------------------------------------------------
+    # It is not one of the per-user labels below. A code update replaces the
+    # shared checkout, so a same-checkout system daemon must reload too even
+    # when the invoking profile is different. The helper verifies a fresh PID.
+    system_plist = get_system_launchd_gateway_plist_path()
+    system_label = get_system_launchd_gateway_label()
+    system_managed = system_plist.exists() and _system_daemon_install_matches()
+    if system_managed:
+        try:
+            print(f"  → {system_label}: draining and verifying a fresh PID...")
+            if restart_system_launchd_gateway_for_update():
+                restarted_services.append(system_label)
+            else:
+                failed_or_stale_units.append(system_label)
+                print(f"  ✗ {system_label} did not return on a fresh PID")
+        except (OSError, subprocess.TimeoutExpired):
+            failed_or_stale_units.append(system_label)
+            print(f"  ⚠ {system_label} restart probe failed")
 
     # --- Current profile: unchanged single-service path ---------------------
     # Gate order and predicate mirror the pre-fleet inline block exactly:
@@ -4752,9 +4775,8 @@ def _restart_macos_launchd_gateways(
     # failing counts toward the incomplete-update warning.
     current_label = get_launchd_label()
     try:
-        if get_launchd_plist_path().exists() and _launchd_service_registered(
-            current_label
-        ):
+        if (not system_managed and get_launchd_plist_path().exists()
+                and _launchd_service_registered(current_label)):
             try:
                 launchd_restart()
                 restarted_services.append(current_label)

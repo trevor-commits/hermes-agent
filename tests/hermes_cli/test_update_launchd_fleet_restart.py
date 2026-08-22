@@ -314,6 +314,8 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
         )
 
     monkeypatch.setattr(gw, "get_launchd_label", lambda: current)
+    monkeypatch.setattr(gw, "get_system_launchd_gateway_plist_path", lambda: tmp_path / "no-system.plist")
+    monkeypatch.setattr(gw, "_system_daemon_install_matches", lambda: False)
     monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: list(labels))
     monkeypatch.setattr(gw, "_locate_launchd_gateway_service", fake_locate)
@@ -344,6 +346,21 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
 
 class TestRestartMacosLaunchdGateways:
+    def test_system_daemon_is_restarted_and_verified_for_fleet_update(self, monkeypatch, tmp_path):
+        """System LaunchDaemon is not a user-label; update must handle it explicitly."""
+        system = tmp_path / "system.plist"
+        system.write_text("<plist/>")
+        monkeypatch.setattr(gw, "get_system_launchd_gateway_plist_path", lambda: system)
+        monkeypatch.setattr(gw, "get_system_launchd_gateway_label", lambda: "ai.hermes.gateway.daemon")
+        monkeypatch.setattr(gw, "_system_daemon_install_matches", lambda: True)
+        monkeypatch.setattr(gw, "restart_system_launchd_gateway_for_update", lambda: True)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: tmp_path / "no-user.plist")
+        monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: [])
+        restarted, failed = [], []
+        _restart_macos_launchd_gateways(restarted, failed, 5.0)
+        assert restarted == ["ai.hermes.gateway.daemon"]
+        assert failed == []
+
     def test_current_delegates_and_siblings_kickstart_in_own_domains(
         self, monkeypatch, tmp_path
     ):

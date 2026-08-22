@@ -661,6 +661,10 @@ class TestLaunchdServiceRecovery:
             "_probe_system_launchd_gateway",
             lambda: (True, 86231, "state = running\npid = 86231\n"),
         )
+        monkeypatch.setattr(gateway_cli, "_system_daemon_blocks_current_profile", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli, "_system_daemon_identity_details", lambda: {"matches": True}
+        )
 
         snapshot = gateway_cli.get_gateway_runtime_snapshot()
 
@@ -684,6 +688,10 @@ class TestLaunchdServiceRecovery:
             gateway_cli,
             "_probe_system_launchd_gateway",
             lambda: (True, 86231, "state = running\npid = 86231\n"),
+        )
+        monkeypatch.setattr(gateway_cli, "_system_daemon_blocks_current_profile", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli, "_system_daemon_identity_details", lambda: {"matches": True}
         )
         monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
 
@@ -710,6 +718,10 @@ class TestLaunchdServiceRecovery:
             "_probe_system_launchd_gateway",
             lambda: (True, 86231, ""),
         )
+        monkeypatch.setattr(gateway_cli, "_system_daemon_blocks_current_profile", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli, "_system_daemon_identity_details", lambda: {"matches": True}
+        )
         monkeypatch.setattr(
             gateway_cli,
             "refresh_launchd_plist_if_needed",
@@ -734,8 +746,8 @@ class TestLaunchdServiceRecovery:
         # the restart handoff path, so declare the daemon "ours" here.
         monkeypatch.setattr(
             gateway_cli,
-            "_system_daemon_identity_matches",
-            lambda plist_path=None: True,
+            "_system_daemon_identity_details",
+            lambda: {"matches": True, "home_matches": True},
         )
         monkeypatch.setattr(
             gateway_cli,
