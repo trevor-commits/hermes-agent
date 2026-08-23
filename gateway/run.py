@@ -4282,10 +4282,9 @@ def _format_direct_source_card_completion(evt: dict) -> str:
     if "hard_context_ceiling_blocked" in safe_error:
         return (
             "⚠️ Research stopped safely before exceeding the context limit.\n\n"
-            "No automatic retry runs after worker dispatch because a retry "
-            "can duplicate a card or receipt. Please resend the URL once. The "
-            "duplicate check will prevent a second card if the first attempt "
-            "landed.\n\n"
+            "No automatic retry was started. A post-dispatch retry can duplicate "
+            "a card or receipt. The original intake remains available for "
+            "deterministic reconciliation.\n\n"
             f"Failure: `{safe_error}`"
         )
     if safe_error.startswith("source_card_landing_failed:"):
@@ -4293,9 +4292,9 @@ def _format_direct_source_card_completion(evt: dict) -> str:
         return f"⚠️ Card written but not landed: {detail}"
     return (
         "⚠️ Research could not finish.\n\n"
-        "No automatic retry runs after worker dispatch because a retry can "
-        "duplicate a card or receipt. Please resend the URL once. The duplicate "
-        "check will prevent a second card if the first attempt landed.\n\n"
+        "No automatic retry was started. A post-dispatch retry can duplicate a "
+        "card or receipt. The original intake remains available for deterministic "
+        "reconciliation.\n\n"
         f"Failure: `{safe_error}`"
     )
 
