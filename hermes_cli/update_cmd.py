@@ -1158,6 +1158,208 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
+def _called_process_error_cmd_parts(exc: subprocess.CalledProcessError) -> list[str]:
+    """Normalize ``CalledProcessError.cmd`` into argv-style tokens."""
+    cmd = exc.cmd
+    if cmd is None:
+        return []
+    if isinstance(cmd, (str, bytes)):
+        text = cmd.decode("utf-8", "replace") if isinstance(cmd, bytes) else cmd
+        try:
+            return shlex.split(text, posix=os.name != "nt")
+        except ValueError:
+            return text.split()
+    return [str(part) for part in cmd]
+
+
+def _called_process_error_is_git(exc: subprocess.CalledProcessError) -> bool:
+    """True when the failed subprocess was git itself."""
+    parts = _called_process_error_cmd_parts(exc)
+    if not parts:
+        return False
+    # Windows argv may use backslashes; basename() on POSIX would otherwise
+    # keep the whole path. Normalize separators before taking the name.
+    name = os.path.basename(parts[0].replace("\\", "/")).lower()
+    return name in {"git", "git.exe"}
+
+
+def _called_process_error_is_python_dep_install(
+    exc: subprocess.CalledProcessError,
+) -> bool:
+    """True when the failed subprocess was a uv/pip (or ensurepip) install."""
+    parts = [part.lower() for part in _called_process_error_cmd_parts(exc)]
+    if not parts:
+        return False
+    exe = os.path.basename(parts[0].replace("\\", "/"))
+    if "ensurepip" in parts:
+        return True
+    if "install" in parts and (
+        "pip" in parts or exe in {"pip", "pip.exe", "pip3", "pip3.exe", "uv", "uv.exe"}
+    ):
+        return True
+    return False
+
+
+def _format_update_failure_stage(exc: subprocess.CalledProcessError) -> str:
+    """Name the update stage that actually failed.
+
+    The git pull and the Python-dependency install share one ``try`` in
+    ``_cmd_update_impl``. Calling every ``CalledProcessError`` a git failure
+    (the historical Windows message) sent users hunting in the wrong place
+    and, worse, keyed the ZIP overlay on exception *type* rather than on git
+    actually having failed (#87304, #85840).
+    """
+    if _called_process_error_is_python_dep_install(exc):
+        return "Python dependency install failed"
+    if _called_process_error_is_git(exc):
+        return "Git update failed"
+    return "Update step failed"
+
+
+def _shim_quarantine_error_type() -> "type[BaseException]":
+    """The strict-quarantine refusal type, resolved lazily through ``_m()``.
+
+    Falls back to a never-raised private type when main.py lacks it (torn
+    mid-update tree), so the ``except`` clause stays valid.
+    """
+    cls = getattr(_m(), "ShimQuarantineError", None)
+    if isinstance(cls, type) and issubclass(cls, BaseException):
+        return cls
+
+    class _Never(Exception):
+        pass
+
+    return _Never
+
+
+def _refuse_update_for_contended_shims(exc: BaseException) -> None:
+    """Refuse the dependency sync when live shims could not be quarantined.
+
+    #87331 fail-closed half: a shim rename that failed every retry proves a
+    process holds the venv without FILE_SHARE_DELETE — running the installer
+    anyway is exactly how the venv ends up stranded between versions. The
+    code swap (when one happened) is already committed; only the dependency
+    install is deferred, via the update-incomplete marker, to the next fresh
+    launch after the holder exits. Exits 2 (refused) so the command-boundary
+    receipt net records it as a refusal, not a failure.
+    """
+    print("✗ Cannot continue the update: live Hermes launcher(s) could not be")
+    print("  moved aside:")
+    for name in getattr(exc, "failed_shims", []) or ["hermes.exe"]:
+        print(f"    {name}")
+    print("  Another process is holding this install's venv — typically Hermes")
+    print("  Desktop, a gateway, or another hermes REPL — and mutating the venv")
+    print("  now would strand it half-updated.")
+    print("  The dependency install has been deferred: close the process(es)")
+    print("  above, then run any `hermes` command to finish it automatically.")
+    # Idempotent: the git path already dropped the marker before the sync;
+    # this covers the ZIP/repair paths so the deferral is never silent.
+    _write_update_incomplete_marker()
+    sys.exit(2)
+
+
+def _should_zip_fallback_on_update_error(exc: BaseException) -> bool:
+    """ZIP fallback is for Windows git file-I/O breakage, not later stages.
+
+    A dependency-install failure (locked ``hermes.exe`` / ``uv pip install``
+    exit 2) is not a git failure. The pull has already succeeded by then, so
+    re-downloading the source ZIP cannot fix the install and would replace
+    every top-level entry except ``venv`` / ``node_modules`` / ``.git`` /
+    ``.env`` — permanently deleting uncommitted edits and untracked files.
+    """
+    return (
+        isinstance(exc, subprocess.CalledProcessError)
+        and _m()._is_windows()
+        and _called_process_error_is_git(exc)
+    )
+
+
+def _print_called_process_error_tail(
+    exc: subprocess.CalledProcessError, *, limit: int = 12
+) -> None:
+    """Print a captured stderr/stdout tail when the failing call recorded one."""
+    blob = exc.stderr or exc.stdout or ""
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8", "replace")
+    lines = [line for line in str(blob).splitlines() if line.strip()]
+    if not lines:
+        return
+    print("  Last output:")
+    for line in lines[-limit:]:
+        print(f"    {line}")
+
+
+def _zip_overlay_block_reason(
+    root: Path, *, ignore_staging_artifacts: bool = False
+) -> Optional[str]:
+    """Why overlaying a ZIP onto ``root`` would destroy work, or None if safe.
+
+    The ZIP path swaps every top-level entry (except a tiny preserve set) and
+    then deletes the backups, so uncommitted edits and untracked files under
+    a replaced directory are gone. Fail closed when git status cannot run:
+    unknown dirtiness is not a license to clobber the tree (#87304).
+
+    ``ignore_staging_artifacts`` is for the pre-swap re-check: phase 1 of the
+    two-phase replace creates ``*.hermes-update-staging`` siblings inside the
+    checkout, which git reports as untracked. Those are our own artifacts,
+    not user work — without the filter the re-check would always refuse.
+    """
+    if not (root / ".git").exists():
+        return None
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    result = subprocess.run(
+        # -uall: a user-level ``status.showUntrackedFiles = no`` git config
+        # would otherwise hide untracked files and silently blind this guard.
+        git_cmd + ["status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        suffix = f" ({detail[0]})" if detail else ""
+        return f"could not check the working tree{suffix}"
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if ignore_staging_artifacts:
+        lines = [
+            line for line in lines if not _is_zip_staging_artifact_status_line(line)
+        ]
+    if lines:
+        return "the working tree has uncommitted changes or untracked files"
+    return None
+
+
+_ZIP_STAGING_ARTIFACT_SUFFIXES = (".hermes-update-staging", ".hermes-update-old")
+
+
+def _is_zip_staging_artifact_status_line(line: str) -> bool:
+    """True when a porcelain status line is our own two-phase-swap artifact."""
+    payload = line[3:] if len(line) >= 3 else line
+    top_level = (
+        payload.strip().strip('"').replace("\\", "/").rstrip("/").split("/", 1)[0]
+    )
+    return top_level.endswith(_ZIP_STAGING_ARTIFACT_SUFFIXES)
+
+
+def _abort_zip_update_if_dirty_tree() -> None:
+    """Refuse to overlay a ZIP onto a dirty git checkout (#87304)."""
+    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
+    if reason is None:
+        return
+    print(f"✗ ZIP fallback refused: {reason}.")
+    print(
+        "  Overlaying the ZIP would overwrite uncommitted edits and permanently "
+        "delete untracked files."
+    )
+    print("  Stash or commit your changes, then rerun `hermes update`.")
+    print("  To inspect: git status --porcelain")
+    _m().sys.exit(1)
+
+
 def _read_project_version() -> str | None:
     """Read the ``version`` field from the checkout's pyproject.toml.
 
@@ -1268,6 +1470,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             f"--branch {branch}`, or update against main with `hermes update`."
         )
         _m().sys.exit(1)
+    _abort_zip_update_if_dirty_tree()
     zip_url = (
         f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
     )
@@ -1361,6 +1564,22 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                 src = os.path.join(extracted, item)
                 dst = os.path.join(str(_m().PROJECT_ROOT), item)
                 staged.append((_stage_replacement(src, dst), dst))
+                # #70337/#87331: the GitHub source ZIP contains only source —
+                # apps/desktop/release/ (the BUILT desktop app, win-unpacked/
+                # Hermes.exe) exists only in the LIVE tree. Swapping `apps`
+                # without it deletes the desktop build and breaks the
+                # shortcut. Graft the live release dir into the staged copy
+                # BEFORE the swap so the commit preserves it atomically.
+                if item == "apps":
+                    live_release = os.path.join(dst, "desktop", "release")
+                    staged_release = os.path.join(
+                        staged[-1][0], "desktop", "release"
+                    )
+                    if os.path.isdir(live_release) and not os.path.exists(
+                        staged_release
+                    ):
+                        os.makedirs(os.path.dirname(staged_release), exist_ok=True)
+                        shutil.copytree(live_release, staged_release)
         except Exception:
             # Nothing is live yet; drop the partial staging copies so a retry
             # starts from the same free space this attempt did.
@@ -1368,6 +1587,23 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             raise
 
         try:
+            # Re-check the tree right before the swap (#87304 TOCTOU): the
+            # download + extract + staging window above can take minutes, and
+            # work created in it would be destroyed by the commit below. Our
+            # own phase-1 staging siblings are filtered out — they are the
+            # expected artifacts of getting here, not user work.
+            recheck_reason = _zip_overlay_block_reason(
+                _m().PROJECT_ROOT, ignore_staging_artifacts=True
+            )
+            if recheck_reason is not None:
+                _discard_staged(staged)
+                print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
+                print(
+                    "  Files appeared in the checkout while the update was "
+                    "downloading; committing the swap would delete them."
+                )
+                print("  Stash or commit your changes, then rerun `hermes update`.")
+                _m().sys.exit(1)
             _commit_staged_replacements(staged)
         except Exception:
             # The rollback already restored every swapped entry, but staging
@@ -1433,7 +1669,13 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         if _m()._is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
-        _m()._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        try:
+            _m()._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        except _shim_quarantine_error_type() as _sqe:
+            # #87331: this runs inside the ZIP-fallback error handler, so the
+            # boundary except clause in cmd_update cannot catch it — refuse
+            # here with the same defer-via-marker contract.
+            _refuse_update_for_contended_shims(_sqe)
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
@@ -3216,7 +3458,7 @@ def _ensure_fhs_path_guard() -> None:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
 def _ensure_acp_launcher() -> None:
-    """Self-heal: install a ``hermes-acp`` launcher next to the ``hermes`` one.
+    r"""Self-heal: install a ``hermes-acp`` launcher next to the ``hermes`` one.
 
     Mirrors the launcher block in ``scripts/install.sh`` so existing installs
     gain the ACP command on ``hermes update`` without a reinstall.  ACP hosts
@@ -3230,14 +3472,19 @@ def _ensure_acp_launcher() -> None:
     (venv wrapper, FHS symlink, pipx/pip console script) without having to
     reconstruct interpreter/entrypoint paths.
 
-    No-op on Windows (install.ps1 copies ``hermes.exe`` + ``hermes-acp.exe``
-    into ``$InstallDir\bin`` and puts THAT on the user PATH — never the whole
-    ``venv\Scripts`` dir, which would shadow the user's ``python`` (#83797) —
-    so ``hermes-acp.exe`` already resolves) and wherever a ``hermes-acp`` is
-    already present next to the ``hermes`` command.  Unwritable directories
-    (e.g. ``/usr/local/bin`` as non-root) are skipped silently.  Idempotent.
+    No-op on Windows (install.ps1 stages the ``hermes`` / ``hermes-acp``
+    launchers into the managed binary dir ``$HermesHome\bin`` and puts THAT
+    on the user PATH — never the whole ``venv\Scripts`` dir, which would
+    shadow the user's ``python`` (#83797); when those launchers go missing,
+    ``hermes_cli._install_repair.ensure_windows_bin_launchers`` re-stages
+    them) and wherever a ``hermes-acp`` is already present next to the
+    ``hermes`` command.  Unwritable directories (e.g. ``/usr/local/bin`` as
+    non-root) are skipped silently.  Idempotent.
     """
     if _m().sys.platform == "win32":
+        # Windows launcher staging/repair lives in _install_repair
+        # (ensure_windows_bin_launchers at process start,
+        # migrate_windows_bin_path in this command's tail) — not here.
         return
     for bin_dir in (Path.home() / ".local" / "bin", Path("/usr/local/bin")):
         hermes_cmd = bin_dir / "hermes"
@@ -4427,6 +4674,78 @@ def _stop_process_trees(pids: list[int]) -> None:
             logger.debug("Could not stop process tree %s: %s", pid, exc)
 
 
+def _looks_like_desktop_control_plane(cmdline: str) -> bool:
+    """True for this-install ``hermes serve`` / ``hermes dashboard`` argv.
+
+    That is the Desktop control plane, not the messaging gateway. Serve and
+    dashboard do not host platform adapters (#92091); do not feed this into
+    ``looks_like_gateway_command_line``.
+
+    Token-based via the parser-derived subcommand classifier — never
+    substring (#90778/#91869: ``kanban --preserve-cache`` contains "serve",
+    ``-m dashboard chat`` contains " dashboard"; both are NOT control
+    planes). A cmdline whose subcommand cannot be determined is NOT a
+    control plane — callers must not guess ownership.
+    """
+    if "hermes_cli.main" not in (cmdline or "").lower():
+        return False
+    return _hermes_holder_subcommand(cmdline) in ("serve", "dashboard")
+
+
+def _desktop_owns_gateway_lifecycle() -> bool:
+    """True when Desktop currently supervises this install's control plane.
+
+    The updater must not steal gateway start in that case: Desktop owns
+    start/stop via ``/api/gateway/*``. This is *not* proof messaging is
+    already served — a live serve process is the control plane, and the
+    gateway is a detached sibling (#76129 / #92091).
+
+    Prefer the spawn ledger (owned identity). Fall back to the install-scoped
+    venv-holder scan already used by the lock guard; an orphaned control-plane
+    process (supervisor gone) does not count.
+    """
+    try:
+        from hermes_cli.process_identity import ledger_entries, spawner_is_dead
+
+        for entry in ledger_entries():
+            if entry.get("purpose") not in ("serve", "dashboard"):
+                continue
+            if spawner_is_dead(entry) is False:
+                return True
+    except Exception as exc:
+        logger.debug("Desktop-lifecycle ledger probe failed: %s", exc)
+
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+
+    try:
+        holders = _m()._detect_venv_python_processes()
+    except Exception as exc:
+        logger.debug("Desktop-lifecycle holder scan failed: %s", exc)
+        return False
+
+    for pid, _name, cmdline in holders:
+        if not _looks_like_desktop_control_plane(cmdline):
+            continue
+        if psutil is None:
+            # Cannot prove orphanhood; a live this-install control plane is
+            # enough to refuse stealing gateway start.
+            return True
+        try:
+            proc = psutil.Process(int(pid))
+            parent = proc.parent()
+            if parent is None or not parent.is_running():
+                continue
+            if parent.create_time() > proc.create_time():
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -4465,6 +4784,24 @@ def _pause_windows_gateways_for_update() -> dict | None:
         # gateways that were running when the update began. Cold-start one after
         # the update so an installed gateway is actually up post-update. Users
         # who run gateway-less (no autostart entry) get nothing forced on them.
+        #
+        # Exception: Desktop currently owns this install's gateway lifecycle
+        # (live supervised serve/dashboard). A vestigial Startup/Scheduled
+        # Task is not the owner — spawning ``gateway run`` beside Desktop
+        # races ports/state (#76129). Serve is the control plane, not proof
+        # messaging is served; the skip is ownership, not liveness (#92091).
+        try:
+            if _desktop_owns_gateway_lifecycle():
+                logger.debug(
+                    "Skipping Windows gateway cold-start plan: "
+                    "Desktop owns gateway lifecycle"
+                )
+                return None
+        except Exception as exc:
+            logger.debug(
+                "Could not check Desktop gateway-lifecycle ownership before update: %s",
+                exc,
+            )
         try:
             from hermes_cli import gateway_windows
 
@@ -4616,6 +4953,18 @@ def _cold_start_windows_gateway_after_update() -> None:
     except Exception as exc:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
         return
+
+    try:
+        if _desktop_owns_gateway_lifecycle():
+            logger.debug(
+                "Skipping Windows gateway cold-start: Desktop owns gateway lifecycle"
+            )
+            return
+    except Exception as exc:
+        logger.debug(
+            "Could not re-check Desktop gateway-lifecycle ownership before cold-start: %s",
+            exc,
+        )
 
     try:
         pid = gateway_windows._spawn_detached()
@@ -5854,12 +6203,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # not behind, fall through to the up-to-date path.
             commit_count = counted if counted is not None else -1
 
+        # A fork can match origin while still trailing upstream. The sync can
+        # therefore advance HEAD even though the origin comparison found no
+        # commits. Detect that BEFORE taking the no-update return so dependency
+        # refreshes, gateway restarts, AND the fleet version matrix still run
+        # for the pulled code (#73108 — previously the sync lived inside the
+        # commit_count == 0 branch, which returns immediately after: an update
+        # that pulled hundreds of upstream commits printed "Already up to
+        # date!" and verified nothing).
+        if commit_count == 0 and is_fork and branch == "main":
+            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                synced_count = _count_commits_between(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_sync_sha,
+                    post_sync_sha,
+                )
+                # HEAD moving is itself proof of an update. Keep the update
+                # path active even if the informational count cannot be read.
+                commit_count = max(1, synced_count)
+
         if commit_count == 0:
             _invalidate_update_cache()
-
-            # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
-                _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved.
             # EXCEPTION: a parked feature branch we verified clean + fully
@@ -6860,11 +7228,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Self-heal the hermes-acp launcher for installs that predate it, so
         # ACP hosts (Zed, JetBrains, Buzz) can resolve Hermes on PATH without
-        # a reinstall.  No-op on Windows and when already present.
+        # a reinstall.  No-op on Windows (the launcher migration below owns
+        # that) and when already present.
         try:
             _ensure_acp_launcher()
         except Exception as e:
             logger.debug("hermes-acp launcher self-heal failed: %s", e)
+
+        # Migrate the Windows hermes launchers to the managed binary dir
+        # (the default Hermes root's bin, next to the managed uv) and repair
+        # them if they are missing. Earlier layouts put them inside the git
+        # checkout (hermes-agent\bin) or put venv\Scripts itself on PATH; the
+        # in-checkout copies were swept by this command's own pre-update
+        # autostash (git stash push --include-untracked) and, with
+        # --keep-stash (the desktop updater), never restored — `hermes`
+        # stopped resolving in every new terminal. Updates never run
+        # install.ps1, so this tail call is how existing installs reach the
+        # new layout. No-op on POSIX and on source checkouts (root is not
+        # the managed clone under the default Hermes root).
+        try:
+            from hermes_cli._install_repair import migrate_windows_bin_path
+
+            migrate_windows_bin_path(_m().PROJECT_ROOT)
+        except Exception as e:
+            logger.debug("Windows bin launcher migration failed: %s", e)
 
         # Refresh the cua-driver binary used by the Computer Use toolset.
         # The upstream installer is gated on supported platforms and on the
@@ -7783,7 +8170,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # were running) — nothing to settle.
             if restarted_services or killed_pids:
                 _time.sleep(2.0)
-            _fleet_snapshot = collect_fleet_versions()
+            # Pass the pre-restart PID snapshot so a gateway the restart
+            # phase stopped WITHOUT a verified replacement shows as a DOWN
+            # row (exit 1) instead of silently producing no row at all.
+            _fleet_snapshot = collect_fleet_versions(
+                pre_restart_pids=_pre_restart_gateway_pids
+            )
             if print_fleet_version_matrix(_fleet_snapshot):
                 gateway_fleet_restart_incomplete = True
         except Exception as _fleet_exc:
@@ -7807,9 +8199,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # automation / operators do not treat the fleet as healthy.
             sys.exit(1)
 
+    except _shim_quarantine_error_type() as e:
+        # Fail-closed shim contention (#87331): strict quarantine refused
+        # BEFORE any installer ran — defer via marker, exit 2, no ZIP.
+        _refuse_update_for_contended_shims(e)
     except subprocess.CalledProcessError as e:
-        if _m()._is_windows():
-            print(f"⚠ Git update failed: {e}")
+        stage = _format_update_failure_stage(e)
+        if _should_zip_fallback_on_update_error(e):
+            print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")
             print()
             desktop_build_ok = _update_via_zip(
@@ -7819,7 +8216,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if gateway_mode:
                 _write_gateway_update_exit_code(desktop_build_ok)
         else:
-            print(f"✗ Update failed: {e}")
+            print(f"✗ {stage}: {e}")
+            _print_called_process_error_tail(e)
+            if _called_process_error_is_python_dep_install(e):
+                print(
+                    "  The git update already finished. Re-downloading the source "
+                    "ZIP cannot fix a dependency install error and would overwrite "
+                    "local files."
+                )
+                if _m()._is_windows():
+                    print("  Retry through the venv interpreter:")
+                    print(
+                        '    venv\\Scripts\\python.exe -c '
+                        '"from hermes_cli.main import main; main()" update --yes'
+                    )
             try:
                 from hermes_cli.update_receipt import finalize_update_receipt
 

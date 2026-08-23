@@ -10,7 +10,9 @@ After a crash (no marker), suspension still fires as a safety net for stuck sess
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 
@@ -126,6 +128,40 @@ class TestCleanShutdownMarker:
             store._ensure_loaded_locked()
             resume_count = sum(1 for e in store._entries.values() if e.resume_pending)
         assert resume_count == 1, "Session should be resume_pending after crash (no marker)"
+
+
+@pytest.mark.asyncio
+async def test_startup_carries_clean_marker_state_to_bounded_boot_sends(
+    tmp_path, monkeypatch
+):
+    """Consuming the clean marker early must not relabel the same boot as unclean."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    marker = tmp_path / ".clean_shutdown"
+    marker.write_text("clean\n", encoding="utf-8")
+
+    runner = gateway_run.GatewayRunner(
+        GatewayConfig(platforms={}, sessions_dir=tmp_path / "sessions")
+    )
+    monkeypatch.setattr(
+        runner, "_start_secondary_profile_adapters", AsyncMock(return_value=0)
+    )
+    seen: list[dict] = []
+
+    async def capture_boot_sends(**kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr(runner, "_await_startup_boot_sends", capture_boot_sends)
+
+    assert await runner.start() is True
+    assert not marker.exists(), "startup should consume the clean-exit receipt"
+    assert seen == [
+        {
+            "planned_restart_notification_pending": False,
+            "unclean_startup": False,
+            "chat_restart_notification_pending": False,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
