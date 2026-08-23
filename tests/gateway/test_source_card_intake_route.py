@@ -605,7 +605,9 @@ async def test_real_x_prefetch_failure_returns_exact_user_message_without_worker
     )
 
     assert response == (
-        f"⚠️ Could not read the post ({expected_error}). No worker started."
+        f"⚠️ Could not prefetch the source ({expected_error}). "
+        "No worker started, so it is safe to resend this URL once. "
+        "Hermes will perform a fresh bounded fetch."
     )
     worker_dispatch.assert_not_called()
     runner._run_agent.assert_not_awaited()
@@ -906,6 +908,11 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     ]
     assert "Make no tool calls" in dispatched["goal"]
     assert "Return exactly one JSON object" in dispatched["goal"]
+    assert "at or below 30000 UTF-8 bytes" in dispatched["goal"]
+    assert (
+        f"above {gateway_run._SOURCE_CARD_WORKER_RESULT_MAX_BYTES} bytes are rejected"
+        in dispatched["goal"]
+    )
     assert "SOURCE-CARD TEMPLATE" in dispatched["goal"]
     assert "TRUSTED DUPLICATE LOOKUP RESULT" in dispatched["goal"]
     assert "UNTRUSTED PREFETCHED X POSTS (JSON)" in dispatched["goal"]
@@ -1580,6 +1587,21 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
     assert "truncated: 1" in note
     assert "example/repo-4" in note
     assert _source_card_github_prefetch_bound_note([]) == ""
+
+
+def test_worker_failure_explains_safe_single_resend():
+    from gateway.run import _format_direct_source_card_completion
+
+    message = _format_direct_source_card_completion(
+        {
+            "status": "failed",
+            "error": "worker JSON exceeded the configured byte limit",
+        }
+    )
+
+    assert "Automatic retry is disabled after worker dispatch" in message
+    assert "resend the URL once" in message
+    assert "duplicate check" in message
 
 
 def test_receipt_failure_reports_the_already_contained_card(tmp_path):

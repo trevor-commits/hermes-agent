@@ -132,6 +132,7 @@ _SOURCE_CARD_WORKER_MAX_ITERATIONS = 2
 _SOURCE_CARD_WORKER_SYSTEM_MAX_BYTES = 24_576
 _SOURCE_CARD_WORKER_GOAL_MAX_BYTES = 16_384
 _SOURCE_CARD_WORKER_RESULT_MAX_BYTES = 32_768
+_SOURCE_CARD_WORKER_RESPONSE_TARGET_BYTES = 30_000
 # Network-bound prefetches (X post lookup, GitHub repo lookup) cross the real
 # internet; local template/duplicate helpers stay disk-speed at their own 10s
 # call sites. One shared constant keeps the timeouts and their error strings
@@ -4277,15 +4278,21 @@ def _format_direct_source_card_completion(evt: dict) -> str:
     safe_error = safe_error[:800] or status or "background worker failed"
     if "hard_context_ceiling_blocked" in safe_error:
         return (
-            "⚠️ Research stopped safely before exceeding the context limit. "
-            "No automatic retry was started.\n\n"
+            "⚠️ Research stopped safely before exceeding the context limit.\n\n"
+            "Automatic retry is disabled after worker dispatch because a retry "
+            "can duplicate a card or receipt. Please resend the URL once. The "
+            "duplicate check will prevent a second card if the first attempt "
+            "landed.\n\n"
             f"Failure: `{safe_error}`"
         )
     if safe_error.startswith("source_card_landing_failed:"):
         detail = safe_error.removeprefix("source_card_landing_failed:")
         return f"⚠️ Card written but not landed: {detail}"
     return (
-        "⚠️ Research could not finish. No automatic retry was started.\n\n"
+        "⚠️ Research could not finish.\n\n"
+        "Automatic retry is disabled after worker dispatch because a retry can "
+        "duplicate a card or receipt. Please resend the URL once. The duplicate "
+        "check will prevent a second card if the first attempt landed.\n\n"
         f"Failure: `{safe_error}`"
     )
 
@@ -22076,7 +22083,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "the bare `hermes` token in downstream learning targets; a `none:` "
             "downstream target requires `none:` Hermes relevance.\n"
             "Return exactly one JSON object with only card_path, card_content and "
-            "analysis. The first non-whitespace character must be `{`. Origin "
+            "analysis. Keep the complete response at or below "
+            f"{_SOURCE_CARD_WORKER_RESPONSE_TARGET_BYTES} UTF-8 bytes. Responses "
+            f"above {_SOURCE_CARD_WORKER_RESULT_MAX_BYTES} bytes are rejected. "
+            "Prefer concise prose and leave room for JSON escaping and analysis. "
+            "The first non-whitespace character must be `{`. Origin "
             "session IDs in this packet are receipt metadata, not chats to look "
             "up. Do not emit Referenced Chat, Markdown fences, or any prose "
             "around the JSON. "
@@ -23037,8 +23048,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     safe_error = "x-lookup failed"
                 response = (
-                    f"⚠️ Could not read the post ({safe_error[:300]}). "
-                    "No worker started."
+                    f"⚠️ Could not prefetch the source ({safe_error[:300]}). "
+                    "No worker started, so it is safe to resend this URL once. "
+                    "Hermes will perform a fresh bounded fetch."
                 )
             else:
                 safe_error = str(dispatch.get("error") or "unknown dispatch failure")
