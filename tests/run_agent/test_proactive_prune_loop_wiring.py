@@ -145,7 +145,7 @@ class TestProactivePruneLoopWiring:
         with (
             patch.object(agent, "_compress_context", side_effect=_compress) as compress,
             patch(
-                "agent.conversation_loop.conversation_history_after_compression",
+                "agent.turn_context.conversation_history_after_compression",
                 return_value=[],
             ),
         ):

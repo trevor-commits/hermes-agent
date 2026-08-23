@@ -2071,14 +2071,6 @@ def execute_tool_calls_concurrent(
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tc.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
-        _record_persisted_path_for_stub(agent, tc.id, function_result)
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if not _is_multimodal_tool_result(function_result):
@@ -2100,6 +2092,7 @@ def execute_tool_calls_concurrent(
                     full_output_persisted=False,
                 )
                 function_result = persistence.content
+            _record_persisted_path_for_stub(agent, tc.id, function_result)
             _tool_content = agent._tool_result_content_for_active_model(
                 name,
                 function_result,

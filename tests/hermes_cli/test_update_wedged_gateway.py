@@ -214,6 +214,11 @@ class TestLaunchdRestartWedgedIntegration:
         )
         monkeypatch.setattr(
             gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: events.append(("drain", timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
             "_wait_for_gateway_exit",
             lambda timeout, force_after=None: events.append(("drain", timeout)) or True,
         )
@@ -239,13 +244,15 @@ class TestLaunchdRestartWedgedIntegration:
         """A busy-but-alive gateway (fresh heartbeat) must NOT be escalated —
         that would bypass the in-flight cron drain floor (#86684)."""
         events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        expected_budget = gateway_cli._get_restart_exit_wait_budget()
         gateway_cli.launchd_restart()
         assert "escalate" not in events
-        assert ("drain", 180.0) in events
+        assert ("drain", expected_budget) in events
 
     def test_unknown_liveness_keeps_full_drain_budget(self, monkeypatch):
         """Ambiguity (no heartbeat) must never trigger escalation."""
         events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_UNKNOWN)
+        expected_budget = gateway_cli._get_restart_exit_wait_budget()
         gateway_cli.launchd_restart()
         assert "escalate" not in events
-        assert ("drain", 180.0) in events
+        assert ("drain", expected_budget) in events

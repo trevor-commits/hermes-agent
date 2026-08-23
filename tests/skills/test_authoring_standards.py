@@ -31,10 +31,12 @@ GRANDFATHER: dict[str, set[str]] = {
 
 
 def _skill_paths():
-    return sorted(
-        list(REPO.glob("skills/**/SKILL.md"))
-        + list(REPO.glob("optional-skills/**/SKILL.md"))
+    paths = list(REPO.glob("skills/**/SKILL.md")) + list(
+        REPO.glob("optional-skills/**/SKILL.md")
     )
+    # Tracked symlink overlays are owned and validated by their source repo;
+    # following them here would mutate or gate machine-local external skills.
+    return sorted(p for p in paths if not p.is_symlink())
 
 
 def _rel(p: Path) -> str:

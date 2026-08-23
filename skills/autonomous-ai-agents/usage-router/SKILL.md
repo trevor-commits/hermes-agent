@@ -1,6 +1,11 @@
 ---
 name: usage-router
-description: Use before delegating work or choosing a model, or when asked about AI usage/allowances/resets — consults live allowance state across Claude, Codex, GLM, Copilot, Hermes and picks the right executor.
+description: Use before choosing an AI provider or model.
+version: 1.0.0
+author: Trevor Gillette
+license: MIT
+platforms: [macos]
+tags: [agents, routing, usage]
 ---
 
 # Usage-aware routing

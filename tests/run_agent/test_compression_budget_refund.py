@@ -266,14 +266,15 @@ class TestCompressionBudgetRefund:
     def test_unverified_or_pressured_compaction_stays_capped(
         self, agent, provider_prompt_tokens
     ):
-        """Missing usage or real usage at threshold cannot recycle the cap."""
+        """Missing usage or threshold-level usage keeps the cap and fails closed."""
         result, compress_calls = _run_marathon_turn(
             agent,
             n_tool_iterations=8,
             provider_prompt_tokens=provider_prompt_tokens,
         )
 
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["hard_context_ceiling_blocked"] is True
         assert len(compress_calls) <= agent.max_compression_attempts, (
             "without provider-confirmed headroom the per-turn cap must hold; "
             f"got {len(compress_calls)} compactions"

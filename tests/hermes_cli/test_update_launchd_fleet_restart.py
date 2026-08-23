@@ -222,6 +222,13 @@ class TestGetServicePidsScoping:
         monkeypatch.setattr(
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
+        monkeypatch.setattr(
+            gw.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="", stderr=""
+            ),
+        )
 
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted

@@ -404,15 +404,8 @@ class _SupermemoryClient:
         if metadata:
             payload["metadata"] = self._merge_metadata(metadata)
 
-        # Honor SUPERMEMORY_BASE_URL for self-hosted/local servers, mirroring the
-        # SDK's base_url resolution in supermemory/_client.py. Falls back to the
-        # hosted API when unset. Without this, session-transcript ingest (raw
-        # urllib, not the SDK client) would always POST to the hosted endpoint
-        # even when every other call is pointed at a local server.
-        conversations_url = (
-            os.environ.get("SUPERMEMORY_BASE_URL", "https://api.supermemory.ai").rstrip("/")
-            + "/v4/conversations"
-        )
+        # Follow the SDK client's resolved endpoint, including self-hosted URLs.
+        conversations_url = self._base_url.rstrip("/") + "/v4/conversations"
         req = urllib.request.Request(
             conversations_url,
             data=json.dumps(payload).encode("utf-8"),

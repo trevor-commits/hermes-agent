@@ -1681,7 +1681,10 @@ def classify_persistence_error(exc_or_str) -> str:
     text = str(exc_or_str).lower()
     if "turn lease" in text:
         return "turn_lease"
-    if "closed by compression" in text:
+    if (
+        "closed by compression" in text
+        or "closed by a continuation" in text
+    ):
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"

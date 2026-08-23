@@ -820,12 +820,17 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+        read_conn = db._get_read_conn()
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
+        if read_conn is not None:
             traced_connections.append(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
+        if read_conn is not None:
+            # _get_read_conn opens but does not track; return it to the pool so
+            # search_messages checks out the traced reader instead of opening
+            # an untraced second connection.
+            db._read_pool.put(read_conn)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)

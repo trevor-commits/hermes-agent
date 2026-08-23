@@ -756,13 +756,13 @@ class TestScalarModelSubKeyPreservation:
         import yaml
 
         set_config_value("model", "gpt-4o")
-        set_config_value("model.provider", "openai")
+        set_config_value("model.provider", "openai-codex")
 
         raw = _read_config(_isolated_hermes_home)
         parsed = yaml.safe_load(raw)
         model = parsed["model"]
         assert model["default"] == "gpt-4o", f"model.default lost: {model}"
-        assert model["provider"] == "openai"
+        assert model["provider"] == "openai-codex"
 
     def test_scalar_model_id_preserved_after_api_key_write(self, _isolated_hermes_home):
         """model.api_key must also preserve the existing scalar model id."""

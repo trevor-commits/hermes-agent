@@ -5387,6 +5387,26 @@ def _coerce_float(value: str):
     return f
 
 
+def _is_llm_provider_config_key(key: str) -> bool:
+    """Return whether a config leaf selects an inference provider."""
+    normalized = key.strip().lower()
+    if normalized in {
+        "provider",
+        "model.provider",
+        "fallback_model.provider",
+        "delegation.provider",
+        "cron.provider",
+        "source_card_worker.provider",
+    }:
+        return True
+    parts = normalized.split(".")
+    return bool(
+        parts
+        and parts[-1] == "provider"
+        and parts[0] in {"auxiliary", "moa"}
+    )
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5577,16 +5597,16 @@ def set_config_value(key: str, value: str, force: bool = False):
                 f"({value!r} -> {_inner!r})."
             )
             value = _inner
-    # Provider leaves must resolve at WRITE time, not at runtime inside a
-    # Telegram worker with no fallback. Reuses the canonical resolver (same
-    # aliases + registry + custom/openrouter handling the runtime uses).
-    # "auto" and "moa" are virtual sentinels handled downstream; --force
-    # bypasses for keys the running version doesn't know yet.
+    # Inference-provider leaves must resolve at WRITE time, not at runtime
+    # inside a worker with no fallback. Non-LLM provider namespaces (TTS,
+    # wake word, memory, etc.) use their own registries and must not be sent
+    # through the LLM resolver. "auto" and "moa" are virtual sentinels;
+    # --force bypasses for keys the running version does not know yet.
     if (
         isinstance(value, str)
         and value
         and not force
-        and key.strip().lower().rsplit(".", 1)[-1] == "provider"
+        and _is_llm_provider_config_key(key)
         and value.strip().lower() not in {"auto", "moa"}
     ):
         try:

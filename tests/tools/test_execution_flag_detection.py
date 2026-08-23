@@ -37,10 +37,28 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        ("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False),
+        pytest.param(
+            "sort",
+            ["--buffer-size=1K", "--compress-program", "-payload-marker"],
+            "{bulk}",
+            False,
+            marks=pytest.mark.linux_only,
+        ),
         ("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True),
-        ("man", ["--pager", "-payload-marker", "ls"], None, True),
-        ("man", ["-P", "-payload-marker", "ls"], None, True),
+        pytest.param(
+            "man",
+            ["--pager", "-payload-marker", "ls"],
+            None,
+            True,
+            marks=pytest.mark.linux_only,
+        ),
+        pytest.param(
+            "man",
+            ["-P", "-payload-marker", "ls"],
+            None,
+            True,
+            marks=pytest.mark.linux_only,
+        ),
     ],
 )
 def test_real_binaries_execute_leading_dash_program_payload(

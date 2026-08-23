@@ -5,9 +5,9 @@
 config.yaml. The double-quoted provider then failed resolve_provider() at
 runtime inside a Telegram source-card worker — where no fallback engages and
 no retry is started. set_config_value now (a) strips one layer of symmetric
-wrapping quotes from scalar string values, and (b) refuses to write a
-``*.provider`` leaf whose value the canonical resolver rejects, unless
-``--force``.
+wrapping quotes from scalar string values, and (b) refuses to write an
+inference-provider leaf whose value the canonical resolver rejects, unless
+``--force``. Non-LLM provider namespaces keep their own registry validation.
 """
 
 import pytest
@@ -78,9 +78,26 @@ def test_force_bypasses_provider_validation(scratch_home):
     assert data["auxiliary"]["compression"]["provider"] == "weird-future-provider"
 
 
+def test_fallback_model_provider_is_llm_validated(scratch_home):
+    from hermes_cli.config import set_config_value
+
+    with pytest.raises(SystemExit) as excinfo:
+        set_config_value("fallback_model.provider", "not-a-real-provider-xyz")
+    assert excinfo.value.code == 1
+    assert "fallback_model" not in _read(scratch_home)
+
+
 def test_virtual_sentinels_allowed(scratch_home):
     from hermes_cli.config import set_config_value
 
     set_config_value("auxiliary.compression.provider", "moa")
     data = _read(scratch_home)
     assert data["auxiliary"]["compression"]["provider"] == "moa"
+
+
+def test_non_llm_provider_leaf_skips_llm_validation(scratch_home):
+    from hermes_cli.config import set_config_value
+
+    set_config_value("tts.provider", "edge")
+    data = _read(scratch_home)
+    assert data["tts"]["provider"] == "edge"

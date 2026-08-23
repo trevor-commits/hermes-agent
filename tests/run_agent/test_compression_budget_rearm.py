@@ -114,6 +114,10 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     agent.tool_delay = 0
     agent.save_trajectories = False
     agent.max_compression_attempts = 1
+    # This test exercises budget re-arming, not the independent fail-closed
+    # ceiling. Keep the ceiling above the scripted 200-token pressure while
+    # leaving the compression trigger at 100.
+    setattr(agent, "_hard_ceiling_tokens", 1_000)
 
     compressor = MagicMock()
     compressor.protect_first_n = 3
@@ -194,6 +198,10 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
         patch(
             "agent.conversation_loop._estimate_tools_tokens_rough",
             return_value=0,
+        ),
+        patch(
+            "agent.conversation_loop._provider_request_tokens_rough",
+            return_value=10,
         ),
         patch.object(agent, "_compress_context", side_effect=_fake_compress),
         patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute_tool_calls),
