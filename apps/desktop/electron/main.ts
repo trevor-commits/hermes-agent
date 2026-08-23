@@ -218,7 +218,13 @@ import {
   registryGatewayWsUrl,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
-import { selectPoolEvictions } from './pool-eviction'
+import {
+  type PoolActivity,
+  type PoolBackendActivityEntry,
+  probeGatewayActivity,
+  selectSafeIdleReaps,
+  selectSafeLruEvictions
+} from './pool-activity'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -1310,7 +1316,11 @@ const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDL
 // concurrent multi-profile session keeps several backends "fresh" at once, and
 // killing one to honor the soft cap would abort a running agent.
 const POOL_KEEPALIVE_FRESH_MS = 90_000
+// Failed activity probes are uncertainty, not proof of idleness. Spare the
+// backend for one bounded idle window, then let later failures reap it.
+const POOL_ACTIVITY_UNCERTAIN_GRACE_MS = POOL_IDLE_MS
 let poolIdleReaper = null
+let poolIdleReapInFlight = false
 let backendOrphanReapPromise = null
 // Auto-reload budget for renderer crashes, shared by EVERY window (primary,
 // secondary session, instance) so a crash loop anywhere is suppressed after
@@ -9936,7 +9946,7 @@ async function ensureBackend(profile) {
     return connection
   }
 
-  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+  await evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
   const entry = {
     process: null,
@@ -10025,7 +10035,7 @@ async function ensureRegistryBackend(connectionId, profile) {
       return existingLocal.connectionPromise
     }
 
-    evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+    await evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
     const localEntry = {
       process: null,
@@ -10069,7 +10079,7 @@ async function ensureRegistryBackend(connectionId, profile) {
     return existing.connectionPromise
   }
 
-  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+  await evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
   const entry = {
     process: null,
@@ -10220,12 +10230,84 @@ function touchPoolBackend(profile) {
 // across N registered remote connections LRU-evict a REAL local backend that
 // was merely idle past the keepalive window. Descriptors are still reclaimed
 // by the idle reaper.
-function evictLruPoolBackends(keep) {
-  const evictions = selectPoolEvictions(backendPool.entries(), Math.max(0, keep), Date.now(), POOL_KEEPALIVE_FRESH_MS)
+interface PoolBackendProbeEntry extends PoolBackendActivityEntry {
+  port?: null | number
+  process?: null | { exitCode?: null | number; signalCode?: null | string }
+  token?: null | string
+}
+
+function probePoolBackendActivity(entry: PoolBackendProbeEntry): Promise<PoolActivity> {
+  const child = entry?.process
+
+  if (!child || child.exitCode != null || child.signalCode != null) {
+    return Promise.resolve('idle')
+  }
+
+  if (!Number.isInteger(entry.port) || typeof entry.token !== 'string' || !entry.token) {
+    return Promise.resolve('unknown')
+  }
+
+  const wsUrl = `ws://127.0.0.1:${entry.port}/api/ws?token=${encodeURIComponent(entry.token)}`
+
+  return probeGatewayActivity(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+}
+
+async function evictLruPoolBackends(keep: number) {
+  const snapshot = new Map(backendPool)
+
+  const evictions = await selectSafeLruEvictions(snapshot.entries(), {
+    freshMs: POOL_KEEPALIVE_FRESH_MS,
+    keep: Math.max(0, keep),
+    now: Date.now(),
+    probe: async (profile): Promise<PoolActivity> => {
+      const entry = snapshot.get(profile)
+
+      return entry && backendPool.get(profile) === entry ? probePoolBackendActivity(entry) : 'busy'
+    },
+    uncertainGraceMs: POOL_ACTIVITY_UNCERTAIN_GRACE_MS
+  })
 
   for (const profile of evictions) {
+    if (backendPool.get(profile) !== snapshot.get(profile)) {
+      continue
+    }
+
     rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${POOL_MAX_BACKENDS})`)
     stopPoolBackend(profile)
+  }
+}
+
+async function reapIdlePoolBackends() {
+  if (poolIdleReapInFlight) {
+    return
+  }
+
+  poolIdleReapInFlight = true
+
+  try {
+    const snapshot = new Map(backendPool)
+
+    const reaps = await selectSafeIdleReaps(snapshot.entries(), {
+      idleMs: POOL_IDLE_MS,
+      now: Date.now(),
+      probe: async (profile): Promise<PoolActivity> => {
+        const entry = snapshot.get(profile)
+
+        return entry && backendPool.get(profile) === entry ? probePoolBackendActivity(entry) : 'busy'
+      },
+      uncertainGraceMs: POOL_ACTIVITY_UNCERTAIN_GRACE_MS
+    })
+
+    for (const profile of reaps) {
+      if (backendPool.get(profile) !== snapshot.get(profile)) {
+        continue
+      }
+
+      rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
+      stopPoolBackend(profile)
+    }
+  } finally {
+    poolIdleReapInFlight = false
   }
 }
 
@@ -10235,14 +10317,9 @@ function startPoolIdleReaper() {
   }
 
   poolIdleReaper = setInterval(() => {
-    const now = Date.now()
-
-    for (const [profile, entry] of [...backendPool.entries()]) {
-      if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
-        rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
-        stopPoolBackend(profile)
-      }
-    }
+    void reapIdlePoolBackends().catch(error => {
+      rememberLog(`Profile backend idle activity probe failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
 
     if (backendPool.size === 0 && poolIdleReaper) {
       clearInterval(poolIdleReaper)
