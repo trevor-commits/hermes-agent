@@ -241,7 +241,7 @@ def test_bedrock_bearer_token_counts_as_explicit(tmp_path, monkeypatch, _clean_a
 def test_bedrock_access_key_pair_counts_as_explicit(tmp_path, monkeypatch, _clean_aws_env):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE1234567890")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "TEST_ACCESS_KEY_ID")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "examplesecretexamplesecretexample0000000")
 
     from hermes_cli.auth import is_provider_explicitly_configured
@@ -252,7 +252,7 @@ def test_bedrock_access_key_without_secret_is_not_explicit(tmp_path, monkeypatch
     """A lone AWS_ACCESS_KEY_ID can't authenticate anything — require the pair."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE1234567890")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "TEST_ACCESS_KEY_ID")
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("bedrock") is False
