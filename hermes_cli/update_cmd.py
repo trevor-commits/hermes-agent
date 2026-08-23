@@ -5064,6 +5064,62 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _sibling_launchd_restart_wait_budget(label: str, fallback: float) -> float | None:
+    """Return a sibling gateway's promised SIGUSR1 drain window.
+
+    A fleet update may be invoked from a profile with a short (or zero) restart
+    timeout while a sibling is already draining active work under a longer
+    ``restart_after_turn_timeout``.  Passing the invoker's cap to that sibling
+    would turn its accepted graceful drain into a premature ``kickstart -k``.
+    Read the target profile's committed config and never use a shorter window
+    than the caller already selected.  If its cap cannot be read, return
+    ``None`` so the caller leaves the live sibling running rather than risking
+    a premature hard restart.
+    """
+    root_label = "ai.hermes.gateway"
+    prefix = f"{root_label}-"
+    if label == root_label:
+        profile = "default"
+    elif label.startswith(prefix) and label[len(prefix):]:
+        profile = label[len(prefix):]
+    else:
+        return None
+
+    try:
+        from gateway.restart import (
+            parse_restart_after_turn_timeout,
+            parse_restart_drain_timeout,
+            resolve_restart_exit_wait_budget,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_home = get_profile_dir(profile)
+        home_token = set_hermes_home_override(str(profile_home))
+        try:
+            config = load_config_readonly()
+        finally:
+            reset_hermes_home_override(home_token)
+        agent = config.get("agent", {}) if isinstance(config, dict) else {}
+        if not isinstance(agent, dict):
+            return None
+        sibling_budget = resolve_restart_exit_wait_budget(
+            parse_restart_drain_timeout(agent.get("restart_drain_timeout")),
+            parse_restart_after_turn_timeout(
+                agent.get("restart_after_turn_timeout")
+            ),
+        )
+        return max(float(fallback), float(sibling_budget))
+    except Exception:
+        # A custom cap might be larger than every available fallback.  Do not
+        # force-kick a live sibling until its promise can be established.
+        return None
+
+
 def _restart_macos_launchd_gateways(
     restarted_services: list,
     failed_or_stale_units: list,
@@ -5158,9 +5214,22 @@ def _restart_macos_launchd_gateways(
                 continue
             graceful_ok = False
             if old_pid is not None and old_pid > 0:
-                print(f"  → {label}: draining (up to {int(drain_budget)}s)...")
+                sibling_drain_budget = _sibling_launchd_restart_wait_budget(
+                    label, drain_budget
+                )
+                if sibling_drain_budget is None:
+                    failed_or_stale_units.append(label)
+                    print(
+                        f"  ⚠ {label}: could not confirm its drain cap; "
+                        "leaving the live gateway undisturbed"
+                    )
+                    continue
+                print(
+                    f"  → {label}: draining "
+                    f"(up to {int(sibling_drain_budget)}s)..."
+                )
                 graceful_ok = _graceful_restart_via_sigusr1(
-                    old_pid, drain_timeout=drain_budget
+                    old_pid, drain_timeout=sibling_drain_budget
                 )
             if graceful_ok and _wait_for_launchd_service_pid(
                 label, old_pid=old_pid, timeout=10.0, domain=domain

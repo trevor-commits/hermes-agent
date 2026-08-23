@@ -28,6 +28,7 @@ import pytest
 
 import hermes_cli.gateway as gw
 import hermes_cli.profiles
+import hermes_cli.update_cmd as update_cmd
 from hermes_cli.gateway import (
     _locate_launchd_gateway_service,
     _parse_launchd_pid_from_print_output,
@@ -294,7 +295,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     from types import SimpleNamespace
 
     rec = SimpleNamespace(
-        kickstarts=[], drains=[], current_restarts=[], waits=[],
+        kickstarts=[], drains=[], drain_timeouts=[], current_restarts=[], waits=[],
         locates=[], registered_checks=[],
     )
 
@@ -321,17 +322,23 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
         )
 
     monkeypatch.setattr(gw, "get_launchd_label", lambda: current)
+    monkeypatch.setattr(
+        update_cmd,
+        "_sibling_launchd_restart_wait_budget",
+        lambda label, fallback: fallback,
+    )
     monkeypatch.setattr(gw, "get_system_launchd_gateway_plist_path", lambda: tmp_path / "no-system.plist")
     monkeypatch.setattr(gw, "_system_daemon_install_matches", lambda: False)
     monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: list(labels))
     monkeypatch.setattr(gw, "_locate_launchd_gateway_service", fake_locate)
     monkeypatch.setattr(gw, "_launchd_service_registered", fake_registered)
-    monkeypatch.setattr(
-        gw,
-        "_graceful_restart_via_sigusr1",
-        lambda pid, drain_timeout: (rec.drains.append(pid), (drain_results or {}).get(pid, False))[1],
-    )
+    def fake_graceful(pid, drain_timeout):
+        rec.drains.append(pid)
+        rec.drain_timeouts.append((pid, drain_timeout))
+        return (drain_results or {}).get(pid, False)
+
+    monkeypatch.setattr(gw, "_graceful_restart_via_sigusr1", fake_graceful)
 
     def fake_kickstart(label, domain):
         err = (kick_errors or {}).get(label)
@@ -408,6 +415,120 @@ class TestRestartMacosLaunchdGateways:
         assert failed == []
         # Siblings were drained before the hard kickstart.
         assert set(rec.drains) == {100, 300}
+
+    def test_sibling_restart_wait_budget_reads_target_profile_cap(
+        self, monkeypatch, tmp_path
+    ):
+        """A sibling's config, not the update invoker's, sets its drain cap."""
+        import hermes_cli.config as config
+        import hermes_constants
+
+        profile_names = []
+        overrides = []
+        resets = []
+        token = object()
+        monkeypatch.setattr(
+            hermes_cli.profiles,
+            "get_profile_dir",
+            lambda name: (profile_names.append(name), tmp_path / name)[1],
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "set_hermes_home_override",
+            lambda home: (overrides.append(home), token)[1],
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "reset_hermes_home_override",
+            lambda passed: resets.append(passed),
+        )
+        monkeypatch.setattr(
+            config,
+            "load_config_readonly",
+            lambda: {
+                "agent": {
+                    "restart_drain_timeout": 0,
+                    "restart_after_turn_timeout": 2700,
+                }
+            },
+        )
+
+        assert update_cmd._sibling_launchd_restart_wait_budget(
+            "ai.hermes.gateway-supervisor", 30.0
+        ) == 2715.0
+        assert profile_names == ["supervisor"]
+        assert overrides == [str(tmp_path / "supervisor")]
+        assert resets == [token]
+
+    def test_unrecognized_sibling_label_has_no_force_restart_cap(self):
+        assert (
+            update_cmd._sibling_launchd_restart_wait_budget(
+                "com.example.unmanaged", 30.0
+            )
+            is None
+        )
+
+    def test_unreadable_sibling_cap_leaves_live_gateway_undisturbed(
+        self, monkeypatch, tmp_path
+    ):
+        """If the promised cap cannot be established, fail closed—never kick."""
+        sibling = "ai.hermes.gateway-supervisor"
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway", sibling],
+            located={sibling: (f"gui/{UID}", 74006)},
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_sibling_launchd_restart_wait_budget",
+            lambda label, fallback: None,
+            raising=False,
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=30.0)
+
+        assert rec.drains == []
+        assert rec.kickstarts == []
+        assert restarted == []
+        assert failed == [sibling]
+
+    def test_sibling_defers_hard_kickstart_until_its_own_drain_cap(
+        self, monkeypatch, tmp_path
+    ):
+        """An active sibling may promise a longer drain than the invoker.
+
+        A false graceful result represents SIGUSR1 being accepted but the
+        gateway still draining active work.  The eventual hard kick is allowed
+        only after the sibling's promised cap has been waited out.
+        """
+        sibling = "ai.hermes.gateway-supervisor"
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway", sibling],
+            located={sibling: (f"gui/{UID}", 74006)},
+            drain_results={74006: False},
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_sibling_launchd_restart_wait_budget",
+            lambda label, fallback: 1800.0,
+            raising=False,
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=30.0)
+
+        assert rec.drain_timeouts == [(74006, 1800.0)]
+        assert rec.kickstarts == [f"gui/{UID}/{sibling}"]
+        assert restarted == [sibling]
+        assert failed == []
 
     def test_current_profile_without_plist_makes_no_launchctl_calls(
         self, monkeypatch, tmp_path
