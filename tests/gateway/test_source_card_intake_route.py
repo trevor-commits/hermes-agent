@@ -1589,7 +1589,7 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
     assert _source_card_github_prefetch_bound_note([]) == ""
 
 
-def test_worker_failure_explains_safe_single_resend():
+def test_worker_failure_preserves_terminal_reconciliation_contract():
     from gateway.run import _format_direct_source_card_completion
 
     message = _format_direct_source_card_completion(
@@ -1599,9 +1599,9 @@ def test_worker_failure_explains_safe_single_resend():
         }
     )
 
-    assert "Automatic retry is disabled after worker dispatch" in message
-    assert "resend the URL once" in message
-    assert "duplicate check" in message
+    assert "No automatic retry was started" in message
+    assert "deterministic reconciliation" in message
+    assert "resend the URL" not in message
 
 
 def test_receipt_failure_reports_the_already_contained_card(tmp_path):
