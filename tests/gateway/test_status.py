@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -13,6 +14,23 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    def test_identity_write_keeps_test_home_when_environment_is_cleared(
+        self, tmp_path, monkeypatch
+    ):
+        """A clear=True test env must not fall back to the developer home."""
+        isolated_home = Path(os.environ["HERMES_HOME"])
+        fallback_home = tmp_path / "would-be-developer-home"
+        monkeypatch.setattr(Path, "home", lambda: fallback_home)
+
+        with patch.dict(os.environ, {}, clear=True):
+            status.write_runtime_status(
+                platform="feishu",
+                platform_state="connected",
+            )
+
+        assert (isolated_home / "gateway_state.json").exists()
+        assert not (fallback_home / ".hermes" / "gateway_state.json").exists()
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

@@ -139,10 +139,12 @@ def _get_process_hermes_home() -> Path:
     profile directory when a profile-context task happens to be active at write
     time.  See issue #56986.
     """
-    val = os.environ.get("HERMES_HOME", "").strip()
-    if val:
-        return Path(val)
-    return _get_platform_default_hermes_home()
+    # Resolve through the canonical helper instead of duplicating its fallback.
+    # Import lazily so the hermetic test fixture can preserve its process-home
+    # sandbox even when a test intentionally clears ``os.environ``.
+    from hermes_constants import get_process_hermes_home
+
+    return get_process_hermes_home()
 
 
 def _canonical_hermes_home(path: Path | str) -> Path:

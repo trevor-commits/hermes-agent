@@ -450,7 +450,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
+    Also redirects Hermes state resolution to per-test tempdirs so code that
     reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
     datetime/locale-sensitive tests are deterministic.
     """
@@ -492,6 +492,25 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # hermes_state's live-DB guard stays armed in them even when the test
     # strips pytest's own PYTEST_* vars from the child env.
     monkeypatch.setenv("HERMES_TEST_ISOLATION", str(fake_hermes_home))
+    # Some adapter tests intentionally use ``patch.dict(..., clear=True)`` to
+    # prove behavior with a minimal process environment. Keep process-scoped
+    # gateway identity writes inside this test's sandbox even while that
+    # context has removed HERMES_HOME and HERMES_TEST_ISOLATION. An explicit
+    # HERMES_HOME set by a test still wins through the canonical resolver.
+    import hermes_constants as _hermes_constants
+
+    _process_home = _hermes_constants.get_process_hermes_home
+
+    def _test_process_home():
+        if os.environ.get("HERMES_HOME", "").strip():
+            return _process_home()
+        return fake_hermes_home
+
+    monkeypatch.setattr(
+        _hermes_constants,
+        "get_process_hermes_home",
+        _test_process_home,
+    )
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
