@@ -2635,25 +2635,27 @@ class ContextCompressor(ContextEngine):
     ) -> None:
         """Record one completed boundary and its summary quality.
 
-        ``feasibility_skip=True`` marks a deliberate pre-LLM skip (#60451):
-        the boundary is streak-NEUTRAL for ``_fallback_compression_streak``
-        (neither incremented nor reset). It still arms the real-usage
-        effectiveness verdict (``_verify_compaction_cleared_threshold``) on
-        purpose — a skipped-summary drop that fails to clear the threshold is
-        exactly the incompressible-transcript case the ineffective-strike
-        breaker exists for, and its recovery probe bounds the block.
+        ``feasibility_skip=True`` marks a completed boundary without a
+        summary-quality verdict.  This includes a deliberate pre-LLM skip
+        (#60451) and replay-only reclaim.  The boundary is streak-NEUTRAL for
+        ``_fallback_compression_streak`` (neither incremented nor reset). It
+        still arms the real-usage effectiveness verdict
+        (``_verify_compaction_cleared_threshold``) on purpose — a no-summary
+        rewrite that fails to clear the threshold is exactly the
+        incompressible-transcript case the ineffective-strike breaker exists
+        for, and its recovery probe bounds the block.
         """
         self._verify_compaction_cleared_threshold = True
         if feasibility_skip:
-            # A deliberate pre-LLM feasibility skip (#60451) is not a
-            # summary-quality verdict: it must neither extend a fallback
-            # streak (two skips would otherwise latch the >= 2 breaker and
-            # disable compression entirely — including the cheap deterministic
-            # dropping the skip exists to reach) nor reset one (a skip proves
-            # nothing about the summary model's health).
+            # A no-summary boundary is not a summary-quality verdict: it must
+            # neither extend a fallback streak (two skips would otherwise latch
+            # the >= 2 breaker and disable compression entirely — including the
+            # cheap deterministic dropping the skip exists to reach) nor reset
+            # one (a skip or replay-only reclaim proves nothing about the
+            # summary model's health).
             if not self.quiet_mode:
                 logger.info(
-                    "Compaction completed via pre-LLM feasibility skip; "
+                    "Compaction completed without a summary-quality verdict; "
                     "fallback_compression_streak unchanged (%d)",
                     self._fallback_compression_streak,
                 )
@@ -7252,6 +7254,35 @@ This compaction should PRIORITISE preserving all information related to the focu
         telemetry = self._begin_compression_telemetry(current_tokens=current_tokens)
         telemetry["chunk_count"] = 0
 
+        def _prune_replay_without_summary() -> int:
+            """Reclaim prior-turn Responses sidecars on summary no-op paths."""
+            before = estimate_messages_tokens_rough(messages)
+            pruned = _prune_stale_reasoning_replay(messages)
+            if not pruned:
+                return 0
+            _strip_persistence_markers(messages)
+            after = estimate_messages_tokens_rough(messages)
+            saved = max(0, before - after)
+            self._last_compression_savings_pct = (
+                saved / before * 100 if before > 0 else 0.0
+            )
+            self._last_compression_made_progress = True
+            # record_completed_compaction() must treat this boundary as
+            # summary-quality-neutral.  Replay pruning observes no summary
+            # provider result, so it may neither reset nor extend a durable
+            # fallback streak.
+            self._last_feasibility_skip = True
+            telemetry["stale_replay_pruned_messages"] = pruned
+            telemetry["summary_quality_neutral"] = "stale_replay_prune"
+            if not self.quiet_mode:
+                logger.info(
+                    "Pruned stale replay items from %d assistant message(s) "
+                    "without summary compression (~%d tokens saved)",
+                    pruned,
+                    saved,
+                )
+            return pruned
+
         # Manual /compress (force=True) bypasses the failure cooldown so the
         # user can retry immediately after an auto-compress abort.  Without
         # this, /compress would silently no-op for 30-60s after a failure.
@@ -7268,18 +7299,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             # threshold because of the incompressible floor (system prompt +
             # tool schemas), every subsequent turn re-fires a compaction that
             # returns here unchanged, and the CLI appears frozen.
-            self._record_ineffective_compression_verdict(
-                self._ineffective_compression_count + 1,
-            )
-            self._last_compression_savings_pct = 0.0
-            telemetry["failure_class"] = "insufficient_messages"
-            if not self.quiet_mode:
-                logger.warning(
-                    "Cannot compress: only %d messages (need > %d). "
-                    "ineffective_compression_count=%d",
-                    n_messages, _min_for_compress,
-                    self._ineffective_compression_count,
+            if not _prune_replay_without_summary():
+                self._record_ineffective_compression_verdict(
+                    self._ineffective_compression_count + 1,
                 )
+                self._last_compression_savings_pct = 0.0
+                telemetry["failure_class"] = "insufficient_messages"
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Cannot compress: only %d messages (need > %d). "
+                        "ineffective_compression_count=%d",
+                        n_messages, _min_for_compress,
+                        self._ineffective_compression_count,
+                    )
             return messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
@@ -7345,24 +7377,25 @@ This compaction should PRIORITISE preserving all information related to the focu
                 middle_messages=[],
                 tail_messages=messages[compress_end:],
             )
-            telemetry["failure_class"] = "no_compressible_window"
             # No compressable window — the entire transcript fits within
             # the tail budget (soft_ceiling).  Without recording this as
             # an ineffective compression the anti-thrashing guard in
             # should_compress() never fires and every subsequent turn
             # re-triggers a no-op compression loop.  (#40803)
-            self._record_ineffective_compression_verdict(
-                self._ineffective_compression_count + 1,
-            )
-            self._last_compression_savings_pct = 0.0
-            if not self.quiet_mode:
-                logger.warning(
-                    "Compression skipped: compress_start (%d) >= compress_end (%d) "
-                    "— transcript fits within tail budget, nothing to compress. "
-                    "ineffective_compression_count=%d",
-                    compress_start, compress_end,
-                    self._ineffective_compression_count,
+            if not _prune_replay_without_summary():
+                telemetry["failure_class"] = "no_compressible_window"
+                self._record_ineffective_compression_verdict(
+                    self._ineffective_compression_count + 1,
                 )
+                self._last_compression_savings_pct = 0.0
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression skipped: compress_start (%d) >= compress_end (%d) "
+                        "— transcript fits within tail budget, nothing to compress. "
+                        "ineffective_compression_count=%d",
+                        compress_start, compress_end,
+                        self._ineffective_compression_count,
+                    )
             return messages
 
         turns_to_summarize = messages[compress_start:compress_end]

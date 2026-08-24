@@ -103,6 +103,55 @@ class TestCompressNoOpRegistersIneffective:
             "should_compress should return False after 2+ ineffective compressions"
         )
 
+    def test_no_window_prunes_stale_responses_replay(self):
+        """A summary no-op can still reclaim prior-turn Responses sidecars."""
+        comp = _make_compressor(
+            summary_target_ratio=0.45,
+            config_context_length=96000,
+        )
+        messages = _build_session(10, words_per_turn=10)
+        checkpoint = {"type": "compaction", "encrypted_content": "checkpoint"}
+        stale = [checkpoint, {"type": "reasoning", "encrypted_content": "old" * 10_000}]
+        active = [{"type": "reasoning", "encrypted_content": "current"}]
+        messages[2]["codex_reasoning_items"] = stale
+        messages[-1]["codex_reasoning_items"] = active
+        for message in messages:
+            message["_db_persisted"] = True
+        comp._fallback_compression_streak = 1
+        comp.last_prompt_tokens = 73_000
+        comp._find_tail_cut_by_tokens = lambda msgs, he: he
+
+        result = comp.compress(messages, current_tokens=73_000)
+
+        assert result[2]["codex_reasoning_items"] == [checkpoint]
+        assert result[-1]["codex_reasoning_items"] == active
+        assert all("_db_persisted" not in message for message in result)
+        assert comp._last_compression_made_progress is True
+        assert comp._last_feasibility_skip is True
+        assert comp._ineffective_compression_count == 0
+        comp.record_completed_compaction(
+            used_fallback=comp._last_summary_fallback_used,
+            feasibility_skip=comp._last_feasibility_skip,
+        )
+        assert comp._fallback_compression_streak == 1
+
+    def test_short_transcript_prunes_stale_responses_replay(self):
+        """The insufficient-message exit has the same reclaim opportunity."""
+        comp = _make_compressor(config_context_length=96000)
+        messages = _build_session(2, words_per_turn=10)
+        stale = [{"type": "reasoning", "encrypted_content": "old" * 10_000}]
+        active = [{"type": "reasoning", "encrypted_content": "current"}]
+        messages[2]["codex_reasoning_items"] = stale
+        messages[-1]["codex_reasoning_items"] = active
+        comp.last_prompt_tokens = 73_000
+
+        result = comp.compress(messages, current_tokens=73_000)
+
+        assert "codex_reasoning_items" not in result[2]
+        assert result[-1]["codex_reasoning_items"] == active
+        assert comp._last_compression_made_progress is True
+        assert comp._ineffective_compression_count == 0
+
 
 
 # ---------------------------------------------------------------------------
