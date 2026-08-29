@@ -161,6 +161,7 @@ def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
     )
     base, implicit = agent._resolved_api_call_stale_timeout_base()
     assert base == 90.0
+    assert implicit is True
 
 
 def test_gpt56_terra_floor_reaches_non_stream_base(monkeypatch, tmp_path):
@@ -181,7 +182,6 @@ def test_gpt56_terra_floor_reaches_non_stream_base(monkeypatch, tmp_path):
     base, implicit = agent._resolved_api_call_stale_timeout_base()
     assert base == 300.0
     assert implicit is False, "a reasoning floor must not count as implicit"
-    assert implicit is True
 
 
 # ── stream-side mirror (the real builder lives in a worker thread) ────────
