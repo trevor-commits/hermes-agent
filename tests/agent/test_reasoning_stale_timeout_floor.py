@@ -161,6 +161,26 @@ def test_non_reasoning_model_keeps_default(monkeypatch, tmp_path):
     )
     base, implicit = agent._resolved_api_call_stale_timeout_base()
     assert base == 90.0
+
+
+def test_gpt56_terra_floor_reaches_non_stream_base(monkeypatch, tmp_path):
+    """The terra floor must flow through the non-stream base resolution.
+
+    This is the exact path the source-card worker's non-streaming Codex
+    calls resolve through; without the floor they were killed at 90s.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    import run_agent
+    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+
+    agent = _make_agent(tmp_path, model="gpt-5.6-terra")
+    base, implicit = agent._resolved_api_call_stale_timeout_base()
+    assert base == 300.0
+    assert implicit is False, "a reasoning floor must not count as implicit"
     assert implicit is True
 
 
