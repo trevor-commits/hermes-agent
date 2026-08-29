@@ -99,6 +99,17 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("o3-pro", 600),
     ("o3-mini", 300),
     ("o4-mini", 300),
+    # OpenAI gpt-5.6 "terra" — the deep-reasoning member of the gpt-5.6
+    # family on the ChatGPT Codex backend (codex_responses internal
+    # streaming).  Live evidence 2026-08-23..28: every long-form worker
+    # request (source-card drafts asking for 8-15K output tokens) emitted
+    # no events for >90s during the thinking phase, so the default 90s
+    # stale detector killed attempts 1 AND 2 of every run (ReadError /
+    # broken pipe after the forced close) before the fallback provider
+    # engaged.  Short cron calls on the same model (first event <90s)
+    # succeed, which is why only long-form workers were dying.
+    # gpt-5.6-sol / gpt-5.6-luna emit events quickly and need no floor.
+    ("gpt-5.6-terra", 300),
     # Anthropic Claude 4.x thinking variants.  Anchored at
     # ``claude-opus-4`` so non-thinking Claude 3.x or future
     # non-reasoning Claude variants don't match.

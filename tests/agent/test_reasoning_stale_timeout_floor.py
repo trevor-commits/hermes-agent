@@ -85,6 +85,9 @@ import pytest
     ("x-ai/grok-4.5", 300.0),
     ("x-ai/grok-4.6", 300.0),
     ("x-ai/grok-4-fast-non-reasoning", 180.0),
+    # OpenAI gpt-5.6 terra — deep-reasoning gpt-5.6 on the Codex backend.
+    ("gpt-5.6-terra", 300.0),
+    ("openai/gpt-5.6-terra", 300.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
@@ -93,6 +96,14 @@ def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
         f"{expected}; bare substrings and shared prefixes must not "
         f"over-match community derivatives."
     )
+
+
+def test_gpt56_fast_variants_get_no_floor():
+    """Only terra floors in the gpt-5.6 family; sol/luna answer quickly."""
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    assert get_reasoning_stale_timeout_floor("gpt-5.6-sol") is None
+    assert get_reasoning_stale_timeout_floor("gpt-5.6-luna") is None
+    assert get_reasoning_stale_timeout_floor("gpt-5.6") is None
 
 
 
