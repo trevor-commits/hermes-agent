@@ -5962,6 +5962,18 @@ def _source_card_fields_and_manifest(
         flags=re.MULTILINE | re.DOTALL,
     )
     if manifest is None:
+        if "## Decision manifest (ER-278)" not in text:
+            # Legacy card: 1,988 of the 2,073 cards on origin/main predate the
+            # ER-278 manifest requirement entirely.  Re-submitting such a
+            # source direct-lands the existing card with no model turn, and a
+            # hard failure here made every one of those re-submissions die in
+            # seconds (observed 2026-08-22, two intakes).  A wholly absent
+            # manifest on an already-landed card is legacy data, not a
+            # malformed authoring attempt — record an explicit no-decision
+            # receipt instead of failing.  A PRESENT-but-unparseable manifest
+            # still fails below, and new worker drafts are separately required
+            # to contain exactly one manifest before this code runs.
+            return fields, [], "legacy-card-predates-er278"
         raise _SourceCardLandingError("receipt", "card decision manifest is malformed")
     decision_keys: list[str] = []
     no_decision_reason: Optional[str] = None
@@ -6196,7 +6208,11 @@ def _source_card_isolated_landing_repository(repository: Path):
                 str(checkout),
             ],
             cwd=repository,
-            timeout=120,
+            # 300s, not 120s: the shallow clone pulls ~40 MiB from GitHub and
+            # timed out at 120s on 2026-08-28 during a degraded-network window
+            # (same window flapped Telegram polling), killing an otherwise
+            # finished card at the landing step.
+            timeout=300,
         )
         for key, value in identity.items():
             _source_card_run_step(

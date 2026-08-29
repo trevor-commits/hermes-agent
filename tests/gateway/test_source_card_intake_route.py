@@ -1687,6 +1687,48 @@ def test_receipt_preflight_rejects_a_decision_key_without_exact_card_filename(
         _source_card_fields_and_manifest(card)
 
 
+def test_receipt_preflight_accepts_a_legacy_card_without_any_manifest(tmp_path):
+    """A card wholly predating ER-278 direct-lands with a no-decision receipt.
+
+    1,988 of 2,073 landed cards have no manifest at all; re-submitting one of
+    those sources must not die in the receipt preflight (observed 2026-08-22).
+    """
+    from gateway.run import _source_card_fields_and_manifest
+
+    card = tmp_path / "legacy-card.md"
+    card.write_text(
+        "# Legacy\n\n"
+        "- url: https://example.com\n"
+        "- owner/name: example/legacy\n",
+        encoding="utf-8",
+    )
+    fields, decision_keys, no_decision_reason = _source_card_fields_and_manifest(
+        card
+    )
+    assert decision_keys == []
+    assert no_decision_reason == "legacy-card-predates-er278"
+    assert fields["url"] == "https://example.com"
+
+
+def test_receipt_preflight_still_rejects_a_present_but_unparseable_manifest(
+    tmp_path,
+):
+    """The legacy escape covers only a wholly absent manifest heading."""
+    from gateway.run import _SourceCardLandingError, _source_card_fields_and_manifest
+
+    card = tmp_path / "broken-card.md"
+    # Heading present at EOF without a trailing newline: the section regex
+    # cannot match, and the legacy escape must NOT swallow it.
+    card.write_text(
+        "# Broken\n\n"
+        "- url: https://example.com\n\n"
+        "## Decision manifest (ER-278)",
+        encoding="utf-8",
+    )
+    with pytest.raises(_SourceCardLandingError, match="manifest is malformed"):
+        _source_card_fields_and_manifest(card)
+
+
 def test_landing_rejects_an_invalid_decision_key_before_push(tmp_path):
     from gateway.run import _SourceCardLandingError, _land_source_card
 
