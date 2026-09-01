@@ -735,6 +735,96 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
+# ── Live gateway_state.json write guard ─────────────────────────────────────
+# Sibling of the kanban guard above, for the gateway runtime receipt.
+#
+# On 2026-09-01 a candidate gate's ``tests/gateway/test_feishu.py`` overwrote
+# the operator's live ``gateway_state.json`` with a pytest PID and argv. The
+# ensure/watchdog pair then matched a dead PID, and the only alerting path
+# that reaches Trevor's phone stayed degraded until a gateway restart. It was
+# the second occurrence of this class.
+#
+# The mechanism defeats every environment-based protection: that file uses
+# ``@patch.dict(os.environ, {}, clear=True)``, which empties HOME and
+# HERMES_HOME together for the test body. ``gateway.status`` then falls back
+# to ``Path.home() / ".hermes"``, and with HOME gone CPython resolves
+# ``Path.home()`` from the passwd database — straight back to the real home.
+# So the deny-list root MUST come from ``pwd``, not from ``$HOME`` and not
+# from any HERMES_* variable: a cleared environment cannot change the passwd
+# entry, and (unlike ``Path.home()``) it is also immune to the scratch HOME
+# the keeper worker legitimately sets for candidate gates.
+
+
+def _capture_real_account_hermes_root() -> Path | None:
+    """Resolve ``~/.hermes`` for the REAL account, ignoring the environment."""
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:  # non-POSIX, or no passwd entry
+        return None
+    if not home:
+        return None
+    try:
+        return (Path(home) / ".hermes").resolve()
+    except OSError:
+        return None
+
+
+_REAL_ACCOUNT_HERMES_ROOT = _capture_real_account_hermes_root()
+
+
+@pytest.fixture(autouse=True)
+def _gateway_status_write_guard(_hermetic_environment, monkeypatch):
+    """Fail-closed guard: refuse runtime-status writes to the REAL root.
+
+    Deny-list, like the kanban guard: only a resolved path under the real
+    account's ``~/.hermes`` is refused, so hermetic tests writing into
+    tempdirs are untouched.
+
+    Patches only when ``gateway.status`` is *already imported* (a
+    ``sys.modules`` probe, never an import) so the guard cannot drag the
+    gateway into unrelated test processes. Every production caller in
+    ``gateway/run.py`` and ``gateway/platforms/base.py`` imports
+    ``write_runtime_status`` lazily inside the calling function, so patching
+    the module attribute is seen by all of them.
+    """
+    if _REAL_ACCOUNT_HERMES_ROOT is None:
+        return
+    _status = sys.modules.get("gateway.status")
+    if _status is None:
+        return
+    # A sys.modules probe can observe a module mid-import; a half-imported
+    # module has no callers yet, so there is nothing to guard this round.
+    _orig_write = getattr(_status, "write_runtime_status", None)
+    if _orig_write is None:
+        return
+
+    def _guarded_write_runtime_status(**kwargs):
+        try:
+            resolved = _status._get_runtime_status_path().expanduser().resolve()
+        except Exception:
+            # Path resolution itself failed: nothing was written, and the
+            # original call is entitled to raise its own error.
+            return _orig_write(**kwargs)
+        try:
+            resolved.relative_to(_REAL_ACCOUNT_HERMES_ROOT)
+        except ValueError:
+            return _orig_write(**kwargs)  # not under the real root — safe
+        raise RuntimeError(
+            "gateway_status_write_guard: runtime status path resolved to "
+            f"{resolved}, which is under the REAL Hermes root "
+            f"({_REAL_ACCOUNT_HERMES_ROOT}). Hermetic isolation has been "
+            "bypassed — refusing to overwrite the live gateway receipt. "
+            "A cleared os.environ (patch.dict(..., clear=True)) drops HOME "
+            "and HERMES_HOME together and reaches the real home via pwd."
+        )
+
+    monkeypatch.setattr(
+        _status, "write_runtime_status", _guarded_write_runtime_status
+    )
+
+
 # ── Live state.db write guard ───────────────────────────────────────────────
 # Companion to the kanban guard above, for the MAIN state database.
 # ``hermes_state._ensure_test_isolation`` (the single choke point every
