@@ -47,49 +47,52 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
   return null
 }
 
-export type UpdateClearanceOutcome = 'clear' | 'finished' | 'timeout'
+export type UpdateClearanceOutcome = 'clear' | 'finished'
 
 export interface WaitForUpdateClearanceOptions {
-  timeoutMs: number
   pollMs: number
   /** Invoked once per poll while parked (boot progress / logging). */
   onWaitTick?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
-  now?: () => number
+  /** Existing app shutdown state; cancellation must never permit a spawn. */
+  isCancelled?: () => boolean
   sleep?: (ms: number) => Promise<void>
 }
 
 /**
- * Park until no update signal remains, or the deadline passes.
+ * Park until no update signal remains. App shutdown cancels the pending start.
  *
  * Returns 'clear' when the gate was already open (no wait happened),
- * 'finished' when it opened during the wait, and 'timeout' when the deadline
- * expired with the gate still closed (callers proceed anyway — matching the
- * long-standing marker-gate behavior, since a wedged updater must not brick
- * the app forever).
+ * 'finished' when it opened during the wait. Elapsed time never authorizes
+ * starting a backend against a checkout an updater may still be mutating.
+ * onWaitTick keeps the existing boot-progress UI responsive during long runs.
  */
 export async function waitForUpdateClearance(
   deps: UpdateGateDeps,
   options: WaitForUpdateClearanceOptions
 ): Promise<UpdateClearanceOutcome> {
-  const now = options.now || Date.now
   const sleep = options.sleep || (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const checkCancellation = () => {
+    if (options.isCancelled?.()) {
+      throw new Error('Backend startup cancelled because Hermes is shutting down.')
+    }
+  }
 
+  checkCancellation()
   let reason = updateGateReason(deps)
 
   if (!reason) {
     return 'clear'
   }
 
-  const deadline = now() + options.timeoutMs
-
-  while (reason && now() < deadline) {
+  while (reason) {
     if (options.onWaitTick) {
       await options.onWaitTick(reason)
     }
 
     await sleep(options.pollMs)
+    checkCancellation()
     reason = updateGateReason(deps)
   }
 
-  return reason ? 'timeout' : 'finished'
+  return 'finished'
 }

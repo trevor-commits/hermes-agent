@@ -17,16 +17,17 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 ``git checkout`` could mutate the same checkout concurrently, rewriting source
 under a live interpreter and leaving the tree half-updated.
 
-This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. Format and location are
-unchanged and remain byte-compatible with the Rust and Electron readers:
+Native marker reads, claims, and releases use the existing ``.mutex`` sidecar
+to serialize their transactions. Other writers must honor that same mutex to
+participate; shared marker bytes alone do not establish cross-entrypoint
+atomicity. Format and location remain compatible with Rust and Electron:
 
     <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+A marker remains protected while its pid is alive or cannot be inspected.
+Elapsed time is diagnostic: a slow build can still mutate the checkout after
+twenty minutes. A dead owner's marker is removed on read only while holding
+the sidecar mutex.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -51,18 +52,14 @@ Two mechanisms recognize the orchestrating parent, and either suffices:
 from __future__ import annotations
 
 import logging
+import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
-# apps/desktop/electron/update-marker.ts — the same marker is read by both, and
-# a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
-UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
 
@@ -96,29 +93,32 @@ def update_marker_path() -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True when a process with ``pid`` currently exists.
+    """Protect a positive pid unless the process is confirmed dead.
 
-    Delegates to :func:`gateway.status._pid_exists`, the project's existing
-    no-kill probe. Do NOT hand-roll this with ``os.kill(pid, 0)``: on Windows
+    Uses the existing psutil dependency for a cross-platform no-kill probe.
+    Do NOT hand-roll this with ``os.kill(pid, 0)``: on Windows
     that is not a no-op — CPython routes ``sig=0`` to
     ``GenerateConsoleCtrlEvent``, which Ctrl+C's the target's whole console
     process group (bpo-14484). A liveness check that killed the updater it was
     asking about would be a spectacular way to fix a concurrency bug.
 
-    Any pid we cannot evaluate counts as dead: a corrupt marker must not wedge
-    the lock forever.
+    Missing probe support or denied access cannot authorize another writer.
+    Unlike gateway discovery, update ownership must fail closed on uncertainty.
     """
     if pid <= 0:
         return False
     try:
-        from gateway.status import _pid_exists
-
-        return bool(_pid_exists(pid))
+        import psutil
     except Exception as exc:
-        # Import failure or an unusable pid (e.g. larger than the platform's
-        # pid_t). Treat the marker as stale rather than blocking updates.
-        logger.debug("Could not probe pid %s: %s", pid, exc)
+        logger.debug("Could not load pid probe: %s", exc)
+        return True
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, OverflowError):
         return False
+    except Exception as exc:
+        logger.debug("Could not probe pid %s: %s", pid, exc)
+        return True
 
 
 def _handoff_pid() -> int | None:
@@ -162,25 +162,53 @@ def _is_ancestor_pid(pid: int) -> bool:
 
 @dataclass(frozen=True)
 class UpdateHolder:
-    """A confirmed-live update currently holding the lock."""
+    """An update owner that has not been confirmed dead."""
 
     pid: int
-    age_seconds: float
+    age_seconds: float | None
 
 
-def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
-    """Return the live update holding the lock, or ``None``.
+class _MarkerMutex:
+    """Serialize marker transactions on the existing, persistent sidecar.
 
-    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    Never unlink this file: replacing its inode would allow two processes to
+    hold different locks for the same marker. Failure to lock is a refusal,
+    including unsupported storage or an unavailable locking implementation.
     """
-    marker = path or update_marker_path()
+
+    def __init__(self, marker: Path) -> None:
+        self.path = marker.with_name(marker.name + ".mutex")
+        self.acquired = False
+        self.handle = None
+        self._release = None
+
+    def __enter__(self) -> "_MarkerMutex":
+        try:
+            from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = self.path.open("a+", encoding="utf-8")
+            self._release = _release_file_lock
+            self.acquired = _try_acquire_file_lock(self.handle)
+        except Exception as exc:
+            logger.debug("Could not lock update marker %s: %s", self.path, exc)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self.handle is not None:
+            try:
+                if self.acquired:
+                    self._release(self.handle)
+            finally:
+                self.handle.close()
+
+
+def _read_live_update(marker: Path, *, cleanup_stale: bool) -> UpdateHolder | None:
+    """Read the marker; deletion requires the caller to hold its mutex."""
     try:
         raw = marker.read_text(encoding="utf-8")
-    except OSError:
-        return None  # absent or unreadable => no live update
+    except FileNotFoundError:
+        return None
 
     lines = raw.splitlines()
     try:
@@ -190,26 +218,52 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     try:
         started_at = float(lines[1].strip())
     except (IndexError, ValueError):
-        started_at = float("-inf")
+        started_at = float("nan")
 
-    age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+    age = max(0, time.time() - started_at) if math.isfinite(started_at) else None
+    if not _pid_alive(pid):
+        if cleanup_stale:
+            marker.unlink(missing_ok=True)
         return None
 
     return UpdateHolder(pid=pid, age_seconds=age)
 
 
-def describe_holder(holder: UpdateHolder) -> str:
+def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
+    """Return the live update holding the lock, or ``None``.
+
+    A live or unprobeable positive pid remains protected regardless of age.
+    Missing timestamps only affect the diagnostic age. Stale cleanup is
+    performed only while holding the sidecar mutex,
+    so this read cannot remove a claim being published or released. A busy
+    mutex permits observation only. Never raises.
+    """
+    marker = path or update_marker_path()
+    try:
+        with _MarkerMutex(marker) as mutex:
+            return _read_live_update(marker, cleanup_stale=mutex.acquired)
+    except (OSError, UnicodeError):
+        return None  # absent or unreadable => no live update
+
+
+def describe_holder(holder: UpdateHolder | None) -> str:
     """One-line, user-facing explanation of who holds the update lock."""
-    minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
-    elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+    if holder is None:
+        return (
+            "✗ Could not safely acquire the Hermes update lock.\n\n"
+            "  Another process may be changing the update marker, or its\n"
+            "  storage is unavailable. No checkout changes were started.\n"
+            "  Wait for the other update or restore access, then retry."
+        )
+    if holder.age_seconds is None:
+        started = "start time unavailable"
+    else:
+        minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
+        elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        started = f"started {elapsed} ago"
     return (
         f"✗ Another Hermes update is already running (PID {holder.pid}, "
-        f"started {elapsed} ago).\n"
+        f"{started}).\n"
         "\n"
         "  Two updates mutating the same checkout corrupt it: one rewrites\n"
         "  source while the other is mid-install. Wait for it to finish, or\n"
@@ -242,44 +296,57 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
-        existing = read_live_update(path=self.path)
-        if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
-                return True
-            self.holder = existing
-            return False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
+            with _MarkerMutex(self.path) as mutex:
+                if not mutex.acquired:
+                    self.holder = _read_live_update(self.path, cleanup_stale=False)
+                    return False
+                existing = _read_live_update(self.path, cleanup_stale=True)
+                if existing is not None:
+                    if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                        return True
+                    self.holder = existing
+                    return False
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", dir=self.path.parent,
+                        prefix=self.path.name + ".", delete=False,
+                    ) as handle:
+                        temporary = Path(handle.name)
+                        handle.write(f"{os.getpid()}\n{int(time.time())}\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, self.path)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                self.acquired = True
+                return True
+        except (OSError, UnicodeError) as exc:
             logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
-        self.acquired = True
-        return True
+            return False
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
         if not self.acquired:
             return
-        self.acquired = False
         try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
+            with _MarkerMutex(self.path) as mutex:
+                if not mutex.acquired:
+                    return
+                try:
+                    raw = self.path.read_text(encoding="utf-8")
+                    owner = int(raw.splitlines()[0].strip())
+                except (FileNotFoundError, IndexError, ValueError):
+                    self.acquired = False
+                    return
+                if owner == os.getpid():
+                    self.path.unlink()
+                # A handoff partner's marker is not ours to remove.
+                self.acquired = False
+        except (OSError, UnicodeError):
             return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
-            return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

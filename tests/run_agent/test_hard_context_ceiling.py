@@ -254,7 +254,7 @@ def test_execution_middleware_cannot_expand_stalled_turn_over_ceiling(
     def _no_progress(messages, _system_message, **_kwargs):
         return messages, agent._cached_system_prompt
 
-    def _estimate(messages):
+    def _estimate(messages, *, charge_stale_thinking=True):
         if messages == [{"role": "user", "content": "middleware expansion"}]:
             return 2_000
         return 500

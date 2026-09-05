@@ -260,6 +260,11 @@ class TestGetServicePidsScoping:
             "_probe_system_launchd_gateway",
             lambda: (True, 36573, "pid = 36573"),
         )
+        monkeypatch.setattr(
+            gw,
+            "_probe_system_launchd_gateway_for_install",
+            lambda: (True, 36573, "pid = 36573"),
+        )
 
         assert 36573 in gw._get_service_pids()
         assert 36573 in gw._get_service_pids(all_profiles=True)
@@ -281,7 +286,8 @@ class TestGetServicePidsScoping:
 
 def _fleet(monkeypatch, tmp_path, *, current, labels, located,
            registered=None, plist_exists=True,
-           drain_results=None, kick_errors=None, wait_results=None):
+           drain_results=None, kick_errors=None, wait_results=None,
+           current_supervised=True):
     """Wire a fake launchd fleet through hermes_cli.gateway seams.
 
     ``located`` maps label -> (domain, pid) as ``_locate_launchd_gateway_service``
@@ -295,7 +301,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
     rec = SimpleNamespace(
         kickstarts=[], drains=[], current_restarts=[], waits=[],
-        locates=[], registered_checks=[],
+        locates=[], registered_checks=[], current_verifies=[],
     )
 
     plist = tmp_path / f"{current}.plist"
@@ -349,6 +355,18 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     monkeypatch.setattr(
         gw, "launchd_restart", lambda: rec.current_restarts.append(current)
     )
+
+    # The current profile is now verified the same way siblings are: a
+    # successful launchd_restart() only counts once launchd reports it is
+    # supervising the job (#88848). Stubbed here so the fleet cases keep
+    # asserting on routing rather than on a real launchctl probe.
+    def fake_verify_current(*, label=None, **_kw):
+        rec.current_verifies.append(label)
+        return current_supervised
+
+    monkeypatch.setattr(
+        gw, "wait_for_launchd_gateway_supervision", fake_verify_current
+    )
     return rec
 
 
@@ -361,7 +379,11 @@ class TestRestartMacosLaunchdGateways:
         monkeypatch.setattr(gw, "get_system_launchd_gateway_label", lambda: "ai.hermes.gateway.daemon")
         monkeypatch.setattr(gw, "_system_daemon_install_matches", lambda: True)
         monkeypatch.setattr(gw, "restart_system_launchd_gateway_for_update", lambda: True)
-        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: tmp_path / "no-user.plist")
+        retired_user = tmp_path / "retired-user.plist"
+        retired_user.write_text("<plist/>")
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: retired_user)
+        monkeypatch.setattr(gw, "_system_daemon_blocks_current_profile", lambda: True)
+        monkeypatch.setattr(gw, "launchd_restart", lambda: pytest.fail("retired user service must not restart"))
         monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: [])
         restarted, failed = [], []
         _restart_macos_launchd_gateways(restarted, failed, 5.0)
@@ -682,14 +704,24 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
-    def test_launchd_labels_get_launchctl_hint(self, capsys):
+    def test_launchd_labels_get_launchctl_hint(self, capsys, monkeypatch):
+        monkeypatch.setattr(gw, "is_macos", lambda: True)
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
-        assert "launchctl kickstart -k" in out
+        assert "launchctl bootstrap" in out
 
-    def test_systemd_units_keep_systemctl_hint(self, capsys):
+    def test_systemd_units_keep_systemctl_hint(self, capsys, monkeypatch):
+        monkeypatch.setattr(gw, "is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out
         assert "launchctl" not in out
+
+
+def test_system_daemon_warning_never_recommends_user_bootstrap(capsys, monkeypatch):
+    monkeypatch.setattr(gw, "is_macos", lambda: True)
+    _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway.daemon"])
+    out = capsys.readouterr().out
+    assert "system/ai.hermes.gateway.daemon" in out
+    assert "Library/LaunchAgents" not in out

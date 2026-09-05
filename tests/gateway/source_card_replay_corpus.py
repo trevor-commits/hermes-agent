@@ -307,7 +307,14 @@ def build_corpus_fixture(tmp_path: Path, cards_repo: Path, python_exe: str) -> d
             ["git", "-C", str(repo), "config", key, value], check=True, capture_output=True
         )
 
-    shutil.copytree(cards_repo / "src" / "chat_context_index", repo / "src" / "chat_context_index")
+    # The source checkout may carry local bytecode that its Git ignore rules
+    # exclude. Do not turn those caches into tracked fixture inputs: running
+    # the validator can rewrite them and correctly block the landing rebase.
+    shutil.copytree(
+        cards_repo / "src" / "chat_context_index",
+        repo / "src" / "chat_context_index",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
     (repo / "scripts").mkdir(exist_ok=True)
     for name in ("validate-touched-source-cards", "validate-researched-repos"):
         shutil.copy2(cards_repo / "scripts" / name, repo / "scripts" / name)

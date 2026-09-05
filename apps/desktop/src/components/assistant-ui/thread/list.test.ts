@@ -9,8 +9,9 @@ import {
   liveTailStart,
   type MessageGroup,
   resolveThreadScrollTarget,
-  shouldClampTranscriptRenderBudget,
+  shouldClampTranscriptBudget,
   subscribeToThreadForeground,
+  transcriptBackfillFrameCount,
   transcriptPaneBudget
 } from './list'
 
@@ -99,17 +100,15 @@ describe('transcriptPaneBudget', () => {
   })
 })
 
-describe('shouldClampTranscriptRenderBudget', () => {
-  it('preserves an explicitly expanded history page while the pane is visible', () => {
-    expect(shouldClampTranscriptRenderBudget(1200, 600, false)).toBe(false)
+describe('shouldClampTranscriptBudget', () => {
+  it('never snaps a visible pane back after Show earlier', () => {
+    expect(shouldClampTranscriptBudget(false, 10, 5)).toBe(false)
+    expect(shouldClampTranscriptBudget(false, 5, 5)).toBe(false)
   })
 
-  it('reclaims expanded history when the pane becomes hidden', () => {
-    expect(shouldClampTranscriptRenderBudget(1200, 40, true)).toBe(true)
-  })
-
-  it('does not re-clamp a hidden pane already at its budget', () => {
-    expect(shouldClampTranscriptRenderBudget(40, 40, true)).toBe(false)
+  it('snaps only a hot-hidden pane that outgrew the retention budget', () => {
+    expect(shouldClampTranscriptBudget(true, 10, 5)).toBe(true)
+    expect(shouldClampTranscriptBudget(true, 5, 5)).toBe(false)
   })
 })
 
@@ -322,5 +321,11 @@ describe('liveTailStart', () => {
 
       expect(rendered(liveTailStart(groups))).toBeLessThanOrEqual(rendered(oldStart))
     }
+  })
+})
+
+describe('transcriptBackfillFrameCount', () => {
+  it('settles a full pane in at most three prepend commits', () => {
+    expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(3)
   })
 })

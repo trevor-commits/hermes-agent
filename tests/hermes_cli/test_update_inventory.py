@@ -58,7 +58,12 @@ class TestCollectInventory:
         assert by_profile["work"].pid == 200
         assert by_profile["work"].supervisor == "manual"
         assert by_profile["work"].code_sha is None  # pre-stamp gateway
-        assert "hermes -p work gateway restart" in by_profile["work"].restart_via
+        assert by_profile["work"].restart_via == "manual"
+        from hermes_cli.update_inventory import describe_restart_mechanism
+
+        assert "hermes -p work gateway restart" in describe_restart_mechanism(
+            by_profile["work"].restart_via, "work"
+        )
 
     def test_docker_install_not_updatable_in_place(self, fleet, monkeypatch):
         monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **k: "docker")
@@ -164,8 +169,71 @@ class TestReceiptIntegration:
         assert payload["plan"]["install_method"] == "git"
         assert len(payload["plan"]["runtimes"]) == 2
 
-    def test_noop_without_active_receipt(self, fleet):
-        import hermes_cli.update_receipt as ur
 
-        ur._current = None
-        ui.record_plan_in_receipt(ui.collect_runtime_inventory())  # must not raise
+def test_external_socket_identity_refines_to_actual_launchd_owner(fleet, monkeypatch):
+    """The logger's child declares external; launchd owns the whole tree."""
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: True)
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100, 199, 200})
+    monkeypatch.setattr("hermes_cli.gateway._probe_system_launchd_gateway_for_install", lambda: (False, None, ""))
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home: (
+        {"pid": 200, "supervisor": "external", "code_sha": "a" * 40}
+        if home.name == "work" else None
+    ))
+    runtime = next(r for r in ui.collect_runtime_inventory().runtimes if r.profile == "work")
+    assert runtime.supervisor == "launchd"
+    assert runtime.restart_via == "launchd"
+    assert ui.match_runtime_outcomes(
+        ui.UpdatePlan(runtimes=[runtime]),
+        restarted_services=["ai.hermes.gateway-work"],
+        relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[],
+    )[0]["outcome"] == "restarted"
+
+def test_noop_without_active_receipt(fleet):
+    import hermes_cli.update_receipt as ur
+
+    ur._current = None
+    ui.record_plan_in_receipt(ui.collect_runtime_inventory())  # must not raise
+
+
+def test_system_launchdaemon_inventory_and_restart_receipt(fleet, monkeypatch):
+    """A system-owned default gateway must not become an unaccounted user job."""
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: True)
+    monkeypatch.setattr("hermes_cli.gateway._probe_system_launchd_gateway_for_install", lambda: (True, 100, ""))
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda home: {"pid": 100, "supervisor": "launchd"} if home.name == "home" else None)
+    plan = ui.collect_runtime_inventory()
+    default = next(r for r in plan.runtimes if r.profile == "default")
+    assert default.supervisor == "launchd-system"
+    assert default.restart_via == "launchd-system"
+    assert "fresh-PID" in ui.describe_restart_mechanism(default.restart_via, "default")
+    for field, expected in [("restarted_services", "restarted"), ("failed_units", "failed")]:
+        inputs = dict(restarted_services=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(), failed_units=[])
+        inputs[field] = ["ai.hermes.gateway.daemon"]
+        outcomes = ui.match_runtime_outcomes(plan, **inputs)
+        assert next(r for r in outcomes if r["profile"] == "default")["outcome"] == expected
+
+
+def test_system_wrapper_child_keeps_system_restart_authority(monkeypatch):
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: True)
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway._probe_system_launchd_gateway_for_install", lambda: (True, 199, ""))
+    monkeypatch.setattr("hermes_cli.gateway._stderr_wrapper_gateway_children", lambda pid: {200} if pid == 199 else None)
+    assert ui._detect_supervisor_for_pid(200, {199, 200}) == "launchd-system"
+    assert ui._detect_supervisor_for_pid(201, {199, 200, 201}) == "launchd"
+
+
+def test_pre_pull_runtime_records_survive_inventory_module_reload():
+    import importlib
+
+    plan = ui.UpdatePlan(runtimes=[ui.RuntimeRecord(
+        kind="gateway", profile="default", pid=100,
+        supervisor="launchd-system", restart_via="launchd-system",
+    )])
+    importlib.reload(ui)
+    outcomes = ui.match_runtime_outcomes(
+        plan, restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0]["outcome"] == "unaccounted"

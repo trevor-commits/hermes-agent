@@ -16,6 +16,7 @@ disk.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import time
 
@@ -23,7 +24,6 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
-    UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
     describe_holder,
     read_live_update,
@@ -112,18 +112,45 @@ def test_dead_owner_is_reclaimed_not_honored(marker):
     assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
-def test_owner_past_the_age_ceiling_is_reclaimed(marker):
-    """A live-but-wedged updater must not hold the lock forever."""
-    long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
-    marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
+def test_long_running_owner_is_not_reclaimed(marker):
+    """A slow build can legitimately keep mutating after twenty minutes."""
+    long_ago = int(time.time()) - 21 * 60
+    body = f"{os.getpid()}\n{long_ago}\n"
+    marker.write_text(body, encoding="utf-8")
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True
+    assert lock.acquire() is False
+    assert read_live_update(path=marker).pid == os.getpid()
+    assert marker.read_text(encoding="utf-8") == body
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), RuntimeError("probe unavailable")])
+def test_uncertain_positive_pid_keeps_ownership(marker, monkeypatch, error):
+    def unavailable(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr("psutil.Process", unavailable)
+    body = f"424242\n{int(time.time()) - 21 * 60}\n"
+    marker.write_text(body, encoding="utf-8")
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert read_live_update(path=marker).pid == 424242
+    assert marker.read_text(encoding="utf-8") == body
+
+
+@pytest.mark.parametrize("timestamp", ["", "nan", "inf", "garbage"])
+def test_live_owner_with_unknown_start_time_still_blocks(marker, timestamp):
+    body = f"{os.getpid()}\n{timestamp}\n"
+    marker.write_text(body, encoding="utf-8")
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert "start time unavailable" in describe_holder(lock.holder)
+    assert marker.read_text(encoding="utf-8") == body
 
 
 @pytest.mark.parametrize(
     "body",
-    ["", "not-a-pid\n123\n", "\n\n", "12345"],
+    ["", "not-a-pid\n123\n", "\n\n", str(DEAD_PID)],
     ids=["empty", "garbage-pid", "blank-lines", "no-start-time"],
 )
 def test_malformed_markers_never_block_an_update(marker, body):
@@ -165,17 +192,116 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
     assert "already running" in message
 
 
-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
-    """Degrade to pre-lock behavior rather than refusing to update at all.
-
-    An unwritable marker path is a worse reason to block an update than the
-    race the lock prevents.
-    """
+def test_unwritable_marker_location_refuses_the_update(tmp_path):
+    """Storage failure must never permit unguarded checkout mutation."""
     lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
-    assert lock.acquire() is True
+    assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
+    assert "Could not safely acquire" in describe_holder(lock.holder)
+
+
+def test_native_claim_honors_existing_spawn_sidecar_mutex(marker):
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    sidecar = marker.with_name(marker.name + ".mutex")
+    with sidecar.open("a+", encoding="utf-8") as handle:
+        assert _try_acquire_file_lock(handle)
+        try:
+            lock = UpdateLock(path=marker)
+            assert lock.acquire() is False
+            assert lock.acquired is False
+            assert not marker.exists()
+        finally:
+            _release_file_lock(handle)
+    assert lock.acquire() is True
+    lock.release()
+    assert sidecar.exists(), "the shared mutex inode must never be unlinked"
+
+
+def test_failed_marker_publication_refuses_the_update(marker, monkeypatch):
+    def unavailable(*_args):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr("hermes_cli.update_lock.os.replace", unavailable)
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert lock.acquired is False
+    assert not marker.exists()
+    assert "Could not safely acquire" in describe_holder(lock.holder)
+
+
+def test_stale_read_does_not_delete_marker_during_mutex_transaction(marker):
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+    with marker.with_name(marker.name + ".mutex").open("a+", encoding="utf-8") as handle:
+        assert _try_acquire_file_lock(handle)
+        try:
+            assert read_live_update(path=marker) is None
+            assert marker.exists(), "an observation outside the mutex must not delete"
+        finally:
+            _release_file_lock(handle)
+    assert read_live_update(path=marker) is None
+    assert not marker.exists()
+
+
+def test_release_waits_for_mutex_before_checking_and_removing_owner(marker):
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire()
+    with marker.with_name(marker.name + ".mutex").open("a+", encoding="utf-8") as handle:
+        assert _try_acquire_file_lock(handle)
+        try:
+            lock.release()
+            assert marker.exists()
+            assert lock.acquired, "a blocked release can be retried"
+            marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
+        finally:
+            _release_file_lock(handle)
+    lock.release()
+    assert marker.exists(), "retry must recheck the handoff partner's ownership"
+
+
+def _concurrent_update_claim(marker, ready, results, finish):
+    lock = UpdateLock(path=marker)
+    ready.wait(timeout=15)
+    acquired = lock.acquire()
+    results.put((os.getpid(), acquired))
+    try:
+        finish.wait(timeout=15)
+    finally:
+        lock.release()
+
+
+def test_concurrent_native_claims_have_one_live_owner(marker):
+    """Real sibling processes must not both enter checkout mutation."""
+    context = multiprocessing.get_context("spawn")
+    ready = context.Barrier(3)
+    results = context.Queue()
+    finish = context.Event()
+    processes = [
+        context.Process(target=_concurrent_update_claim, args=(marker, ready, results, finish))
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        ready.wait(timeout=15)
+        claims = [results.get(timeout=15) for _ in processes]
+        winners = [pid for pid, acquired in claims if acquired]
+        assert len(winners) == 1, claims
+        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == winners[0]
+    finally:
+        finish.set()
+        for process in processes:
+            process.join(timeout=20)
+        results.close()
+        results.join_thread()
+    assert all(process.exitcode == 0 for process in processes)
+    assert not marker.exists()
 
 
 class TestHandoffFromOrchestratingUpdater:
@@ -187,9 +313,11 @@ class TestHandoffFromOrchestratingUpdater:
     HANDOFF_PID_ENV; a live holder matching it is our own orchestrator.
     """
 
-    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
+    @pytest.mark.parametrize("age_seconds", [0, 21 * 60])
+    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch, age_seconds):
         # Stand in for the parent updater with our own (live) pid.
-        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        body = f"{os.getpid()}\n{int(time.time()) - age_seconds}\n"
+        marker.write_text(body, encoding="utf-8")
         monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
 
         lock = UpdateLock(path=marker)
@@ -198,7 +326,7 @@ class TestHandoffFromOrchestratingUpdater:
 
         lock.release()
         assert marker.exists(), "the parent still needs its marker after our stage ends"
-        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+        assert marker.read_text(encoding="utf-8") == body
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(self, marker, monkeypatch):
         """The env var alone must not bypass the lock."""

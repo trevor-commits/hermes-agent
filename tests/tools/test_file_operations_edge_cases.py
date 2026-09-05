@@ -253,9 +253,9 @@ class TestPaginationBounds:
 
 
 class TestSearchContextParsing:
-    def test_search_with_grep_uses_extended_regex(self):
+    def test_search_with_grep_uses_extended_regex(self, tmp_path):
         env = MagicMock()
-        env.cwd = "/tmp"
+        env.cwd = str(tmp_path)
         ops = ShellFileOperations(env)
 
         with patch.object(ops, "_exec") as mock_exec:

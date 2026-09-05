@@ -23,19 +23,13 @@
 import fs from 'fs'
 import path from 'path'
 
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
-export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
-
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
-// True only if a host process with this pid is currently alive. Signal 0 does
+// Protect a positive pid unless it is confirmed dead. Signal 0 does
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
-// EPERM => alive but owned by another user (still "alive" for our purposes).
+// EPERM or an unknown probe failure cannot authorize a second writer.
 // Injectable `kill` keeps it unit-testable.
 export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -47,18 +41,17 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
 
     return true
   } catch (err) {
-    return Boolean(err && err.code === 'EPERM')
+    return err?.code !== 'ESRCH'
   }
 }
 
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * Returns `{ pid, ageMs }` for a positive pid that is alive or cannot be
+ * inspected. Age is diagnostic only: a slow build can keep mutating after
+ * twenty minutes. A missing timestamp produces a null age, not permission
+ * to start another updater. Dead-pid markers are pruned for recovery.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -67,11 +60,9 @@ export function readLiveUpdateMarker(
   hermesHome,
   {
     kill,
-    now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    now = Date.now
   }: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
   } = {}
 ) {
@@ -80,17 +71,23 @@ export function readLiveUpdateMarker(
 
   try {
     raw = fs.readFileSync(file, 'utf8')
-  } catch {
-    return null // absent or unreadable => no live update
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return null
+    }
+
+    // Unreadable storage cannot prove the updater released its claim.
+    throw err
   }
 
   const [pidLine, startedLine] = String(raw).split('\n')
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
+  const elapsedMs = now() - startedAt * 1000
+  const ageMs = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : null
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
-  if (!alive || ageMs > maxAgeMs) {
+  if (!alive) {
     try {
       fs.unlinkSync(file)
     } catch {
@@ -120,8 +117,8 @@ export function readLiveUpdateMarker(
  * Fix: the desktop writes the marker itself, using the spawned updater's
  * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` will
  * later adopt it or another hand-off stage may replace the PID. A live
- * holder's original timestamp is preserved across those transfers so retries
- * cannot keep resetting the 20-minute stale ceiling. When the updater finishes
+ * holder's original timestamp is preserved across those transfers for elapsed
+ * time reporting. When the updater finishes
  * it deletes the marker as before.
  * If the updater never starts (spawn failure) the marker still contains a
  * real PID, so `readLiveUpdateMarker` will self-heal once that PID exits.
@@ -132,23 +129,21 @@ export function writeUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
     startedAt
   }: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
     startedAt?: number
   } = {}
 ) {
   const file = markerPath(hermesHome)
   const nowMs = now()
-  const owner = readLiveUpdateMarker(hermesHome, { kill, maxAgeMs, now: () => nowMs })
+  const owner = readLiveUpdateMarker(hermesHome, { kill, now: () => nowMs })
 
   const acquiredAt =
     typeof startedAt === 'number' && Number.isInteger(startedAt)
       ? startedAt
-      : owner
+      : owner && owner.ageMs !== null
         ? Math.floor((nowMs - owner.ageMs) / 1000)
         : Math.floor(nowMs / 1000)
 
@@ -183,7 +178,6 @@ export function updateHandoffConflict(
   hermesHome,
   opts: {
     now?: () => number
-    maxAgeMs?: number
     kill?: typeof process.kill
   } = {}
 ) {
@@ -193,13 +187,14 @@ export function updateHandoffConflict(
     return null
   }
 
-  const mins = Math.floor(owner.ageMs / 60_000)
-  const secs = Math.floor((owner.ageMs % 60_000) / 1000)
+  const mins = Math.floor((owner.ageMs ?? 0) / 60_000)
+  const secs = Math.floor(((owner.ageMs ?? 0) % 60_000) / 1000)
   const elapsed = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`
+  const started = owner.ageMs === null ? 'start time unavailable' : `started ${elapsed} ago`
 
   return {
     pid: owner.pid,
     ageMs: owner.ageMs,
-    message: `An update is already running (PID ${owner.pid}, started ${elapsed} ago). Wait for it to finish, then try again.`
+    message: `An update is already running (PID ${owner.pid}, ${started}). Wait for it to finish, then try again.`
   }
 }

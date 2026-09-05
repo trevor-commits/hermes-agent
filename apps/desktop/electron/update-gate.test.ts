@@ -54,8 +54,7 @@ test('returns clear immediately without sleeping when the gate is open', async (
     pollMs: 10,
     sleep: async () => {
       slept += 1
-    },
-    timeoutMs: 1000
+    }
   })
 
   assert.equal(outcome, 'clear')
@@ -81,8 +80,7 @@ test('parks on the in-flight flag and finishes when it clears', async () => {
         }
       },
       pollMs: 1,
-      sleep: async () => {},
-      timeoutMs: 10_000
+      sleep: async () => {}
     }
   )
 
@@ -119,8 +117,7 @@ test('parks across the flag→marker handoff without a gap', async () => {
         }
       },
       pollMs: 1,
-      sleep: async () => {},
-      timeoutMs: 10_000
+      sleep: async () => {}
     }
   )
 
@@ -128,17 +125,45 @@ test('parks across the flag→marker handoff without a gap', async () => {
   assert.deepEqual(reasons, ['update-in-flight', 'update-in-flight', 'marker', 'marker', 'marker'])
 })
 
-test('returns timeout when the gate never opens', async () => {
+test('keeps backend startup parked beyond twenty minutes until the update ends', async () => {
   let clock = 0
+  let marker = true
+  let ticks = 0
 
-  const outcome = await waitForUpdateClearance(deps(true, false), {
-    now: () => clock,
-    pollMs: 10,
-    sleep: async ms => {
-      clock += ms
-    },
-    timeoutMs: 50
-  })
+  const outcome = await waitForUpdateClearance(
+    { hasLiveMarker: () => marker, isUpdateInFlight: () => false },
+    {
+      pollMs: 21 * 60_000,
+      onWaitTick: () => {
+        ticks += 1
+      },
+      sleep: async ms => {
+        clock += ms
+        if (clock >= 42 * 60_000) marker = false
+      }
+    }
+  )
 
-  assert.equal(outcome, 'timeout')
+  assert.equal(outcome, 'finished')
+  assert.equal(ticks, 2, 'the ongoing wait continues to report progress')
+})
+
+test('shutdown cancels a parked backend start without opening the gate', async () => {
+  let cancelling = false
+  let marker = true
+
+  await assert.rejects(
+    waitForUpdateClearance(
+      { hasLiveMarker: () => marker, isUpdateInFlight: () => false },
+      {
+        pollMs: 1,
+        isCancelled: () => cancelling,
+        sleep: async () => {
+          cancelling = true
+          marker = false
+        }
+      }
+    ),
+    /shutting down/
+  )
 })

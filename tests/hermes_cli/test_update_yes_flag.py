@@ -12,7 +12,24 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(monkeypatch, tmp_path):
+    """Prompt tests have no installed services or running gateways."""
+    # Git is mocked: preserve injected module evidence instead of evicting it.
+    monkeypatch.setattr("hermes_cli.main._purge_stale_hermes_modules", lambda: None)
+    for helper in ("get_launchd_plist_path", "get_system_launchd_gateway_plist_path"):
+        monkeypatch.setattr(f"hermes_cli.gateway.{helper}", lambda: tmp_path / "absent.plist")
+    monkeypatch.setattr("hermes_cli.gateway.launchd_gateway_labels_for_install", lambda: [])
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **kw: set())
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda *a, **kw: [])
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda: None)
 
 
 def _make_run_side_effect(

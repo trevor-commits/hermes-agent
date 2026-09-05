@@ -7,6 +7,11 @@ hermes_state re-imports every name here for backward compatibility.
 """
 
 import re
+import contextlib
+import logging
+import os
+import sys
+import time
 from typing import Any
 
 from agent.skill_commands import (
@@ -249,6 +254,51 @@ _RESET_END_REASONS = (
 )
 _RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASONS)
 
+# Accidental end reasons that recovery treats as resumable (see
+# docs/session-lifecycle.md "recoverable accidental reasons"). Interpolated
+# into the recovery SQL below AND exposed as SessionDB.RECOVERABLE_END_REASONS
+# so the tuple is the single source of truth — literals cannot drift.
+_RECOVERABLE_END_REASONS = (
+    "agent_close",
+    "ws_orphan_reap",
+    # A stale sentinel-parked runtime quietly superseded by a fresh
+    # session.resume of the same stored session (no reclaimed broadcast);
+    # the stored session stays resumable like any accidental end.
+    "superseded_by_resume",
+    # Startup sweep of rows orphaned by a dead gateway process (#65194):
+    # the in-process ws-orphan grace timer died with the process, so the
+    # row was closed at the next boot instead. Same accident class as
+    # ws_orphan_reap — kept distinct for forensics — and equally resumable.
+    "startup_orphan_reap",
+)
+_RECOVERABLE_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RECOVERABLE_END_REASONS)
+
+# End reasons written by AUTOMATIC infrastructure cleanup (server shutdown,
+# orphan reapers, idle/LRU eviction) rather than by a deliberate conversation
+# boundary (compression, session_reset, session_switch, explicit user close).
+# An automatic stamp records "some runtime went away", NOT "this conversation
+# ended" — so a writer that can prove the conversation is still live (e.g. an
+# active compression rotation holding the lease, #88197) may treat the stamp
+# as stale and clear it. Superset of the recoverable set: those are already
+# resumable accidents; the extra TUI reasons are the same accident class but
+# were historically only known to tui_gateway's _AUTOMATIC_SESSION_END_REASONS.
+_AUTOMATIC_END_REASONS = frozenset(_RECOVERABLE_END_REASONS) | {
+    "tui_shutdown",
+    "ws_disconnect",
+    "idle_timeout",
+    "lru_evict",
+}
+
+
+def is_automatic_end_reason(reason) -> bool:
+    """True when *reason* is an automatic-cleanup end stamp (see above).
+
+    Single owner of the "accidental vs deliberate end" predicate — every
+    compression-liveness site must call this instead of re-implementing the
+    reason taxonomy (#88197, never-patch-predicates).
+    """
+    return isinstance(reason, str) and reason in _AUTOMATIC_END_REASONS
+
 
 def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
     """Pre-marker reset-continuation heuristic.
@@ -471,6 +521,7 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
+    _compressed_summary INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
@@ -516,6 +567,23 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-backend liveness heartbeat (#94895). Each serve / tui_gateway process
+-- registers a row at startup and refreshes ``last_heartbeat`` periodically.
+-- The startup orphan sweep (sessions.startup_orphan_reap) consults this
+-- table to avoid reaping rows whose owning backend is still alive but
+-- just idle (multi-backend state.db shared by isolated serve processes).
+-- A backend whose ``last_heartbeat`` is older than the heartbeat staleness
+-- window is treated as dead; rows without ANY matching heartbeat fall back
+-- to the original staleness predicate so legacy deployments keep working.
+CREATE TABLE IF NOT EXISTS gateway_heartbeats (
+    backend_id TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    last_heartbeat REAL NOT NULL,
+    profile TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (
@@ -758,6 +826,9 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # them would preserve an unknown index gap.
 FTS_STALE_KEY = "fts_stale"
 
+# Durable diagnostic for stale FTS recovery blocked across process restarts.
+FTS_REBUILD_DEFERRAL_KEY = "fts_rebuild_deferral"
+
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
@@ -823,3 +894,116 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+# ── Cross-process full-FTS-rebuild admission (single authority) ──────────────
+#
+# Several independent Hermes processes routinely share one state.db (gateway
+# service, the Desktop app's `hermes serve` backend, interactive CLI sessions,
+# the TUI slash worker). A full structural FTS rebuild — the FTS5 'rebuild'
+# command or the drop/recreate script in `_recover_stale_fts` — must only ever
+# run in ONE of them at a time: two concurrent rebuilds collide on write and
+# have structurally corrupted state.db in production (PR #93200; the
+# 2026-08-15 / 2026-08-23 incidents and issues #89293 / #90950).
+#
+# This is the single admission authority for every full structural rebuild
+# entry point: `SessionSearchMixin.rebuild_fts()`,
+# `SessionSchemaMixin._rebuild_fts_indexes()` (via `_init_schema`), and
+# `SessionSchemaMixin._recover_stale_fts()`. The chunked deferred backfill
+# (`fts_rebuild_step`) is deliberately NOT routed through it — it claims
+# progress under `_execute_write`'s SQLite transaction authority and is
+# intentionally multi-process.
+#
+# Semantics mirror `hermes_state._cross_process_repair_lock` (the schema-
+# surgery authority): portable (msvcrt on Windows, flock elsewhere), bounded
+# wait, and FAIL CLOSED — a caller that cannot acquire the lock must NOT
+# rebuild. The kernel drops both lock types when the holder dies, so a crashed
+# rebuilder cannot wedge future rebuilds. It lives here (not hermes_state)
+# because the search/schema mixins cannot import hermes_state (cycle).
+#
+# The lock file is `<db>.fts_rebuild.lock`, distinct from `<db>.repair.lock`:
+# schema surgery runs on an EXCLUSIVE offline connection and can legitimately
+# take minutes in VACUUM, while runtime rebuilds run on live connections. The
+# timeout is sized for a full 'rebuild' of both indexes on a large DB.
+
+logger = logging.getLogger("hermes_state")
+
+_FTS_REBUILD_LOCK_TIMEOUT_SECONDS = 120.0
+_FTS_REBUILD_LOCK_POLL_SECONDS = 0.1
+_IS_WINDOWS = sys.platform == "win32"
+
+
+@contextlib.contextmanager
+def fts_rebuild_admission(db_path):
+    """Serialize full structural FTS rebuilds on *db_path* across processes.
+
+    Yields True when this process holds the rebuild authority, False when the
+    bounded acquire timed out. A caller that gets False must NOT perform a
+    full rebuild — proceeding is exactly the concurrent-rebuild interleaving
+    this lock exists to prevent (fail closed). The deferred/stale breadcrumb
+    machinery already guarantees a skipped rebuild is retried later.
+
+    ``db_path`` may be a str or Path; None (in-memory DB / tests without a
+    file path) yields True — a private in-memory DB has no cross-process
+    surface.
+    """
+    if db_path is None:
+        yield True
+        return
+    lock_path = f"{db_path}.fts_rebuild.lock"
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError as exc:
+        # Read-only dir, exhausted fds, exotic filesystem: fall back to the
+        # pre-lock behaviour rather than refusing a rebuild we could run.
+        logger.warning(
+            "Could not open FTS rebuild lock %s (%s) — proceeding with "
+            "in-process serialisation only.", lock_path, exc,
+        )
+        yield True
+        return
+
+    acquired = False
+    try:
+        deadline = time.monotonic() + _FTS_REBUILD_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_FTS_REBUILD_LOCK_POLL_SECONDS)
+        if not acquired:
+            logger.warning(
+                "FTS rebuild lock %s held by another process for more than "
+                "%.0fs — deferring this rebuild to avoid racing the holder "
+                "(the stale-FTS breadcrumb keeps it retryable).",
+                lock_path, _FTS_REBUILD_LOCK_TIMEOUT_SECONDS,
+            )
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best effort release
+            pass
+        finally:
+            handle.close()

@@ -67,6 +67,17 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    # Stash tests model an installation without managed or ad-hoc gateways.
+    # Git is mocked: preserve injected module evidence instead of evicting it.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    for helper in ("get_launchd_plist_path", "get_system_launchd_gateway_plist_path"):
+        monkeypatch.setattr(f"hermes_cli.gateway.{helper}", lambda: tmp_path / "absent.plist")
+    monkeypatch.setattr("hermes_cli.gateway.launchd_gateway_labels_for_install", lambda: [])
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **kw: set())
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda *a, **kw: [])
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda: None)
 
 
 
@@ -108,14 +119,14 @@ def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(mon
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# ff-only fallback to a preserving merge on diverged history
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
     ff_only_fails=False,
-    reset_fails=False,
+    merge_fails=False,
     fetch_fails=False,
     fetch_stderr="",
 ):
@@ -143,10 +154,10 @@ def _make_update_side_effect(
                     returncode=128,
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
-        if "reset" in joined and "--hard" in joined:
-            if reset_fails:
-                return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
-            return SimpleNamespace(stdout="HEAD is now at abc123\n", stderr="", returncode=0)
+        if "merge" in joined and "--no-edit" in joined:
+            if merge_fails:
+                return SimpleNamespace(stdout="", stderr="CONFLICT: merge conflict\n", returncode=1)
+            return SimpleNamespace(stdout="Merge made by the ort strategy.\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect, recorded
@@ -163,11 +174,11 @@ def _make_update_side_effect(
 
 
 # ---------------------------------------------------------------------------
-# reset --hard failure — don't attempt stash restore
+# merge conflict — don't attempt stash restore
 # ---------------------------------------------------------------------------
 
-def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, capsys):
-    """When reset --hard fails, stash restore is skipped with a helpful message."""
+def test_cmd_update_skips_stash_restore_when_merge_fails(monkeypatch, tmp_path, capsys):
+    """An aborted merge preserves the stash without applying it to stale code."""
     _setup_update_mocks(monkeypatch, tmp_path)
     # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
@@ -180,7 +191,7 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
         lambda *a, **kw: restore_calls.append(1) or True,
     )
 
-    side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
+    side_effect, commands = _make_update_side_effect(ff_only_fails=True, merge_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
@@ -188,6 +199,8 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     # Stash restore should NOT have been called
     assert len(restore_calls) == 0
+    assert any("merge" in cmd and "--abort" in cmd for cmd in commands)
+    assert not any("reset" in cmd and "--hard" in cmd for cmd in commands)
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
@@ -299,7 +312,7 @@ def test_update_keep_stash_failure_path_still_preserves(monkeypatch, tmp_path, c
     """--keep-stash + failed update: neither restore nor park runs; the
     existing preserved-in-stash message fires (working tree unknown)."""
     restore_calls, discard_calls, park_calls = _setup_keep_stash_test(monkeypatch, tmp_path)
-    side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
+    side_effect, _ = _make_update_side_effect(ff_only_fails=True, merge_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
@@ -435,3 +448,360 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+def test_restore_rejects_invalid_python_and_keeps_clean_updated_tree(
+    monkeypatch, tmp_path, capsys
+):
+    """A cleanly-applied stash must not be allowed to brick every agent turn."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    source = tmp_path / "tools" / "terminal_tool.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    source.write_text("<<<<<<< Updated upstream\nVALUE = 2\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "made the Hermes agent unexecutable" in output
+    assert "gateway was not restarted" in output
+    assert f"git stash apply {stash_ref}" in output
+
+
+def test_restore_rejects_new_import_time_failure_and_preserves_stash(
+    monkeypatch, tmp_path, capsys
+):
+    """A valid-Python stash must not introduce a critical import failure."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    source = tmp_path / "consumer.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    source.write_text("raise RuntimeError('restored local failure')\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "agent import consumer" in output
+    assert "restored local failure" in output
+    assert "gateway was not restarted" in output
+
+
+def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
+    """A restore may proceed when it does not worsen an environment failure."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "consumer.py").write_text(
+        "raise RuntimeError('missing local config')\n", encoding="utf-8"
+    )
+    local_file = tmp_path / "local.txt"
+    local_file.write_text("original\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    local_file.write_text("restored\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+
+    assert hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, prompt_user=False
+    )
+    assert local_file.read_text(encoding="utf-8") == "restored\n"
+    assert git("stash", "list").stdout.strip() == ""
+
+
+def test_restore_rejects_later_failure_masked_by_preexisting_failure(
+    monkeypatch, tmp_path, capsys
+):
+    """Every critical module must be compared, not only the first failure."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "first.py").write_text(
+        "raise RuntimeError('missing local config')\n", encoding="utf-8"
+    )
+    second = tmp_path / "second.py"
+    second.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    second.write_text("raise RuntimeError('restored later failure')\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert second.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "agent import second" in output
+    assert "restored later failure" in output
+    assert "gateway was not restarted" in output
+
+
+def test_restore_rejects_system_exit_masked_by_preexisting_failure(
+    monkeypatch, tmp_path, capsys
+):
+    """A terminating import must be compared instead of hiding the marker."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "first.py").write_text(
+        "raise RuntimeError('missing local config')\n", encoding="utf-8"
+    )
+    second = tmp_path / "second.py"
+    second.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    second.write_text("raise SystemExit('restored exit')\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert second.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "agent import second" in output
+    assert "restored exit" in output
+    assert "gateway was not restarted" in output
+
+
+def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
+    """A stash cannot bypass import validation by terminating the probe."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    source = tmp_path / "consumer.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    source.write_text("import os\nos._exit(7)\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "critical-module probe" in output
+    assert "exit code 7" in output
+    assert "gateway was not restarted" in output
+
+
+def test_restore_stays_parked_when_untracked_baseline_is_unknown(
+    monkeypatch, tmp_path, capsys
+):
+    """Unknown cleanup scope must not turn into a destructive empty baseline."""
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd, "_git_untracked_paths", lambda *_args: None)
+
+    restored = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "stash@{0}", prompt_user=False
+    )
+
+    assert restored is False
+    output = capsys.readouterr().out
+    assert "cleanup baseline is unknown" in output
+    assert "git stash apply stash@{0}" in output
+
+
+def test_reject_does_not_claim_cleanup_when_git_state_is_unknown(
+    monkeypatch, tmp_path, capsys
+):
+    """Cleanup failures must not be reported as a restored clean tree."""
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd, "_git_untracked_paths", lambda *_args: None)
+
+    with pytest.raises(SystemExit):
+        update_cmd._reject_unsafe_stash_restore(
+            ["git"], tmp_path, "stash@{0}", set(), "consumer.py", "invalid"
+        )
+
+    output = capsys.readouterr().out
+    assert "could not be fully restored automatically" in output
+    assert "The clean updated tree has been restored" not in output
+
+
+def test_restore_rejects_unknown_restored_python_paths(
+    monkeypatch, tmp_path, capsys
+):
+    """A failed post-apply path query cannot skip restored syntax validation."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    source = tmp_path / "consumer.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    monkeypatch.setattr(update_cmd, "_restored_python_paths", lambda *_args: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False
+        )
+
+    assert exc_info.value.code == 1
+    assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert git("status", "--porcelain").stdout == ""
+    assert git("stash", "list").stdout.strip()
+    output = capsys.readouterr().out
+    assert "restored Python source discovery" in output
+    assert "gateway was not restarted" in output
+
+
+def test_gateway_restore_prompt_defaults_to_keep_stash(tmp_path, capsys):
+    prompts = []
+
+    restored = hermes_main._restore_stashed_changes(
+        ["git"],
+        tmp_path,
+        "stash@{0}",
+        prompt_user=True,
+        input_fn=lambda prompt, default: prompts.append((prompt, default)) or "",
+    )
+
+    assert restored is False
+    assert prompts == [("Restore local changes now? [y/N]", "n")]
+    assert "still preserved in git stash" in capsys.readouterr().out

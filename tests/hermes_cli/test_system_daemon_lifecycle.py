@@ -89,6 +89,28 @@ class TestIdentity:
     def test_matching_plist_is_ours(self, ours):
         assert gw._system_daemon_identity_matches() is True
 
+    @pytest.mark.parametrize("field", ["argv", "venv"])
+    def test_shared_path_prefix_does_not_establish_install_ownership(self, ours, field):
+        import plistlib
+
+        root = ours.root.resolve()
+        payload = {"Label": "ai.hermes.gateway.daemon",
+                   "ProgramArguments": ["/bin/bash"],
+                   "EnvironmentVariables": {"HERMES_HOME": str(ours.home)}}
+        foreign = str(root) + "-other/venv/bin/python"
+        if field == "argv":
+            payload["ProgramArguments"] = [foreign, "-m", "hermes_cli.main"]
+        else:
+            payload["EnvironmentVariables"]["VIRTUAL_ENV"] = foreign
+        ours.plist.write_bytes(plistlib.dumps(payload))
+        assert gw._system_daemon_identity_details()["install_matches"] is False
+
+    def test_resolved_symlink_into_install_establishes_ownership(self, ours, tmp_path):
+        alias = tmp_path / "linked-checkout"
+        alias.symlink_to(ours.root, target_is_directory=True)
+        _write_plist(tmp_path, root=str(alias), home=str(ours.home))
+        assert gw._system_daemon_identity_matches() is True
+
     def test_missing_plist_fails_closed(self, ours):
         ours.plist.unlink()
         assert gw._system_daemon_identity_matches() is False
@@ -279,6 +301,40 @@ class TestVerifiedRestart:
 
 
 class TestFleetUpdateSystemDaemonRestart:
+    def test_failed_wedge_stop_never_claims_fresh_system_gateway(self, ours, monkeypatch):
+        monkeypatch.setattr(gw, "_probe_system_launchd_gateway_for_install", lambda: (True, 1234, ""))
+        monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gw, "_stderr_wrapper_gateway_children", lambda pid: None)
+        monkeypatch.setattr(gw, "probe_gateway_loop_liveness", lambda *a, **kw: gw.GATEWAY_LOOP_WEDGED)
+        monkeypatch.setattr(gw, "_escalate_wedged_gateway", lambda pid: False)
+        monkeypatch.setattr(gw, "_wait_for_system_daemon_pid_for_install", lambda *a: pytest.fail("old gateway did not exit"))
+        assert gw.restart_system_launchd_gateway_for_update() is False
+
+    @pytest.mark.parametrize("state", ["alive", "unknown", "wedged"])
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_system_restart_only_escalates_confirmed_target_wedge(self, ours, monkeypatch, state, wrapped):
+        calls = []
+        target_pid = 5678 if wrapped else 1234
+        monkeypatch.setattr(gw, "get_hermes_home", lambda: ours.home / "profiles" / "other")
+        monkeypatch.setattr(gw, "_probe_system_launchd_gateway_for_install", lambda: (True, 1234, ""))
+        monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gw, "_stderr_wrapper_gateway_children", lambda pid: {5678} if wrapped else None)
+        monkeypatch.setattr(gw, "probe_gateway_loop_liveness", lambda pid, **kw: calls.append(("probe", pid, kw.get("home"))) or state)
+        monkeypatch.setattr(gw, "_get_restart_exit_wait_budget", lambda: 107.0)
+        monkeypatch.setattr(gw, "_graceful_restart_via_sigusr1", lambda pid, budget: calls.append(("drain", pid, budget)) or True)
+        monkeypatch.setattr(gw, "_escalate_wedged_gateway", lambda pid: calls.append(("escalate", pid)) or True)
+        monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda pid, timeout: calls.append(("wrapper-exit", pid)) or True)
+        monkeypatch.setattr(gw, "_wait_for_system_daemon_pid_for_install", lambda pid: calls.append(("fresh", pid)) or True)
+        assert gw.restart_system_launchd_gateway_for_update()
+        assert calls[0] == ("probe", target_pid, ours.home)
+        assert ("fresh", 1234) in calls
+        if state == "wedged":
+            assert ("escalate", target_pid) in calls
+            assert not any(c[0] == "drain" for c in calls)
+        else:
+            assert ("drain", 1234, 107.0) in calls
+            assert not any(c[0] == "escalate" for c in calls)
+
     def test_update_restart_verifies_fresh_pid(self, ours, monkeypatch):
         calls = []
         monkeypatch.setattr(

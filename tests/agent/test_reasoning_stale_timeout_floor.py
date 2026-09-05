@@ -88,6 +88,12 @@ import pytest
     # OpenAI gpt-5.6 terra — deep-reasoning gpt-5.6 on the Codex backend.
     ("gpt-5.6-terra", 300.0),
     ("openai/gpt-5.6-terra", 300.0),
+    # Thinking Machines Inkling — family entry covers -small and the
+    # OpenRouter :free / :batch SKU suffixes (":" is a slug separator
+    # in the right anchor, same as "-").
+    ("thinkingmachines/inkling", 300.0),
+    ("thinkingmachines/inkling:free", 300.0),
+    ("thinkingmachines/inkling-small:free", 300.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor

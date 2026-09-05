@@ -11,6 +11,7 @@ asserting on the text of install.sh.
 """
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -29,11 +30,11 @@ def run_write_marker(install_dir, *, commit="", branch="main"):
     """
     script = f"""
 set -e
-INSTALL_DIR={install_dir!s}
-INSTALL_COMMIT={commit!r}
-BRANCH={branch!r}
+INSTALL_DIR={shlex.quote(str(install_dir))}
+INSTALL_COMMIT={shlex.quote(commit)}
+BRANCH={shlex.quote(branch)}
 # Pull in the function definitions without triggering an install.
-eval "$(sed -n '/^write_bootstrap_marker()/,/^}}/p' {INSTALL_SH!s})"
+eval "$(sed -n '/^write_bootstrap_marker()/,/^}}/p' {shlex.quote(str(INSTALL_SH))})"
 log_warn() {{ echo "WARN: $*" >&2; }}
 write_bootstrap_marker
 """
@@ -43,7 +44,7 @@ write_bootstrap_marker
 
 
 def make_checkout(tmp_path):
-    install_dir = tmp_path / "hermes-agent"
+    install_dir = tmp_path / "Hermes Agent"
     install_dir.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=install_dir, check=True)
     subprocess.run(

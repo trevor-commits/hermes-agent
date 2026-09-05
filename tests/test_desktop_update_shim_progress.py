@@ -122,6 +122,7 @@ FAKE_HERMES = """#!/bin/bash
 case "$*" in *--help*) echo "--keep-stash"; exit 0 ;; esac
 n="$(cat "$HERMES_TEST_CALLS" 2>/dev/null || echo 0)"; n=$((n + 1))
 printf '%s' "$n" > "$HERMES_TEST_CALLS"
+printf '%s' "$HERMES_HOME" > "$HERMES_TEST_CAPTURE.home"
 for f in "$TMPDIR"/hermes-update-status.[0-9]*; do
   case "$f" in *.tmp) continue ;; esac
   cp "$f" "$HERMES_TEST_CAPTURE.$n" 2>/dev/null
@@ -130,8 +131,10 @@ exit "$(cat "$HERMES_TEST_EXITS.$n" 2>/dev/null || echo 0)"
 """
 
 
-def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
+def _run_handoff(tmp_path, exits: dict[int, int], *, hermes_home=None) -> list[dict]:
     """Run the real hand-off end to end; return the stage seen at each call."""
+    hermes_home = hermes_home or tmp_path
+    hermes_home.mkdir(parents=True, exist_ok=True)
     install_root = tmp_path / "hermes-agent"
     (install_root / "venv" / "bin").mkdir(parents=True)
     hermes = install_root / "venv" / "bin" / "hermes"
@@ -146,6 +149,7 @@ def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
     env = {
         **os.environ,
         "TMPDIR": str(tmp_path),
+        "HERMES_HOME": str(hermes_home),
         "HERMES_TEST_CAPTURE": str(capture),
         "HERMES_TEST_CALLS": str(calls),
         "HERMES_TEST_EXITS": str(tmp_path / "exits"),
@@ -165,13 +169,13 @@ def _run_handoff(tmp_path, exits: dict[int, int]) -> list[dict]:
         check=True,
     )
 
-    result = tmp_path / ".hermes-update-result.json"
+    result = hermes_home / ".hermes-update-result.json"
     deadline = time.monotonic() + 45
-    while time.monotonic() < deadline and not result.exists():
+    while time.monotonic() < deadline and not (result.exists() or (tmp_path / ".hermes-update-result.json").exists()):
         time.sleep(0.1)
     assert result.exists(), "hand-off never wrote its result file"
 
-    seen = sorted(tmp_path.glob("seen.*"), key=lambda p: int(p.suffix[1:]))
+    seen = sorted((p for p in tmp_path.glob("seen.*") if p.suffix[1:].isdigit()), key=lambda p: int(p.suffix[1:]))
 
     return [json.loads(p.read_text()) for p in seen]
 
@@ -197,3 +201,14 @@ def test_retry_gate_publishes_a_distinct_stage(tmp_path):
         "Updating code and dependencies",
         "Retrying update",
     ]
+
+
+@requires_posix_handoff
+def test_handoff_preserves_explicit_home_with_separate_install(tmp_path):
+    hermes_home = tmp_path / "external-state" / ".hermes"
+    stages = _run_handoff(tmp_path, {1: 0}, hermes_home=hermes_home)
+    assert len(stages) == 1
+    assert (tmp_path / "seen.home").read_text() == str(hermes_home)
+    assert (hermes_home / ".hermes-update-result.json").exists()
+    assert not (tmp_path / ".hermes-update-result.json").exists()
+    assert not (tmp_path / ".hermes-update-in-progress").exists()

@@ -212,6 +212,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1001",
             "thread_id": "17585",
+            "_resolved_from": "origin",
         }
 
 
@@ -256,6 +257,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "_resolved_from": "explicit",
         }
 
 
@@ -272,6 +274,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345678901234@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
 
@@ -287,6 +290,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_unresolved_target_still_delivered_as_written(self):
@@ -305,6 +309,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "ops-room",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
 
@@ -1499,9 +1504,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, *, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
+            assert isinstance(task_id, str)
+            assert task_id.startswith("cron:skill-env-job:")
             assert "NOTION_API_KEY" in get_all_passthrough()
             return {"final_response": "ok"}
 

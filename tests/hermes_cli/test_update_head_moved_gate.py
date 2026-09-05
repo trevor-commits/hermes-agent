@@ -110,6 +110,14 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     # unsupported, so the phase is a clean no-op for both snapshots.
     import hermes_cli.gateway as hermes_gateway
 
+    # An empty process inventory must also describe no installed launchd jobs.
+    # Git is mocked: preserve injected module evidence instead of evicting it.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    for helper in ("get_launchd_plist_path", "get_system_launchd_gateway_plist_path"):
+        monkeypatch.setattr(hermes_gateway, helper, lambda: tmp_path / "absent.plist")
+    monkeypatch.setattr(hermes_gateway, "launchd_gateway_labels_for_install", lambda: [])
+    monkeypatch.setattr(hermes_gateway, "_get_service_pids", lambda **kw: set())
+    monkeypatch.setattr("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda: None)
     monkeypatch.setattr(
         hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
     )

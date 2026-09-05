@@ -226,7 +226,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return
     }
 
-    const content = message.content || message.text || message.context || message.name
+    const content =
+      message.display_content !== undefined
+        ? message.display_content
+        : message.content || message.text || message.context || message.name
 
     // Classify before display normalization: displayContentForMessage trims
     // ordinary user text, and trimming first could turn a real prompt with a

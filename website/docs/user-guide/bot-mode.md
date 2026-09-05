@@ -109,6 +109,14 @@ agent:
 Bot-to-bot delivery is per-invocation: the receiving Bot picks the message up when it next runs. Live interrupt of a Bot mid-conversation is future work.
 :::
 
+### Failed turns retry safely
+
+A failed delivery turn is retried at most once, and only when a retry can actually help. Transient failures (target runtime offline, delivery timeout, provider rate limit or server error) re-run the same Bot Chat session unchanged. A context-overflow failure also re-runs the same session — the retried turn compacts the over-threshold transcript via the standard context-compression pass before calling the model, so the retry fits where the original didn't. Auth, quota, and configuration failures never auto-retry: a second attempt cannot fix them and only burns quota, so the failure is surfaced immediately. A retried turn never starts a fresh session — your Bot Chat history and context stay intact.
+
+### When a delivery fails: typed reasons
+
+A failed bot turn or relay delivery carries a machine-readable `reason` code alongside the human error text, end to end: the target gateway classifies the failure (`provider_auth_or_access`, `provider_quota_limit`, `provider_rate_limit`, `provider_server_error`, `context_overflow`, `missing_config`, `model_unavailable`, `runtime_offline`, `queued_expired`, `delivery_timeout`, `target_busy`, `unknown`), the Desktop forwards it, and the sending agent's completion notification is tagged `[reason: <code>]` ahead of the error text. A calling agent can branch on the code — "sign in again" vs "retry later" — instead of parsing provider prose. The Desktop's needs-attention badge uses the same codes.
+
 ### Messaging across connected machines (the Desktop relay)
 
 Every gateway you register in **Settings → Connections** — local, remote URL, SSH, Hermes Cloud, docker — is a persistent line the Desktop holds open, and Bot Mode uses those lines for messaging automatically. No extra setup:
@@ -126,13 +134,32 @@ hermes peer add spark --url http://spark.lan:8377 --key <API_SERVER_KEY>
 hermes peer list
 hermes peer dm spark < /tmp/dm.txt        # message body from a file (nothing shell-interpreted)
 hermes peer dm spark/researcher < /tmp/dm.txt   # named profile on a multiplexed peer
+hermes peer run spark --idempotency-key ticket-123 < /tmp/long-task.txt
+hermes peer status spark run_abc123
+hermes peer stop spark run_abc123
 ```
 
 `hermes peer dm` delivers into the remote agent's canonical Bot Chat over the peer's existing API server, runs one agent turn there, and prints the reply on stdout — the exact cross-machine twin of the local `hermes -p <bot> chat` command.
 
+Use `peer dm` only for short queries and receipts because it holds one HTTP
+connection until the turn finishes. For a long turn, `peer run` returns a
+`run_id` immediately; poll it with `peer status`. The run inherits the
+canonical Bot Chat transcript, and a stable `--idempotency-key` makes a retry
+return the original run instead of starting duplicate work. Use `peer stop`
+with that exact run ID to interrupt it without targeting another turn.
+
 Once a peer is registered, the messaging protocol taught to every Bot Chat (`agent.bot_mode_protocol`) automatically includes the peer roster, and `message_agent` accepts peer targets directly — `message_agent(target="spark/researcher", …)`, or `target="spark"` for the peer's main agent — so **your bots learn on their own** that teammates exist on other machines and how to reach them. Registering or removing a peer refreshes each Bot Chat's protocol on its next message (capability epoch).
 
 Requirements: the peer machine runs the `api_server` gateway platform with a strong `API_SERVER_KEY`; reachability is your network's business (LAN, Tailscale, VPN). The key is a credential and lives in `~/.hermes/.env` as `HERMES_PEER_<NAME>_KEY`; peer names/URLs live in `config.yaml` under `bot_peers`.
+
+:::note One-way reachability (NAT)
+Cross-gateway links are direct gateway-to-gateway connections — Desktop is a
+viewer, not a relay. A gateway behind home NAT can dial out to a public peer
+(laptop → VPS works), but the reverse direction has no inbound route
+(VPS → home fails) unless your network provides one. If your Group Chat spans
+a NAT boundary, put the room's authority on the host every participant can
+reach (typically the public VPS), or bridge the network with Tailscale/VPN.
+:::
 
 ## Bots across machines
 

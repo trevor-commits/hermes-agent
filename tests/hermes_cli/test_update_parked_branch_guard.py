@@ -611,3 +611,37 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_same_branch_update_preserves_committed_changes(repo_pair, monkeypatch, conflict):
+    """A local commit and a remote commit can diverge on the SAME branch."""
+    _git(repo_pair, "checkout", "main")
+    local_file = repo_pair / ("a.txt" if conflict else "customization.txt")
+    local_file.write_text("keep my customization\n")
+    _git(repo_pair, "add", local_file.name)
+    _git(repo_pair, "commit", "-qm", "personal customization")
+    local_tip = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class BeforeDependencies(Exception):
+        pass
+
+    def stop_before_dependencies(*args, **kwargs):
+        raise BeforeDependencies
+
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", stop_before_dependencies)
+    args = SimpleNamespace(branch="main", yes=True, force=False, force_venv=False)
+    if conflict:
+        with pytest.raises(SystemExit) as exc:
+            hermes_main.cmd_update(args)
+        assert exc.value.code == 1
+        assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == local_tip
+        assert not _git(repo_pair, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).stdout
+    else:
+        with pytest.raises(BeforeDependencies):
+            hermes_main.cmd_update(args)
+        assert _git(repo_pair, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode == 0
+    assert _git(repo_pair, "merge-base", "--is-ancestor", local_tip, "HEAD").returncode == 0
+    assert local_file.read_text() == "keep my customization\n"
+    assert _git(repo_pair, "status", "--porcelain").stdout == ""
