@@ -730,28 +730,28 @@ def _warn_malformed_secret(provider_id: str, source: str) -> None:
 
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
-) -> tuple[str, str]:
-    """Resolve an API-key provider's token and indicate where it came from."""
+) -> tuple[str, str, str]:
+    """Resolve a token, source, and its paired endpoint in the same read."""
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
         try:
             from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
             token, source = resolve_copilot_token()
             if token:
-                api_token, _base_url = get_copilot_api_token(token)
-                return api_token, source
+                api_token, base_url = get_copilot_api_token(token)
+                return api_token, source, base_url
         except ValueError as exc:
             logger.warning("Copilot token validation failed: %s", exc)
         except Exception:
             pass
-        return "", ""
+        return "", "", ""
 
-    from hermes_cli.config import get_env_value_prefer_dotenv
+    from agent.credential_pool import get_env_credential
     for env_var in pconfig.api_key_env_vars:
         # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
         # in the user's .env file isn't shadowed by a stale shell export
         # inherited from a parent process (Codex CLI, test runners, etc.).
-        val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        val, shared_url = get_env_credential(env_var, provider=provider_id)
         if not has_usable_secret(val):
             continue
         if not _secret_matches_declared_prefix(provider_id, val):
@@ -760,7 +760,7 @@ def _resolve_api_key_provider_secret(
             # looking instead of returning it.
             _warn_malformed_secret(provider_id, env_var)
             continue
-        return val, env_var
+        return val, f"shared-env:{env_var}" if shared_url else env_var, shared_url
 
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
@@ -787,11 +787,11 @@ def _resolve_api_key_provider_secret(
                 if not _secret_matches_declared_prefix(provider_id, key):
                     _warn_malformed_secret(provider_id, f"credential_pool:{provider_id}")
                     continue
-                return key, f"credential_pool:{provider_id}"
+                return key, f"credential_pool:{provider_id}", getattr(entry, "runtime_base_url", "") or ""
     except Exception:
         pass
 
-    return "", ""
+    return "", "", ""
 
 
 # =============================================================================
@@ -2030,6 +2030,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # Exclude CLAUDE_CODE_OAUTH_TOKEN — it's set by Claude Code itself,
     # not by the user explicitly configuring anthropic in Hermes.
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    from agent.credential_pool import get_env_prefer_dotenv
     pconfig = PROVIDER_REGISTRY.get(normalized)
     # Fallback to ProviderDef from models.dev catalog when the provider
     # isn't in the manually-maintained PROVIDER_REGISTRY (e.g. openrouter).
@@ -2041,7 +2042,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(get_env_prefer_dotenv(env_var, provider=normalized)):
                 return True
 
     # AWS SDK providers (Bedrock) have auth_type="aws_sdk" and empty
@@ -2077,7 +2078,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
-                if env_var and has_usable_secret(os.getenv(env_var, "")):
+                if env_var and has_usable_secret(get_env_prefer_dotenv(env_var, provider=normalized)):
                     return True
                 continue
             if (
@@ -7249,11 +7250,12 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    api_key, key_source, credential_url = _resolve_api_key_provider_secret(provider_id, pconfig)
 
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+    env_url = credential_url or env_url
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -7438,7 +7440,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    api_key, key_source, credential_url = _resolve_api_key_provider_secret(provider_id, pconfig)
 
     # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
     # see the local server as configured. doctor still reports unconfigured
@@ -7450,6 +7452,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+    env_url = credential_url or env_url
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)

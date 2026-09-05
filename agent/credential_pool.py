@@ -3246,10 +3246,15 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 # changes to the .env file. load_env() memoizes on the .env mtime, so
 # per-call reads (pool seeding, per-turn credential refresh) cost a stat()
 # when the file is unchanged.
-def get_env_prefer_dotenv(key: str) -> str:
+def get_env_credential(key: str, *, provider: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve a model secret and its shared endpoint without merging environments."""
+    from agent.secret_scope import current_secret_scope, load_env_file
+
     env_file = load_env()
     raw = env_file.get(key, "").strip()
     scoped_value = (_get_secret(key, "") or "").strip()
+    if provider and auth_mod.is_source_suppressed(provider, f"env:{key}"):
+        return "", ""
     # If .env contains an unresolved op:// reference, prefer the
     # already-resolved value supplied by the active secret scope (or by
     # os.environ in legacy single-profile mode), set by
@@ -3261,8 +3266,80 @@ def get_env_prefer_dotenv(key: str) -> str:
     # config block.  For every non-op:// value the original
     # .env-takes-precedence behaviour is preserved unchanged.
     if raw.startswith("op://") and scoped_value:
-        return scoped_value
-    return raw or scoped_value
+        return scoped_value, ""
+    if not provider:
+        return raw or scoped_value, ""
+    if key in env_file or key in (current_secret_scope() or {}):
+        return raw if key in env_file else scoped_value, ""
+
+    # Native profile auth already borrows root pool rows. Env-backed rows only
+    # persist references, so hydrate those references from their owning .env.
+    root_path = _global_auth_file_path()
+    if root_path is None:
+        return scoped_value, ""
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if provider == "openrouter":
+        allowed_keys = ("OPENROUTER_API_KEY",)
+    else:
+        allowed_keys = pconfig.api_key_env_vars if pconfig else ()
+    if key not in allowed_keys:
+        return scoped_value, ""
+    source = f"env:{key}"
+    def provider_section(store, section, default):
+        container = store.get(section)
+        value = container.get(provider) if isinstance(container, dict) else None
+        accepted = (list, dict) if section == "suppressed_sources" else type(default)
+        return value if isinstance(value, accepted) else default
+
+    root_store = auth_mod._load_global_auth_store()
+    root_entries = provider_section(root_store, "credential_pool", [])
+    root_entry = next((e for e in root_entries if isinstance(e, dict) and e.get("source") == source), None)
+    local_store = _load_auth_store()
+    local_entries = provider_section(local_store, "credential_pool", [])
+    if root_entry is None:
+        # A deleted shared reference must not revive a stale parent export.
+        if any(isinstance(e, dict) and e.get("source") == source for e in local_entries):
+            return "", ""
+        return scoped_value, ""
+    root_sources = {e.get("source") for e in root_entries if isinstance(e, dict)}
+    if (
+        provider_section(local_store, "providers", {})
+        or any(
+            not isinstance(e, dict)
+            or not str(e.get("source", "")).startswith("env:")
+            or e.get("source") not in root_sources
+            or any(e.get(field) for field in ("access_token", "refresh_token", "api_key", "agent_key"))
+            for e in local_entries
+        )
+        or any(source in provider_section(store, "suppressed_sources", []) for store in (local_store, root_store))
+    ):
+        return "", ""
+
+    base_url = str(root_entry.get("base_url") or (pconfig.inference_base_url if pconfig else OPENROUTER_BASE_URL)).rstrip("/")
+    config = _load_config_safe() or {}
+    model = config.get("model") or {}
+    local_configs = [provider_section(config, "providers", {})]
+    if isinstance(model, dict) and model.get("provider") == provider:
+        local_configs.append(model)
+    for entry in local_configs:
+        if isinstance(entry, dict) and (
+            entry.get("api_key")
+            or (entry.get("base_url") and str(entry["base_url"]).rstrip("/") != base_url)
+        ):
+            return "", ""
+    if pconfig and pconfig.base_url_env_var:
+        local_url = get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+        if local_url and local_url != base_url:
+            return "", ""
+    value = load_env_file(root_path.with_name(".env")).get(key, "").strip()
+    # A reference requires its owner's secret resolver; never send the URI.
+    if value.startswith("op://"):
+        value = ""
+    return value, base_url
+
+
+def get_env_prefer_dotenv(key: str, *, provider: Optional[str] = None) -> str:
+    return get_env_credential(key, provider=provider)[0]
 
 
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
@@ -3329,7 +3406,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     if provider == "openrouter":
         # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
+        token, shared_url = get_env_credential("OPENROUTER_API_KEY", provider=provider)
         if token:
             source = "env:OPENROUTER_API_KEY"
             if _is_source_suppressed(provider, source):
@@ -3343,7 +3420,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
                     source=source,
                     env_var="OPENROUTER_API_KEY",
                     token=token,
-                    base_url=OPENROUTER_BASE_URL,
+                    base_url=shared_url or OPENROUTER_BASE_URL,
                 ),
             )
         return changed, active_sources
@@ -3366,18 +3443,18 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     for env_var in env_vars:
         # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv(env_var)
+        token, shared_url = get_env_credential(env_var, provider=provider)
         if not token:
             continue
         source = f"env:{env_var}"
         if _is_source_suppressed(provider, source):
             continue
         active_sources.add(source)
-        base_url = env_url or pconfig.inference_base_url
+        base_url = shared_url or env_url or pconfig.inference_base_url
         if provider == "kimi-coding":
-            base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, shared_url or env_url)
         elif provider == "zai":
-            base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, shared_url or env_url)
         changed |= _upsert_entry(
             entries,
             provider,

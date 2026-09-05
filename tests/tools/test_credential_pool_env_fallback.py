@@ -121,7 +121,7 @@ class TestAuthResolvesFromDotEnv:
         assert "DEEPSEEK_API_KEY" not in os.environ
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
-        key, source = _resolve_api_key_provider_secret(
+        key, source, _base_url = _resolve_api_key_provider_secret(
             provider_id="deepseek",
             pconfig=_make_pconfig(),
         )
@@ -141,7 +141,7 @@ class TestAuthResolvesFromDotEnv:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "stale-shell-deepseek")
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
-        key, source = _resolve_api_key_provider_secret(
+        key, source, _base_url = _resolve_api_key_provider_secret(
             provider_id="deepseek",
             pconfig=_make_pconfig(),
         )
@@ -179,7 +179,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool):
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
@@ -193,7 +193,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool):
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
@@ -208,7 +208,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )
@@ -227,7 +227,7 @@ class TestAuthCredentialPoolFallback:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=mock_pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig(),
             )

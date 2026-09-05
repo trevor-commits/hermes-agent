@@ -1835,6 +1835,17 @@ def _resolve_explicit_runtime(
         api_key = explicit_api_key
         if not api_key:
             creds = resolve_api_key_provider_credentials(provider)
+            if (
+                str(creds.get("source", "")).startswith("shared-env:")
+                and explicit_base_url
+                and explicit_base_url != str(creds.get("base_url", "")).rstrip("/")
+            ):
+                raise AuthError(
+                    "A shared profile key cannot be used with a different endpoint. "
+                    "Configure a profile-specific key for this endpoint.",
+                    provider=provider,
+                    code="shared_credential_endpoint_mismatch",
+                )
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")

@@ -102,7 +102,7 @@ class TestCallerIntegration:
 
         # Create a minimal pconfig mock
         pconfig = MagicMock()
-        token, source = _resolve_api_key_provider_secret("copilot", pconfig)
+        token, source, _base_url = _resolve_api_key_provider_secret("copilot", pconfig)
         assert token == "exchanged_jwt"
         assert source == "GH_TOKEN"
         mock_exchange.assert_called_once_with("gho_raw")

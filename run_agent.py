@@ -6102,7 +6102,7 @@ class AIAgent:
         if getattr(self, "_fallback_activated", False):
             return False
         try:
-            from agent.credential_pool import get_env_prefer_dotenv
+            from agent.credential_pool import get_env_credential, get_env_prefer_dotenv
             from hermes_cli.auth import PROVIDER_REGISTRY
         except ImportError:
             return False
@@ -6115,7 +6115,7 @@ class AIAgent:
         ):
             api_key = ""
             for env_var in pconfig.api_key_env_vars:
-                api_key = get_env_prefer_dotenv(env_var).strip()
+                api_key, shared_url = get_env_credential(env_var, provider=self.provider)
                 if api_key:
                     break
             if not api_key:
@@ -6125,18 +6125,18 @@ class AIAgent:
             if pconfig.base_url_env_var:
                 env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
-            base_url = env_url or default_base
+            base_url = shared_url or env_url or default_base
             if self.provider == "kimi-coding":
                 from hermes_cli.auth import _resolve_kimi_base_url
 
                 base_url = _resolve_kimi_base_url(
-                    api_key, pconfig.inference_base_url, env_url
+                    api_key, pconfig.inference_base_url, shared_url or env_url
                 ).rstrip("/")
             elif self.provider == "zai":
                 from hermes_cli.auth import _resolve_zai_base_url
 
                 base_url = _resolve_zai_base_url(
-                    api_key, pconfig.inference_base_url, env_url
+                    api_key, pconfig.inference_base_url, shared_url or env_url
                 ).rstrip("/")
         elif self.provider == "custom":
             # Named custom provider (#67935): identity lives in config

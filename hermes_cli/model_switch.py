@@ -2449,7 +2449,7 @@ import threading as _threading  # noqa: E402
 _picker_prewarm_done = _threading.Event()
 
 
-def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False) -> bool:
+def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False, for_picker: bool = False) -> bool:
     """Return whether *provider* has a credential that can be selected now.
 
     ``auth.json`` historically allowed opaque token-style pool values that do
@@ -2462,7 +2462,7 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
 
         pool = load_pool(provider)
         if pool.has_credentials():
-            return pool.has_available()
+            return for_picker or pool.has_available()
     except Exception:
         pass
     return raw_pool_present
@@ -2706,17 +2706,14 @@ def _collect_authed_provider_slugs(
             env_vars = pdata.get("env", [])
             if not isinstance(env_vars, list):
                 continue
-        has_creds = any(_scoped_key_env(ev) for ev in env_vars)
+        from agent.credential_pool import get_env_prefer_dotenv
+        has_creds = any(get_env_prefer_dotenv(ev, provider=hermes_id) for ev in env_vars)
         if not has_creds:
             try:
-                store = _load_auth_store()
-                raw_pool_present = bool(
-                    store and store.get("credential_pool", {}).get(hermes_id)
+                from hermes_cli.auth import read_credential_pool
+                has_creds = _credential_pool_is_usable(
+                    hermes_id, raw_pool_present=bool(read_credential_pool(hermes_id))
                 )
-                if raw_pool_present:
-                    has_creds = _credential_pool_is_usable(
-                        hermes_id, raw_pool_present=True
-                    )
             except Exception:
                 pass
         if has_creds:
@@ -3110,18 +3107,15 @@ def list_authenticated_providers(
                 continue
 
         # Check if any env var is set
-        has_creds = any(os.environ.get(ev) for ev in env_vars)
+        from agent.credential_pool import get_env_prefer_dotenv
+        has_creds = any(get_env_prefer_dotenv(ev, provider=hermes_id) for ev in env_vars)
         if not has_creds:
             try:
-                from hermes_cli.auth import _load_auth_store
-                store = _load_auth_store()
-                raw_pool_present = bool(
-                    store and store.get("credential_pool", {}).get(hermes_id)
+                from hermes_cli.auth import read_credential_pool
+                has_creds = _credential_pool_is_usable(
+                    hermes_id, raw_pool_present=bool(read_credential_pool(hermes_id)),
+                    for_picker=for_picker,
                 )
-                if raw_pool_present:
-                    has_creds = _credential_pool_is_usable(
-                        hermes_id, raw_pool_present=True
-                    )
             except Exception:
                 pass
         if not has_creds:
@@ -3209,13 +3203,15 @@ def list_authenticated_providers(
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
         elif overlay.extra_env_vars:
-            has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
+            from agent.credential_pool import get_env_prefer_dotenv
+            has_creds = any(get_env_prefer_dotenv(ev, provider=hermes_slug) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
                 pcfg = _auth_registry.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
-                    if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
+                    from agent.credential_pool import get_env_prefer_dotenv
+                    if any(get_env_prefer_dotenv(ev, provider=hermes_slug) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
         # Check auth store and credential pool for non-env-var credentials.
@@ -3237,22 +3233,8 @@ def list_authenticated_providers(
         # imports on demand but aren't in the raw auth.json yet.
         if not has_creds:
             try:
-                if _credential_pool_is_usable(hermes_slug):
+                if _credential_pool_is_usable(hermes_slug, for_picker=for_picker):
                     has_creds = True
-                elif for_picker:
-                    # For the interactive /model picker, also show providers
-                    # whose credential pool has entries but all are temporarily
-                    # rate-limited.  Rate limits are per-model for many
-                    # providers (e.g. Google Gemini) — switching to a different
-                    # model under the same provider may work even when all keys
-                    # are in cooldown.
-                    try:
-                        from agent.credential_pool import load_pool
-                        _pool = load_pool(hermes_slug)
-                        if _pool.has_credentials():
-                            has_creds = True
-                    except Exception:
-                        pass
             except Exception as exc:
                 logger.debug("Credential pool check failed for %s: %s", hermes_slug, exc)
         # Fallback: check external credential files directly.

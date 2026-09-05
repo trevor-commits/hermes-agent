@@ -310,6 +310,7 @@ def build_model_options_payload(
         explicit_only=bool(explicit_only),
         include_unconfigured=bool(include_unconfigured),
         picker_hints=True,
+        for_picker=True,
         canonical_order=True,
         pricing=True,
         capabilities=True,
