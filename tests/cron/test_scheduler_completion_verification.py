@@ -320,6 +320,10 @@ def test_completion_outcome_agrees_in_native_job_ledger_and_session(
             return {"completed": True, "failed": False, "final_response": response}
 
     (tmp_path / "scripts").mkdir()
+    # Dispatched fires run under the job home's secret scope, where tuning
+    # settings resolve from that home's .env (never the outer environ), so
+    # the model precondition must be satisfied inside the fixture home itself.
+    (tmp_path / ".env").write_text("HERMES_MODEL=test-model\n")
     (tmp_path / "scripts" / "verify.py").write_text(
         "import os, sqlite3\nfrom pathlib import Path\n"
         "home = Path(os.environ['HERMES_HOME'])\n"

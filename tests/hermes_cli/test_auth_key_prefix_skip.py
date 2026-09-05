@@ -77,7 +77,7 @@ class TestMalformedEnvKeySkipped:
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=pool):
             with caplog.at_level(logging.WARNING):
-                key, source = _resolve_api_key_provider_secret(
+                key, source, _base_url = _resolve_api_key_provider_secret(
                     provider_id="openrouter",
                     pconfig=_make_pconfig("openrouter"),
                 )
@@ -96,7 +96,7 @@ class TestMalformedEnvKeySkipped:
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=pool):
             with caplog.at_level(logging.WARNING):
-                key, source = _resolve_api_key_provider_secret(
+                key, source, _base_url = _resolve_api_key_provider_secret(
                     provider_id="openrouter",
                     pconfig=_make_pconfig("openrouter"),
                 )
@@ -112,7 +112,7 @@ class TestMalformedEnvKeySkipped:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=pool):
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="openrouter",
                 pconfig=_make_pconfig("openrouter"),
             )
@@ -129,7 +129,7 @@ class TestNoDeclaredPrefixUnaffected:
         from hermes_cli.auth import _resolve_api_key_provider_secret
         pool = _mock_pool(_entry("pool-key-should-not-win"))
         with patch("agent.credential_pool.load_pool", return_value=pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="deepseek",
                 pconfig=_make_pconfig("deepseek"),
             )
@@ -147,7 +147,7 @@ class TestValidEnvKeyStillWins:
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
         with patch("agent.credential_pool.load_pool", return_value=pool) as mp:
-            key, source = _resolve_api_key_provider_secret(
+            key, source, _base_url = _resolve_api_key_provider_secret(
                 provider_id="openrouter",
                 pconfig=_make_pconfig("openrouter"),
             )
@@ -164,7 +164,7 @@ class TestValidEnvKeyStillWins:
         )
 
         from hermes_cli.auth import _resolve_api_key_provider_secret
-        key, source = _resolve_api_key_provider_secret(
+        key, source, _base_url = _resolve_api_key_provider_secret(
             provider_id="openrouter",
             pconfig=_make_pconfig(
                 "openrouter", env_vars=["OPENROUTER_API_KEY", "OPENROUTER_KEY"]

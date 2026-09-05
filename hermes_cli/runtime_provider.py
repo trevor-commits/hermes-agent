@@ -732,6 +732,19 @@ def _explicit_api_key_provider(provider, pconfig, requested_provider, model_cfg,
     base_url = _actual_url(provider, base_url)
     if not api_key:
         creds = resolve_api_key_provider_credentials(provider)
+        if (
+            str(creds.get("source", "")).startswith("shared-env:")
+            and base_url
+            and base_url.rstrip("/") != str(creds.get("base_url", "")).rstrip("/")
+        ):
+            # Keeper patch e038df38: a shared profile key is bound to its owner's
+            # endpoint; an explicit different endpoint must use a profile-specific key.
+            raise AuthError(
+                "A shared profile key cannot be used with a different endpoint. "
+                "Configure a profile-specific key for this endpoint.",
+                provider=provider,
+                code="shared_credential_endpoint_mismatch",
+            )
         api_key = creds.get("api_key", "")
         if not base_url:
             base_url = _actual_url(provider, creds.get("base_url", "").rstrip("/"))

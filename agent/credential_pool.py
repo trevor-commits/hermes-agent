@@ -2847,22 +2847,109 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
     return seed.result
 
 
-def get_env_prefer_dotenv(key: str) -> str:
-    """Resolve a credential env var, preferring ~/.hermes/.env over os.environ.
+def get_env_credential(key: str, *, provider: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve a model secret and its shared endpoint without merging environments.
 
-    The user's config file is authoritative; stale env vars from parent
-    processes (Codex CLI, test scripts) must not override deliberate .env
-    changes. load_env() memoizes on mtime, so per-call reads cost a stat().
-    An unresolved ``op://`` reference in .env yields to the already-resolved
-    value from the active secret scope (set by apply_onepassword_secrets());
-    otherwise every provider auth attempt would receive a URL instead of a key.
+    Keeper patch e038df38 (shared profile model access), adapted to the
+    current seeding architecture: a named profile with no local override may
+    borrow an ``env:`` reference owned by the global root, hydrating the key
+    from the owner's .env and pairing it with the owner's endpoint. Local
+    secrets, suppressions and endpoint mismatches fail closed to the profile's
+    own value only.
     """
+    from agent.secret_scope import current_secret_scope, load_env_file
+
     env_file = load_env()
     raw = env_file.get(key, "").strip()
     scoped_value = (_get_secret(key, "") or "").strip()
+    if provider and auth_mod.is_source_suppressed(provider, f"env:{key}"):
+        return "", ""
+    # If .env contains an unresolved op:// reference, prefer the
+    # already-resolved value supplied by the active secret scope (or by
+    # os.environ in legacy single-profile mode), set by
+    # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
+    # "op://Vault/Item/field" string would otherwise win and every
+    # provider auth attempt would receive a URL instead of a key.  This
+    # happens during a partial migration, or when the user wrote op://
+    # references straight into .env rather than the secrets.onepassword
+    # config block.  For every non-op:// value the original
+    # .env-takes-precedence behaviour is preserved unchanged.
     if raw.startswith("op://") and scoped_value:
-        return scoped_value
-    return raw or scoped_value
+        return scoped_value, ""
+    if not provider:
+        return raw or scoped_value, ""
+    if key in env_file or key in (current_secret_scope() or {}):
+        return raw if key in env_file else scoped_value, ""
+
+    # Native profile auth already borrows root pool rows. Env-backed rows only
+    # persist references, so hydrate those references from their owning .env.
+    root_path = _global_auth_file_path()
+    if root_path is None:
+        return scoped_value, ""
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if provider == "openrouter":
+        allowed_keys = ("OPENROUTER_API_KEY",)
+    else:
+        allowed_keys = pconfig.api_key_env_vars if pconfig else ()
+    if key not in allowed_keys:
+        return scoped_value, ""
+    source = f"env:{key}"
+    def provider_section(store, section, default):
+        container = store.get(section)
+        value = container.get(provider) if isinstance(container, dict) else None
+        accepted = (list, dict) if section == "suppressed_sources" else type(default)
+        return value if isinstance(value, accepted) else default
+
+    root_store = auth_mod._load_global_auth_store()
+    root_entries = provider_section(root_store, "credential_pool", [])
+    root_entry = next((e for e in root_entries if isinstance(e, dict) and e.get("source") == source), None)
+    local_store = _load_auth_store()
+    local_entries = provider_section(local_store, "credential_pool", [])
+    if root_entry is None:
+        # A deleted shared reference must not revive a stale parent export.
+        if any(isinstance(e, dict) and e.get("source") == source for e in local_entries):
+            return "", ""
+        return scoped_value, ""
+    root_sources = {e.get("source") for e in root_entries if isinstance(e, dict)}
+    if (
+        provider_section(local_store, "providers", {})
+        or any(
+            not isinstance(e, dict)
+            or not str(e.get("source", "")).startswith("env:")
+            or e.get("source") not in root_sources
+            or any(e.get(field) for field in ("access_token", "refresh_token", "api_key", "agent_key"))
+            for e in local_entries
+        )
+        or any(source in provider_section(store, "suppressed_sources", []) for store in (local_store, root_store))
+    ):
+        return "", ""
+
+    base_url = str(root_entry.get("base_url") or (pconfig.inference_base_url if pconfig else OPENROUTER_BASE_URL)).rstrip("/")
+    config = _load_config_safe() or {}
+    model = config.get("model") or {}
+    local_configs = [provider_section(config, "providers", {})]
+    if isinstance(model, dict) and model.get("provider") == provider:
+        local_configs.append(model)
+    for entry in local_configs:
+        if isinstance(entry, dict) and (
+            entry.get("api_key")
+            or (entry.get("base_url") and str(entry["base_url"]).rstrip("/") != base_url)
+        ):
+            return "", ""
+    if pconfig and pconfig.base_url_env_var:
+        local_url = get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+        if local_url and local_url != base_url:
+            return "", ""
+    value = load_env_file(root_path.with_name(".env")).get(key, "").strip()
+    # A reference requires its owner's secret resolver; never send the URI.
+    if value.startswith("op://"):
+        value = ""
+    return value, base_url
+
+
+def get_env_prefer_dotenv(key: str, *, provider: Optional[str] = None) -> str:
+    """Token-only read (legacy shape); provider-scoped shared references resolve the pair."""
+    return get_env_credential(key, provider=provider)[0]
 
 
 # Providers already warned about env-key -> pool ingestion, once per process
@@ -2955,10 +3042,10 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     if provider == "openrouter":
         for env_var in _env_key_var_candidates(["OPENROUTER_API_KEY"], entries):
-            token = get_env_prefer_dotenv(env_var)
+            token, shared_url = get_env_credential(env_var, provider=provider)
             if token and seed.upsert(
                 f"env:{env_var}",
-                _env_payload(env_var=env_var, token=token, base_url=OPENROUTER_BASE_URL),
+                _env_payload(env_var=env_var, token=token, base_url=shared_url or OPENROUTER_BASE_URL),
             ):
                 _warn_env_ingestion_once(provider, env_var)
         return seed.result
@@ -2978,12 +3065,12 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
-        token = get_env_prefer_dotenv(env_var)
+        token, shared_url = get_env_credential(env_var, provider=provider)
         if not token:
             continue
-        base_url = env_url or pconfig.inference_base_url
+        base_url = shared_url or env_url or pconfig.inference_base_url
         if resolve_base_url is not None:
-            base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
+            base_url = resolve_base_url(token, pconfig.inference_base_url, shared_url or env_url)
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
     return seed.result
 

@@ -103,3 +103,19 @@ def test_picker_shows_exhausted_pool_provider(monkeypatch):
         "Picker must show exhausted-pool providers so the user can select "
         "a different model under the same provider"
     )
+
+def test_shared_model_options_keeps_exhausted_provider_visible(monkeypatch):
+    """The shared model-options payload must also keep an exhausted pool
+    visible (keeper e038df38 contract: visibility only, never availability)."""
+    from hermes_cli import inventory
+    from hermes_cli.model_switch_providers import _credential_pool_is_usable
+
+    _patch_opencode_pool(monkeypatch, available=False)
+    for name in ("_apply_pricing", "_apply_capabilities", "_apply_featured"):
+        monkeypatch.setattr(inventory, name, lambda *a, **kw: None)
+    result = inventory.build_model_options_payload(
+        inventory.ConfigContext("alibaba", "", "", {}, [])
+    )
+    assert "opencode-go" in [p["slug"] for p in result["providers"]]
+    assert not _credential_pool_is_usable("opencode-go")
+

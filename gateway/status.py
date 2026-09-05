@@ -739,10 +739,12 @@ def _command_line_belongs_to_profile(
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).lower().replace("\\", "/").rstrip("/")
     profile = profile_flag_value(command)
-    if profile is not None:
-        # Hermes applies --profile before reading HERMES_HOME. A mismatching
-        # flag must never fall through to a different home's environment.
-        return profile_name not in (None, "default") and profile.lower() == profile_name.lower()
+    if profile is not None and profile.lower() not in ((profile_name or "").lower(), "default"):
+        # Hermes applies --profile before reading HERMES_HOME. A flag naming a
+        # DIFFERENT profile must never fall through to this home's environment.
+        # A flag naming this profile (or the default profile on a default home,
+        # #100817) falls through so env evidence and the branch rules below apply.
+        return False
     declared_homes = [
         token.partition("=")[2]
         for token in (_gateway_command_tokens(command) or [])
@@ -759,10 +761,11 @@ def _command_line_belongs_to_profile(
     if not process_home and process_home is not _UNSET:
         names_home = names_home or command_line_names_hermes_home(command_lc, home_lc)
     if profile_name is not None and profile_name != "default":
-        # Keeper precedence: a read process's OWN environment (HERMES_HOME) outranks an embedded
-        # runtime_command home, so one profile's gateway can never be adopted for another's.
-        # Upstream #100817 still applies: an explicit ``--profile <name>`` flag names this profile.
-        if process_home is _UNSET and profile_flag_value(command_lc) == profile_name.lower():
+        # Keeper precedence: for flagless commands a read process's OWN environment
+        # (HERMES_HOME) outranks an embedded runtime_command home, so one profile's
+        # gateway can never be adopted for another's. An explicit ``--profile <name>``
+        # flag naming THIS profile is the strongest argv signal and accepts on its own.
+        if profile_flag_value(command_lc) == profile_name.lower():
             return True
         return names_home
     # Default profile: accept unless argv names another profile (any spelling the CLI pre-parser

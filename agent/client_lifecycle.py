@@ -689,20 +689,24 @@ class ClientLifecycleMixin:
         Covers registry api-key providers and named custom providers with ``key_env``.
         """
         try:
-            from agent.credential_pool import get_env_prefer_dotenv
+            from agent.credential_pool import get_env_credential, get_env_prefer_dotenv
             from hermes_cli.auth import PROVIDER_REGISTRY
         except ImportError:
             return None
         pconfig = PROVIDER_REGISTRY.get(self.provider)
         if pconfig and getattr(pconfig, "auth_type", "") == "api_key" and getattr(pconfig, "api_key_env_vars", ()):
-            # First non-empty env var wins (lazy: later vars are not read).
-            api_key = next((k for k in (get_env_prefer_dotenv(v).strip() for v in pconfig.api_key_env_vars) if k), "")
+            # First non-empty env var wins (lazy: later vars are not read). The
+            # provider-scoped read (keeper e038df38) pairs a borrowed shared
+            # reference with its owner's endpoint instead of merging environments.
+            api_key, shared_url = next(
+                ((k, u) for k, u in (get_env_credential(v, provider=self.provider) for v in pconfig.api_key_env_vars) if k),
+                ("", ""))
             if not api_key:
                 return None
             url_var = pconfig.base_url_env_var
             env_url = get_env_prefer_dotenv(url_var).strip().rstrip("/") if url_var else ""
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
-            base_url = env_url or default_base
+            base_url = shared_url or env_url or default_base
             if self.provider == "actual":
                 from hermes_cli.auth import normalize_actual_base_url
                 from hermes_cli.runtime_provider import _config_base_url_for_provider, _get_model_config
@@ -711,7 +715,7 @@ class ClientLifecycleMixin:
             elif self.provider in ("kimi-coding", "zai"):
                 from hermes_cli import auth as _auth
                 resolver = _auth._resolve_kimi_base_url if self.provider == "kimi-coding" else _auth._resolve_zai_base_url
-                base_url = resolver(api_key, pconfig.inference_base_url, env_url).rstrip("/")
+                base_url = resolver(api_key, pconfig.inference_base_url, shared_url or env_url).rstrip("/")
         elif self.provider == "custom":
             # Named custom provider: identity in config, credential in key_env; no key_env → nothing to watch.
             try:

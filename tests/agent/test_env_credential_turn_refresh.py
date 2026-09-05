@@ -51,6 +51,9 @@ def env(monkeypatch):
     monkeypatch.setattr(
         cp, "get_env_prefer_dotenv", lambda key: values.get(key, "")
     )
+    monkeypatch.setattr(
+        cp, "get_env_credential", lambda key, **kw: (values.get(key, ""), "")
+    )
     return values
 
 

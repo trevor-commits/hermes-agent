@@ -377,8 +377,13 @@ def _model_level_key_env(provider_id: str) -> str:
     return str(model_cfg.get("key_env") or model_cfg.get("api_key_env") or "").strip()
 
 
-def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) -> tuple[str, str]:
-    """Resolve an API-key provider's token and indicate where it came from."""
+def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) -> tuple[str, str, str]:
+    """Resolve a token, source, and its paired endpoint in the same read.
+
+    Keeper patch e038df38: the endpoint rides with the token so a shared
+    env reference borrowed from the global root cannot be silently paired
+    with a different base URL (or vice versa).
+    """
     if provider_id == "copilot":
         # The dedicated copilot auth module does proper token validation/exchange.
         try:
@@ -386,12 +391,12 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
             token, source = resolve_copilot_token()
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
-                return api_token, source
+                return api_token, source, ""
         except ValueError as exc:
             logger.warning("Copilot token validation failed: %s", exc)
         except Exception:
             pass
-        return "", ""
+        return "", "", ""
 
     # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation in .env isn't shadowed by
     # a stale shell export inherited from a parent process (Codex CLI, test runners, etc.).
@@ -405,14 +410,16 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
     if key_env:
         val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(key_env), key_env)
         if val:
-            return val, key_env
+            return val, key_env, ""
 
+    from agent.credential_pool import get_env_credential
     for env_var in pconfig.api_key_env_vars:
-        val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(env_var), env_var)
+        val, shared_url = get_env_credential(env_var, provider=provider_id)
+        val = _usable_declared_secret(provider_id, val, env_var)
         if val:
             # A provably malformed key (declared prefix mismatch) must not shadow a valid credential-pool
             # entry (#93593). Warn and keep looking instead of returning it.
-            return val, env_var
+            return val, f"shared-env:{env_var}" if shared_url else env_var, shared_url
 
     # Fallback: credential pool (e.g. zai key stored via auth.json). Prefer the pool's own
     # selection (peek) but try the rest too so one malformed entry doesn't block a valid one.
@@ -433,10 +440,10 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
                 key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
                 val = _usable_declared_secret(provider_id, key, pool_source)
                 if val:
-                    return val, pool_source
+                    return val, pool_source, getattr(entry, "runtime_base_url", "") or ""
     except Exception:
         pass
-    return "", ""
+    return "", "", ""
 
 
 # ── Error formatting (AuthError itself lives in auth_constants) ─────────────────────────────────────
@@ -1262,7 +1269,7 @@ def _config_selects_provider(normalized: str) -> bool:
 def _explicit_pool_entry_present(normalized: str) -> bool:
     """Pool rows from EXPLICIT Hermes flows (manual add / device-code / PKCE) or live env keys;
     ambient borrowed sources (gh_cli / claude_code / qwen-cli) are deliberately excluded."""
-    return any(_pool_entry_is_explicit(entry) for entry in read_credential_pool(normalized))
+    return any(_pool_entry_is_explicit(entry, provider=normalized) for entry in read_credential_pool(normalized))
 
 
 # Set by Claude Code itself, not by the user explicitly configuring anthropic in Hermes.
@@ -1271,7 +1278,7 @@ _EXPLICIT_POOL_SOURCES = frozenset({"device_code", "loopback_pkce", "hermes_pkce
 _VERTEX_PROVIDER_IDS = ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai")
 
 
-def _env_secret(name: str) -> bool:
+def _env_secret(name: str, *, provider: Optional[str] = None) -> bool:
     """True when *name* resolves to a usable secret in the active profile scope.
 
     Must not read raw ``os.getenv``: under ``hermes serve`` / Desktop multiplex the
@@ -1282,7 +1289,12 @@ def _env_secret(name: str) -> bool:
     HERMES_HOME ``.env`` first, then the scope-checked environ) so the gate and the key that
     actually authenticates never disagree — an empty ``DEEPSEEK_API_KEY=`` export in the parent
     shell must not hide a real key in ``.env`` (#77007).
+    With *provider*, keeper e038df38 semantics apply: a borrowed shared reference
+    owned by the global root counts (it is the credential the provider will use).
     """
+    if provider:
+        from agent.credential_pool import get_env_prefer_dotenv
+        return has_usable_secret(get_env_prefer_dotenv(name, provider=provider) or "")
     from hermes_cli.config import get_env_value_prefer_dotenv
     return has_usable_secret(get_env_value_prefer_dotenv(name) or "")
 
@@ -1300,14 +1312,14 @@ def _explicit_env_credentials_present(normalized: str) -> bool:
         if not pconfig:
             return False
     if pconfig.auth_type == "api_key":
-        return any(_env_secret(v) for v in pconfig.api_key_env_vars if v not in _IMPLICIT_ENV_VARS)
+        return any(_env_secret(v, provider=normalized) for v in pconfig.api_key_env_vars if v not in _IMPLICIT_ENV_VARS)
     if pconfig.auth_type == "aws_sdk":
         return _env_secret("AWS_BEARER_TOKEN_BEDROCK") or (
             _env_secret("AWS_ACCESS_KEY_ID") and _env_secret("AWS_SECRET_ACCESS_KEY"))
     return False
 
 
-def _pool_entry_is_explicit(entry: Any) -> bool:
+def _pool_entry_is_explicit(entry: Any, *, provider: Optional[str] = None) -> bool:
     """True for pool rows the user created via an explicit Hermes flow (or a still-live env key)."""
     if not isinstance(entry, dict):
         return False
@@ -1317,7 +1329,7 @@ def _pool_entry_is_explicit(entry: Any) -> bool:
         # count it when the referenced var still resolves to a usable secret NOW.
         # See #55790.
         env_var = entry.get("source", "").split(":", 1)[1].strip()
-        return bool(env_var and _env_secret(env_var))
+        return bool(env_var and _env_secret(env_var, provider=provider))
     return bool(source) and (source in _EXPLICIT_POOL_SOURCES or source.startswith("manual:"))
 
 
@@ -2067,8 +2079,8 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     pconfig = _registry_lookup(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
-    env_url = _provider_env_base_url(pconfig)
+    api_key, key_source, shared_url = _resolve_api_key_provider_secret(provider_id, pconfig)
+    env_url = _provider_env_base_url(pconfig) or shared_url
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
     else:
@@ -2301,14 +2313,14 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
             f"Provider '{provider_id}' is not an API-key provider.",
             provider=provider_id, code="invalid_provider")
 
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    api_key, key_source, shared_url = _resolve_api_key_provider_secret(provider_id, pconfig)
     # No-auth LM Studio: a placeholder so runtime / auxiliary_client see the local server as
     # configured. doctor still reports unconfigured because the status path uses the raw secret.
     if not api_key and provider_id == "lmstudio":
         api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
         key_source = key_source or "default"
 
-    env_url = _provider_env_base_url(pconfig)
+    env_url = _provider_env_base_url(pconfig) or shared_url
     resolve_url = _API_KEY_BASE_URL_RESOLVERS.get(provider_id, _default_api_key_base_url)
     base_url = resolve_url(api_key, pconfig.inference_base_url, env_url)
     # An API-key provider must never hand back an empty base URL (a set-but-empty
