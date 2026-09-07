@@ -1120,7 +1120,9 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
-def _pop_session_by_id(sid: str) -> dict | None:
+def _pop_session_by_id(
+    sid: str, *, predicate: Callable[[dict], bool] | None = None
+) -> dict | None:
     """Atomically detach one live session from the registry.
 
     Detaching is the ownership claim for teardown: once the record is no
@@ -1132,11 +1134,22 @@ def _pop_session_by_id(sid: str) -> dict | None:
     """
     with _sessions_lock:
         session = _sessions.get(sid)
-        if session is not None:
+        if session is None:
+            return None
+        # Queue claims use history_lock. Never wait for it while holding the
+        # registry lock (resume takes them in the opposite order); defer busy
+        # cleanup and hold a successful claim through the eligibility check.
+        history_lock = session.get("history_lock") if predicate is not None else None
+        if history_lock is not None and not history_lock.acquire(blocking=False):
+            return None
+        try:
+            if predicate is not None and not predicate(session):
+                return None
             session["_closing"] = True
             _sessions.pop(sid, None)
-    if session is None:
-        return None
+        finally:
+            if history_lock is not None:
+                history_lock.release()
     # The session is already out of _sessions here, so downstream teardown
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
@@ -1188,14 +1201,7 @@ def _close_session_by_id(
     stale scan result from closing a session that reattached or gained active
     delegated work before teardown.
     """
-    if predicate is None:
-        session = _pop_session_by_id(sid)
-    else:
-        with _sessions_lock:
-            current = _sessions.get(sid)
-            if current is None or not predicate(current):
-                return False
-            session = _pop_session_by_id(sid)
+    session = _pop_session_by_id(sid, predicate=predicate)
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
@@ -1413,13 +1419,14 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             current = _sessions.get(sid)
             if current is None or not _ws_session_is_detached(current):
                 return
-            if not _session_is_lru_evictable(sid, current):
+            session = _pop_session_by_id(
+                sid, predicate=lambda s: _session_is_lru_evictable(sid, s)
+            )
+            if session is None:
                 # Losing the UI transport is not a request to cancel work.
                 # Keep one timer so normal completion still releases idle
                 # resources, and a reconnect can reuse the live turn.
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            else:
-                session = _pop_session_by_id(sid)
 
         if reschedule_delay is not None:
             _schedule_ws_orphan_reap(sid, delay_s=reschedule_delay)
@@ -1823,17 +1830,24 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # awaiting input, still building, or owning active delegated work), but
     # WITHOUT the hours-scale age gate: a detached session is eligible the
     # moment it loses its client.
+    if session.get("_compute_host_active"):
+        # ponytail: retain hosted return routes until explicit close; automatic
+        # retirement needs child-owned proof of no queued/delegated work.
+        return False
     if session.get("running") or _session_pending_kind(sid):
+        return False
+    run_thread = session.get("_run_thread")
+    if run_thread is not None and run_thread.is_alive():
         return False
     if session.get("queued_prompt") or session.get("queued_prompts"):
         return False
     if _session_has_active_delegations(sid, session):
         return False
     ready = session.get("agent_ready")
-    # Hosted turns and lazy spectators never build an in-process agent.
+    # Lazy spectators never build an in-process agent.
     if (
         ready is not None and not ready.is_set()
-        and not session.get("lazy") and not session.get("_compute_host_active")
+        and not session.get("lazy")
     ):
         return False
     return _transport_is_dead(session.get("transport"))
@@ -7421,14 +7435,20 @@ def _session_info(agent, session: dict | None = None) -> dict:
                 session = candidate
                 break
     mirror = _metadata_mirror(session)
-    cwd = _display_session_cwd(session)
+    cwd = _display_session_cwd(session) if agent is not None else _session_cwd(session)
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
     reasoning_config = getattr(agent, "reasoning_config", None)
-    reasoning_effort = ""
+    if agent is None:
+        overrides = (session or {}).get("resume_runtime_overrides") or {}
+        if "reasoning_effort" not in mirror:
+            reasoning_config = (session or {}).get("create_reasoning_override")
+            if reasoning_config is None:
+                reasoning_config = overrides.get("reasoning_config_override")
+    reasoning_effort = str(mirror.get("reasoning_effort") or "")
     if isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             # Disabled must be distinguishable from unset ("" = provider
@@ -7439,6 +7459,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    if agent is None and "service_tier" not in mirror:
+        service_tier = (session or {}).get("create_service_tier_override")
+        if service_tier is None:
+            service_tier = overrides.get("service_tier_override")
+        service_tier = service_tier or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -7465,6 +7490,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    model_override = (session or {}).get("model_override") or {}
     # Epoch seconds the current turn started, or None when idle. Lets the
     # desktop preserve the turn-elapsed timer across session switches (cold
     # resume path) instead of resetting it to 0:00.
@@ -7476,9 +7502,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
 
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
+        "model": pending_model or mirror.get("model") or getattr(agent, "model", "")
+        or model_override.get("model") or _resolve_model(),
         "provider": pending_provider
-        or mirror.get("provider", getattr(agent, "provider", "")),
+        or mirror.get("provider") or getattr(agent, "provider", "")
+        or model_override.get("provider") or "",
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -10811,31 +10839,12 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
-    if agent is not None:
-        return _session_info(agent)
-    # The SESSION's own workspace, not the gateway's launch directory. Reporting
-    # `_default_session_cwd()` here told a lazily-resumed session's client that
-    # its workspace was wherever the gateway process happened to start, so the
-    # desktop Files pane painted the wrong project even after the renderer
-    # rebound correctly (#71254). `branch` is always emitted ("" outside a git
-    # repo) so a client can clear a stale label instead of retaining it — the
-    # same contract `_lazy_session_info` above already follows.
-    cwd = _session_cwd(session)
-    return {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-        "model": _resolve_model(),
-        "skills": {},
-        "tools": {},
-        # A lazy session (agent not built yet) is still served by *this* backend,
-        # so it must advertise the current contract. Desktop feeds this straight
-        # into reportBackendContract(); a missing field is read as contract 0 and
-        # a current backend is falsely flagged "out of date" (#68392). The sibling
-        # session.create shape (_lazy_resume_info) already carries it (#36112).
-        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-    }
+    # The serving process may have only a compute-host mirror or deferred
+    # overrides. Use the same session authority as ordinary metadata events.
+    info = _session_info(agent, session)
+    if agent is None and not session.get("_compute_host_active"):
+        info["lazy"] = True
+    return info
 
 
 def _reconcile_display_with_live(

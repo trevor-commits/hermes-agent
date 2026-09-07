@@ -4769,7 +4769,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True}
 
 
-def test_ws_orphan_reap_preserves_isolated_turn_then_reaps(monkeypatch):
+def test_ws_orphan_reap_preserves_isolated_route_until_explicit_close(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4836,8 +4836,11 @@ def test_ws_orphan_reap_preserves_isolated_turn_then_reaps(monkeypatch):
         session["queued_prompt"] = None
         callbacks.pop(0)()
 
+        assert server._sessions["isolated-sid"] is session
+        assert torn_down == []
+        server._close_session_by_id("isolated-sid", end_reason="tui_close")
         assert "isolated-sid" not in server._sessions
-        assert torn_down == [(session, "ws_orphan_reap")]
+        assert torn_down == [(session, "tui_close")]
     finally:
         server._sessions.pop("isolated-sid", None)
 
@@ -4949,6 +4952,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
     delegation_active = True
+    worker_alive = True
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -4959,7 +4963,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
 
     class _LiveThread:
         def is_alive(self):
-            return True
+            return worker_alive
 
     def _interrupt():
         interrupted.append("interrupted")
@@ -4996,6 +5000,11 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         assert len(callbacks) == 1
 
         session["running"] = False
+        callbacks.pop(0)()
+        assert server._sessions["delegating-turn"] is session
+        assert len(callbacks) == 1
+
+        worker_alive = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
@@ -16182,7 +16191,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -16249,7 +16258,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -16282,7 +16291,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -16319,7 +16328,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -18308,7 +18317,7 @@ def test_slash_exec_concurrent_first_use_spawns_single_worker(monkeypatch):
 def test_session_close_rpc_claims_then_tears_down(monkeypatch):
     seen = []
     claimed = {"session_key": "k"}
-    monkeypatch.setattr(server, "_pop_session_by_id", lambda sid: seen.append(sid) or claimed)
+    monkeypatch.setattr(server, "_pop_session_by_id", lambda sid, **_kwargs: seen.append(sid) or claimed)
     monkeypatch.setattr(
         server,
         "_teardown_popped_session",

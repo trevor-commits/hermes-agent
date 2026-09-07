@@ -4,6 +4,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 from starlette.testclient import TestClient
@@ -13,7 +15,29 @@ from tui_gateway import server
 from tui_gateway.ws import handle_ws
 
 
-def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, monkeypatch):
+def test_deferred_resume_preserves_stored_runtime_choices(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_resolve_model", lambda: "profile-default-model")
+    session = {
+        "agent": None,
+        "cwd": "/session/workspace",
+        "model_override": {"model": "gpt-6-astra", "provider": "openai-codex"},
+        "resume_runtime_overrides": {
+            "reasoning_config_override": {"enabled": False},
+            "service_tier_override": "",
+        },
+    }
+    info = server._fallback_session_info(session)
+    assert info["model"] == "gpt-6-astra"
+    assert info["provider"] == "openai-codex"
+    assert info["reasoning_effort"] == "none"
+    assert info["fast"] is False
+    assert info["cwd"] == "/session/workspace"
+    assert info["lazy"] is True
+
+
+@pytest.mark.parametrize("hosted,mirrored", [(False, False), (True, False), (True, True)])
+def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, monkeypatch, hosted, mirrored):
     db = SessionDB(tmp_path / "state.db")
     stored = "20260906_000000_abcdef"
     sid = "reconnect-runtime"
@@ -29,6 +53,11 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
 
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_resolve_model", lambda: "profile-default-model")
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda *_a: hosted)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *_a: SimpleNamespace(
+        interrupt=lambda *_a, **_k: interrupted.append(True),
+    ))
     monkeypatch.setattr(server, "resolve_skin", lambda: {})
     monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
     monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", lambda: None)
@@ -37,10 +66,22 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
     monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_a: False)
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", schedule)
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.05)
-    monkeypatch.setattr(server, "_teardown_popped_session", lambda s, **_k: closed.append(s))
+    monkeypatch.setattr(server, "_teardown_popped_session", lambda s, **_k: closed.append(s) or True)
 
     session = {
-        "agent": SimpleNamespace(interrupt=lambda: interrupted.append(True)),
+        "agent": None if hosted else SimpleNamespace(
+            interrupt=lambda: interrupted.append(True), model="gpt-6-astra",
+            provider="openai-codex", reasoning_config={"effort": "ultra"},
+            service_tier="priority",
+        ),
+        "_compute_host_active": hosted,
+        "model_override": {"model": "gpt-6-astra", "provider": "openai-codex"} if hosted else None,
+        "create_reasoning_override": {"effort": "low" if mirrored else "ultra"},
+        "create_service_tier_override": "priority",
+        "_metadata_mirror": {
+            "model": "gpt-6-astra", "provider": "openai-codex",
+            "reasoning_effort": "ultra", "service_tier": "priority",
+        } if mirrored else {},
         "session_key": stored,
         "source": "desktop",
         "running": True,
@@ -91,6 +132,11 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
                 resumed = response(ws, "resume")
                 assert "error" not in resumed, resumed
                 assert resumed["result"]["session_id"] == sid
+                info = resumed["result"]["info"]
+                assert info["model"] == "gpt-6-astra"
+                assert info["provider"] == "openai-codex"
+                assert info["reasoning_effort"] == "ultra"
+                assert info["service_tier"] == "priority"
                 assert server._sessions[sid] is session
                 assert session["history"] == [{"role": "assistant", "content": "partial work"}]
                 assert sid not in server._pending_ws_reaps
@@ -98,8 +144,8 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
                 resumed_transport = session["transport"]
                 dispatched = []
                 monkeypatch.setattr(
-                    server, "_run_prompt_submit",
-                    lambda _rid, _sid, current, text, **_k: dispatched.append((text, current["transport"])),
+                    server, "_submit_prompt_to_compute_host" if hosted else "_run_prompt_submit",
+                    lambda _rid, _sid, current, text, **_k: dispatched.append((text, current["transport"])) or {},
                 )
                 session["running"] = False
                 assert server._drain_queued_prompt("next", sid, session) is True
@@ -113,6 +159,10 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
                 assert session["_turn_cancel_requested"] is True
                 assert session["queued_prompt"] is None
                 session["running"] = False
+                if hosted:
+                    # The serving process cannot retire work owned by a host.
+                    ws.send_json({"jsonrpc": "2.0", "id": "close", "method": "session.close", "params": {"session_id": sid}})
+                    assert response(ws, "close")["result"]["closed"] is True
                 ws.close()
                 wait_until(lambda: sid not in server._sessions)
 

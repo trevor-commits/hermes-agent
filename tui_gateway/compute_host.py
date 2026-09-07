@@ -538,8 +538,15 @@ class ComputeHost:
                 display_kind=frame.get("display_kind") or None,
             )
             run_thread = session.get("_run_thread")
-            if run_thread is not None and hasattr(run_thread, "join"):
+            # A settled turn can start queued steering or a goal continuation
+            # before its worker exits. Keep this hosted request alive until
+            # that worker chain settles, so the parent cannot reap its route.
+            while run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
+                next_thread = session.get("_run_thread")
+                if next_thread is run_thread:
+                    break
+                run_thread = next_thread
             with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
