@@ -630,13 +630,11 @@ def _(rid, params: dict) -> dict:
         def _reuse_live_response(sid: str, session: dict) -> dict:
             # The helper owns the resume lock because slow-path claim races can
             # discover a live winner and return it after releasing their own lock.
-            # Keeping the client-gone check and transport rebind in one critical
-            # section makes grace expiry atomic across every reuse path.
+            # Keep the live-session check and transport rebind in one critical
+            # section so idle reaping cannot race any reuse path.
             with _session_resume_lock:
                 if _sessions.get(sid) is not session:
                     return _err(rid, 4007, "session no longer live; retry resume")
-                if session.get("_client_gone_interrupt_requested"):
-                    return _err(rid, 4009, "session disconnect interrupt settling")
                 # This resume reattaches the live record: cancel any pending
                 # ws-orphan reap timer armed while the client was detached
                 # (storm killer — _live_session_payload's rebind also cancels,

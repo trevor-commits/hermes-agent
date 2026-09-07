@@ -4769,7 +4769,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True}
 
 
-def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+def test_ws_orphan_reap_preserves_isolated_turn_then_reaps(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4793,7 +4793,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         running=True,
         _compute_host_active=True,
         history=[{"role": "assistant", "content": "partial"}],
-        queued_prompt={"text": "must not run"},
+        queued_prompt={"text": "continue after reconnect"},
     )
     server._sessions["isolated-sid"] = session
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
@@ -4814,15 +4814,18 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         server._schedule_ws_orphan_reap("isolated-sid")
         callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
-        assert session["_turn_cancel_requested"] is True
-        assert session["queued_prompt"] is None
+        assert interrupted == []
+        assert not session.get("_turn_cancel_requested")
+        assert session["queued_prompt"] == {"text": "continue after reconnect"}
         assert session["history"] == [{"role": "assistant", "content": "partial"}]
         assert len(callbacks) == 1
 
-        callbacks.pop(0)()
+        for _ in range(65):
+            callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
+        assert interrupted == []
+        assert server._sessions["isolated-sid"] is session
+        assert torn_down == []
         assert len(callbacks) == 1
 
         session["running"] = False
@@ -4881,7 +4884,19 @@ def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
         server._sessions.pop("reattached-sid", None)
 
 
-def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkeypatch):
+def test_session_resume_rebinds_running_turn_after_disconnect_grace(monkeypatch):
+    callbacks = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
     class _DB:
         def get_session(self, session_id):
             assert session_id == "stored-sid"
@@ -4895,25 +4910,32 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
         session_key="stored-sid",
         transport=server._detached_ws_transport,
         running=True,
-        _client_gone_interrupt_requested=True,
+        history=[{"role": "assistant", "content": "still working"}],
     )
     server._sessions["live-sid"] = session
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "current_transport", lambda: live_transport)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
 
     try:
+        server._schedule_ws_orphan_reap("live-sid")
+        callbacks.pop(0)()
         response = server.handle_request(
             {
-                "id": "resume-after-claim",
+                "id": "resume-after-grace",
                 "method": "session.resume",
                 "params": {"session_id": "stored-sid"},
             }
         )
 
         assert response is not None
-        assert response["error"]["code"] == 4009
-        assert response["error"]["message"] == "session disconnect interrupt settling"
-        assert session["transport"] is server._detached_ws_transport
+        assert "error" not in response
+        assert response["result"]["session_id"] == "live-sid"
+        assert session["transport"] is live_transport
+        assert session["running"] is True
+        assert session["history"] == [{"role": "assistant", "content": "still working"}]
+        assert "live-sid" not in server._pending_ws_reaps
     finally:
         server._sessions.pop("live-sid", None)
 
@@ -4921,7 +4943,7 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
-    delegation_active = iter((True, False, False))
+    delegation_active = True
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -4951,7 +4973,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_session_has_active_delegations",
-        lambda *_args, **_kwargs: next(delegation_active),
+        lambda *_args, **_kwargs: delegation_active,
     )
     monkeypatch.setattr(server, "_teardown_popped_session", lambda *_args, **_kwargs: True)
 
@@ -4962,18 +4984,20 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         assert interrupted == []
         assert len(callbacks) == 1
 
+        delegation_active = False
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
+        assert interrupted == []
         assert len(callbacks) == 1
 
+        session["running"] = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
         server._sessions.pop("delegating-turn", None)
 
 
-def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
+def test_ws_orphan_reap_preserves_in_process_turn(monkeypatch):
     callbacks = []
     interrupted = []
 
@@ -5007,8 +5031,9 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._schedule_ws_orphan_reap("inline-sid")
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
-        assert session["_turn_cancel_requested"] is True
+        assert interrupted == []
+        assert session["running"] is True
+        assert not session.get("_turn_cancel_requested")
         assert len(callbacks) == 1
     finally:
         server._sessions.pop("inline-sid", None)
