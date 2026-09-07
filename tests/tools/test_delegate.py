@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
 import types
@@ -1179,6 +1180,33 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
             self.assertEqual(kwargs["api_key"], "sk-or-delegation-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["max_iterations"], 45)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_explicit_unlimited_budget_reaches_child_agent(self, mock_creds, mock_cfg):
+        """The child runner receives a positive sentinel, never the UI string."""
+        mock_cfg.return_value = {"max_iterations": "unlimited"}
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Run until complete", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["max_iterations"], sys.maxsize)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

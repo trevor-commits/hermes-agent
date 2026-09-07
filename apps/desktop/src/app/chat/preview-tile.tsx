@@ -26,10 +26,12 @@ import {
   $previewTabs,
   adoptPersistedBrowserTab,
   type BrowserPage,
+  canPersistPreviewTab,
   closeRightRailTab,
   forgetBrowserPage,
   markBrowserTabPopped,
   newBrowserTab,
+  persistPreviewTab,
   popOutBrowserTab,
   type PreviewTarget
 } from '@/store/preview'
@@ -85,6 +87,30 @@ function browserTabMenuPrefix(tabId: string) {
         label: translateNow('preview.openInExternal'),
         onSelect: () => openExternalLink(browserTabExternalUrl(tabId) ?? '')
       })}
+    </>
+  )
+}
+
+/** A temporary agent offer gets one quiet, explicit escape hatch in the tab's
+ * existing right-click menu. User-opened and already-pinned tabs stay uncluttered. */
+function previewTabMenuPrefix(tabId: string) {
+  const browserItems = browserTabMenuPrefix(tabId)
+
+  if (!browserItems && !canPersistPreviewTab(tabId)) {
+    return undefined
+  }
+
+  return (kit: MenuKit) => (
+    <>
+      {canPersistPreviewTab(tabId)
+        ? renderActionItem(kit, {
+            icon: 'pin',
+            key: 'pin-preview',
+            label: translateNow('sidebar.row.pin'),
+            onSelect: () => persistPreviewTab(tabId)
+          })
+        : null}
+      {browserItems?.(kit)}
     </>
   )
 }
@@ -265,7 +291,7 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   // A Browser is a vessel, so there can be more of it — a file peek is one of
   // a kind and leaves the strip's "+" to whatever else the zone holds.
   newTab: tabId => (targetFor(tabId)?.kind === 'url' ? newBrowserTab : undefined),
-  tabMenuPrefix: browserTabMenuPrefix,
+  tabMenuPrefix: previewTabMenuPrefix,
   render: tabId => <PreviewTilePane tabId={tabId} />,
   close: tabId => {
     forgetBrowserPage(tabId)

@@ -48,7 +48,13 @@ describe('desktop i18n runtime translator', () => {
     setRuntimeI18nLocale('ar')
     expect(translateNow('settings.appearance.reasoningCollapsedTitle')).toBe('طي التفكير افتراضيًا')
     expect(translateNow('settings.appearance.reasoningCollapsedDesc')).toBe(
-      'أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.'
+      'سطح المكتب فقط؛ يسري فورًا. أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.'
+    )
+  })
+
+  it('labels the reasoning-collapse preference with its desktop-local live scope', () => {
+    expect(translateNow('settings.appearance.reasoningCollapsedDesc')).toBe(
+      'Desktop-only; applies immediately. Keep streamed reasoning available without expanding it until you open it.'
     )
   })
 

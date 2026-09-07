@@ -85,6 +85,29 @@ describe('preview store', () => {
     expect($rightRailActiveTabId.get()).toBe(urlTabs[0].id)
   })
 
+  it('opens an ephemeral offer in its own Browser without replacing a user tab', () => {
+    openPreview(urlTarget('https://example.test/manual'), 'manual')
+    const userTab = $previewTabs.get()[0]
+
+    openPreview({ ...urlTarget('https://example.test/offered'), transient: true }, 'tool-result')
+
+    expect($previewTabs.get()).toHaveLength(2)
+    expect($previewTabs.get().find(tab => tab.id === userTab.id)?.target.url).toBe('https://example.test/manual')
+    expect($previewTabs.get().find(tab => tab.target.url === 'https://example.test/offered')?.target.transient).toBe(
+      true
+    )
+  })
+
+  it('does not make a manually opened file temporary when it is offered again', () => {
+    openPreview({ ...fileTarget('/work/demo.html'), label: 'Manual' }, 'manual')
+
+    openPreview({ ...fileTarget('/work/demo.html'), label: 'Offer', transient: true }, 'tool-result')
+
+    expect($previewTabs.get()).toHaveLength(1)
+    expect($previewTabs.get()[0]?.target.label).toBe('Manual')
+    expect($previewTabs.get()[0]?.target.transient).toBeUndefined()
+  })
+
   it('commits the live page onto a Browser tab without changing its id', () => {
     openPreview(urlTarget('https://news.ycombinator.com'), 'tool-result')
     const id = $previewTabs.get()[0].id
@@ -207,9 +230,9 @@ describe('preview store', () => {
     expect($previewTabs.get()).toHaveLength(1)
   })
 
-  it('persists file and url tabs but never artifacts, whose content is memory-only', () => {
+  it('persists manually opened file and URL tabs but never artifacts, whose content is memory-only', () => {
     openPreview(fileTarget('/work/demo.html'), 'file-browser')
-    openPreview(urlTarget('http://localhost:5174'), 'tool-result')
+    openPreview(urlTarget('http://localhost:5174'), 'manual')
     openPreview(artifactTarget('session-1:dashboard'))
 
     const stored = window.localStorage.getItem('hermes.desktop.previewTabs.v2') ?? ''

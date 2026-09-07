@@ -16,8 +16,10 @@ import { canOpenBrowserWindow, openBrowserInNewWindow } from './windows'
  * a tool result, a file-browser click, and an artifact card all travel the
  * same road and behave identically once open.
  *
- * Tabs are global and outlive the session that created them, like tabs
- * anywhere else — they close when you close them.
+ * Tabs opened by the user can persist across launches; agent offers are marked
+ * transient until the user explicitly pins them. They still share one tab list
+ * while the window is alive, so every renderer follows the same close and
+ * selection rules.
  */
 
 export interface PreviewTarget {
@@ -354,15 +356,17 @@ function mintBrowserTabId(): RightRailTabId {
 /** The Browser a URL should open in: the one you're looking at, else the one
  *  you used last. A link from chat navigates the browser you already have
  *  rather than stacking another identical tab — new tabs are something you
- *  ask for (the strip's "+"), the way they are in a real browser. */
-function browserTabId(tabs: PreviewTab[]): RightRailTabId {
+ *  ask for (the strip's "+"), the way they are in a real browser. An ephemeral
+ *  offer never repurposes a restorable Browser tab; it reuses an existing
+ *  ephemeral vessel or gets its own so a user's pinned page stays pinned. */
+function browserTabId(tabs: PreviewTab[], preferEphemeral = false): RightRailTabId {
   const active = tabs.find(tab => tab.id === $rightRailActiveTabId.get())
 
-  if (active && isBrowserTab(active)) {
+  if (active && isBrowserTab(active) && (!preferEphemeral || active.target.transient)) {
     return active.id
   }
 
-  return tabs.findLast(isBrowserTab)?.id ?? mintBrowserTabId()
+  return tabs.findLast(tab => isBrowserTab(tab) && (!preferEphemeral || tab.target.transient))?.id ?? mintBrowserTabId()
 }
 
 // Browsing files is "peek at the source"; a tool or an explicit link handing
@@ -379,17 +383,62 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
   return { ...target, renderMode: isFilePreviewSource(source) ? 'source' : 'preview' }
 }
 
+/** An offered preview can become durable only if its source can be rebuilt in a
+ * future window. Runtime-only source fallbacks and inline remote HTML cannot. */
+function canPersistPreviewTarget(target: PreviewTarget): boolean {
+  return Boolean(
+    target.transient &&
+    target.kind !== 'artifact' &&
+    target.renderMode !== 'source' &&
+    !(target.previewKind === 'html' && target.dataUrl)
+  )
+}
+
+/** Whether the UI may offer to keep this temporary preview after a relaunch. */
+export function canPersistPreviewTab(tabId: string): boolean {
+  const tab = $previewTabs.get().find(item => item.id === tabId)
+
+  return Boolean(tab && canPersistPreviewTarget(tab.target))
+}
+
+/** Explicit user intent to keep an offered preview. Removing the transient
+ * marker lets the existing tab persistence codec carry it into a new window. */
+export function persistPreviewTab(tabId: string): boolean {
+  const tabs = $previewTabs.get()
+  const index = tabs.findIndex(item => item.id === tabId)
+
+  if (index === -1 || !canPersistPreviewTarget(tabs[index].target)) {
+    return false
+  }
+
+  $previewTabs.set(
+    tabs.map((item, itemIndex) =>
+      itemIndex === index ? { ...item, target: { ...item.target, transient: undefined } } : item
+    )
+  )
+
+  return true
+}
+
 /** Open (or re-front) the tab for `target`. Re-opening an existing tab refreshes
  *  its target so a stale label/path can't outlive the thing it points at. The
  *  only way anything reaches a preview. */
 export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
-  const id = resolved.kind === 'url' ? browserTabId(current) : previewTabId(resolved)
+  const id = resolved.kind === 'url' ? browserTabId(current, Boolean(resolved.transient)) : previewTabId(resolved)
   const index = current.findIndex(tab => tab.id === id)
+  const existing = index === -1 ? undefined : current[index]
+  // An agent may offer a file the user already opened. Re-front the durable tab
+  // instead of changing its persistence contract behind the user's back.
+  const preserveExistingPersistentTarget = Boolean(resolved.transient && existing && !existing.target.transient)
   const tab: PreviewTab = { id, target: resolved }
 
-  $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
+  $previewTabs.set(
+    index === -1
+      ? [...current, tab]
+      : current.map((item, itemIndex) => (itemIndex === index && !preserveExistingPersistentTarget ? tab : item))
+  )
   selectRightRailTab(id)
 }
 
@@ -440,10 +489,9 @@ export function closePreviewForSource(source: string): boolean {
   return closePreviewMatching(source)
 }
 
-/** Close the first tab whose source, url, or label matches any candidate.
- *  Empty candidates are a no-op so a missed match cannot wipe the rail —
- *  closing the whole pane is `closeRightRail`. */
-export function closePreviewMatching(...candidates: string[]): boolean {
+/** Close a tab whose source, url, or label matches any candidate. Empty
+ * candidates are a no-op so a missed match cannot wipe the rail. */
+function closePreviewMatchingWhere(matches: (tab: PreviewTab) => boolean, candidates: string[]): boolean {
   const queries = [...new Set(candidates.map(value => value.trim()).filter(Boolean))]
 
   if (queries.length === 0) {
@@ -453,7 +501,7 @@ export function closePreviewMatching(...candidates: string[]): boolean {
   const tab = $previewTabs.get().find(item => {
     const fields = [item.target.source, item.target.url, item.target.label]
 
-    return queries.some(query => fields.includes(query))
+    return matches(item) && queries.some(query => fields.includes(query))
   })
 
   if (!tab) {
@@ -463,6 +511,29 @@ export function closePreviewMatching(...candidates: string[]): boolean {
   closeRightRailTab(tab.id)
 
   return true
+}
+
+/** Close the first tab whose source, url, or label matches any candidate.
+ * Empty candidates are a no-op so a missed match cannot wipe the rail —
+ * closing the whole pane is `closeRightRail`. */
+export function closePreviewMatching(...candidates: string[]): boolean {
+  return closePreviewMatchingWhere(() => true, candidates)
+}
+
+/** Agent-issued closes only own temporary offers; a user-owned restored tab is
+ * never dismissed merely because it names the same URL or file. */
+export function closeTransientPreviewMatching(...candidates: string[]): boolean {
+  return closePreviewMatchingWhere(tab => Boolean(tab.target.transient), candidates)
+}
+
+/** Close every temporary offer while preserving manual and explicitly pinned
+ * previews. Used for an agent's unqualified `preview.close` event. */
+export function closeTransientPreviewTabs() {
+  for (const tab of $previewTabs.get()) {
+    if (tab.target.transient) {
+      closeRightRailTab(tab.id)
+    }
+  }
 }
 
 /** Artifact tabs can't outlive the registry they read from, so clearing it

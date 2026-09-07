@@ -2131,8 +2131,11 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
+        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget;
+                                # independent of the parent's max_iterations). Set a positive
+                                # integer or the explicit "unlimited" symbol; 0/false/null do
+                                # not mean unlimited. The former unsafe legacy sentinel remains
+                                # readable for compatibility until explicitly migrated.
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death

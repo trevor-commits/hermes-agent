@@ -32,7 +32,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, Iterable
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -1015,6 +1015,10 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa: F401
+
+# Keep the delegation default anchored to the schema source of truth. Unlike
+# agent.max_turns, a missing child budget remains a finite safety default.
+DEFAULT_DELEGATION_MAX_ITERATIONS = DEFAULT_CONFIG["delegation"]["max_iterations"]
 
 # =============================================================================
 # Config Migration System
@@ -3336,6 +3340,13 @@ def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
 #     takes seconds; 9.2e18 turns would take ~10^11 years).
 TURN_LIMIT_UNLIMITED = sys.maxsize
 
+# ``delegation.max_iterations`` deliberately has narrower semantics than
+# ``agent.max_turns``. Only this explicit symbol means unlimited. The legacy
+# integer is accepted on read for the audited profiles, but never written
+# automatically; a user may migrate it to the symbolic spelling explicitly.
+UNLIMITED_DELEGATION_MAX_ITERATIONS = "unlimited"
+LEGACY_UNLIMITED_DELEGATION_MAX_ITERATIONS = 9223372036854776000
+
 # String spellings that mean "no limit".  Lowercased, whitespace-stripped
 # before comparison so ``"None"``, ``" unlimited "`` etc. all match.
 _UNLIMITED_SPELLINGS = frozenset({
@@ -3399,6 +3410,77 @@ def resolve_turn_limit(raw: Any, default: int = TURN_LIMIT_UNLIMITED) -> int:
     # Unknown type (list, dict, …) — don't crash the agent over a bad config.
     logger.debug("resolve_turn_limit: unsupported type %s (%r) → default %d", type(raw).__name__, raw, default)
     return default
+
+
+def normalize_delegation_max_iterations(raw: Any) -> int | str:
+    """Return a canonical persisted ``delegation.max_iterations`` value.
+
+    A child budget is finite by default, so this intentionally does *not*
+    share the foreground turn-limit aliases where ``0``, ``null`` and negative
+    values mean unlimited. Accepted values are a positive integer, the exact
+    legacy sentinel, or the explicit ``"unlimited"`` symbol. The legacy
+    sentinel canonicalizes to the symbol only at a caller's explicit write
+    boundary; merely loading config leaves the original raw YAML untouched.
+    """
+    if raw is None:
+        raise ValueError(
+            "delegation.max_iterations cannot be null; use a positive integer or 'unlimited'."
+        )
+    if isinstance(raw, bool):
+        raise ValueError(
+            "delegation.max_iterations must be a positive integer or 'unlimited', not a boolean."
+        )
+
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value.lower() == UNLIMITED_DELEGATION_MAX_ITERATIONS:
+            return UNLIMITED_DELEGATION_MAX_ITERATIONS
+        try:
+            raw = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                "delegation.max_iterations must be a positive integer or 'unlimited'."
+            ) from exc
+
+    # ``bool`` was handled above. Floats are intentionally not coerced: a
+    # decimal/JSON number must not be rounded into a different child budget.
+    if not isinstance(raw, int):
+        raise ValueError(
+            "delegation.max_iterations must be a positive integer or 'unlimited'."
+        )
+    if raw == 0:
+        raise ValueError(
+            "delegation.max_iterations: 0 is not an unlimited value; use 'unlimited'."
+        )
+    if raw < 0:
+        raise ValueError(
+            "delegation.max_iterations must be a positive integer or 'unlimited'."
+        )
+    if raw == LEGACY_UNLIMITED_DELEGATION_MAX_ITERATIONS:
+        return UNLIMITED_DELEGATION_MAX_ITERATIONS
+    return raw
+
+
+def resolve_delegation_max_iterations(
+    raw: Any, default: int = DEFAULT_DELEGATION_MAX_ITERATIONS
+) -> int:
+    """Resolve a raw child budget to the positive integer AIAgent consumes.
+
+    Invalid hand-edited config falls back to the finite default instead of
+    becoming unlimited or crashing a child launch. Config write paths call
+    :func:`normalize_delegation_max_iterations` first and therefore reject
+    those values with a specific actionable error.
+    """
+    if raw is None:
+        return default
+    try:
+        normalized = normalize_delegation_max_iterations(raw)
+    except ValueError as exc:
+        logger.warning("Invalid delegation.max_iterations=%r; using default %d: %s", raw, default, exc)
+        return default
+    if isinstance(normalized, str):
+        return TURN_LIMIT_UNLIMITED
+    return normalized
 
 
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
@@ -3568,6 +3650,191 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     except FileNotFoundError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# =============================================================================
+# Source-only setting provenance
+# =============================================================================
+
+# ``/api/config/schema`` is deliberately public/read-only so it must never
+# borrow resolved config values merely to explain their origin.  These aliases
+# cover schema-only presentation keys whose backing config location is known.
+_PROVENANCE_PATH_ALIASES = {
+    "model_context_length": "model.context_length",
+}
+
+_PROVENANCE_SURFACES = ("cli", "desktop", "messaging")
+
+
+def _provenance_path_present(config: Any, key: str) -> bool:
+    """Return whether *key* is explicitly present, preserving falsy values.
+
+    This intentionally tests membership rather than truthiness: ``false``,
+    ``0``, ``''``, and ``null`` are all user/managed declarations and must not
+    be reported as inherited defaults.
+    """
+    current = config
+    for segment in key.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return False
+        current = current[segment]
+    return True
+
+
+def _unknown_setting_surfaces() -> Dict[str, Dict[str, str]]:
+    return {
+        surface: {"status": "unknown", "activation": "unknown"}
+        for surface in _PROVENANCE_SURFACES
+    }
+
+
+def _known_setting_visibility(key: str) -> Dict[str, Any]:
+    """Return only lifecycle claims backed by a concrete runtime path.
+
+    Most config settings do not have a verified live-reload contract across all
+    surfaces.  Keep them explicitly unknown instead of extending an observed
+    compression/redaction behavior into a universal promise.
+    """
+    surfaces = _unknown_setting_surfaces()
+    result: Dict[str, Any] = {"surfaces": surfaces}
+
+    if key.startswith("compression."):
+        # tui_gateway synchronizes compression at turn start and messaging
+        # gateways rebuild cached agents when compression.* changes. The classic
+        # CLI has no matching hot-reload contract, so leave it unknown.
+        surfaces["desktop"] = {"status": "applies", "activation": "next-turn"}
+        surfaces["messaging"] = {"status": "applies", "activation": "next-turn"}
+        result["feature_gate"] = {"key": "compression.enabled", "enabled_when": True}
+    elif key == "security.redact_secrets":
+        # agent.redact snapshots this setting at import, after config-to-env
+        # bridging. A fresh process is required on every surface.
+        result["surfaces"] = {
+            surface: {"status": "applies", "activation": "new-process"}
+            for surface in _PROVENANCE_SURFACES
+        }
+        result["feature_gate"] = {"key": "security.redact_secrets", "enabled_when": True}
+        # We do not inspect .env/process state here. The saved-config source is
+        # useful, but the source of an already-running redactor is unknowable
+        # through this safe metadata endpoint.
+        result["runtime_source"] = "unknown"
+    elif key == "display.show_reasoning":
+        # This drives the classic CLI renderer. Desktop has its own device-local
+        # reasoning-collapse preference, so a backend config edit is irrelevant
+        # to that desktop control; messaging behavior is not claimed.
+        surfaces["cli"] = {"status": "applies", "activation": "new-process"}
+        surfaces["desktop"] = {"status": "irrelevant", "activation": "unknown"}
+
+    return result
+
+
+def _read_provenance_config(path: Optional[Path]) -> Tuple[Dict[str, Any], bool]:
+    """Read raw config for membership checks without returning any values.
+
+    ``False`` means the source could not be inspected.  Callers then report an
+    honest unknown instead of treating a parse/read failure as an inherited
+    default.  A missing or empty file is a successfully inspected empty mapping;
+    an invalid non-mapping document is unknown rather than silently empty.
+    """
+    if path is None:
+        return {}, True
+    try:
+        # Match load_config/save_config: LibYAML parsing shares this lock.
+        with _CONFIG_LOCK, open(path, encoding="utf-8") as f:
+            data = fast_safe_load(f)
+    except FileNotFoundError:
+        return {}, True
+    except Exception:
+        return {}, False
+    if data is None:
+        return {}, True
+    return (data, True) if isinstance(data, dict) else ({}, False)
+
+
+def settings_provenance(keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Describe configured sources and known lifecycles without exposing values.
+
+    Returned metadata contains only the requested key, a source kind/path label,
+    state, and explicitly verified surface/lifecycle facts.  It never includes
+    raw YAML values, expanded environment values, or absolute local paths.
+    """
+    requested_keys = [key if isinstance(key, str) else str(key) for key in keys]
+
+    try:
+        profile_config, profile_readable = _read_provenance_config(get_config_path())
+    except Exception:
+        profile_config, profile_readable = {}, False
+
+    try:
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+        managed_path = managed_dir / "config.yaml" if managed_dir is not None else None
+        managed_config, managed_readable = _read_provenance_config(managed_path)
+    except Exception:
+        managed_config, managed_readable = {}, False
+
+    rows: Dict[str, Dict[str, Any]] = {}
+    for key in requested_keys:
+        config_key = _PROVENANCE_PATH_ALIASES.get(key, key)
+        default_present = _provenance_path_present(DEFAULT_CONFIG, config_key)
+        visibility = _known_setting_visibility(key)
+
+        if managed_readable and _provenance_path_present(managed_config, config_key):
+            source, state, path = "managed", "overridden", "managed/config.yaml"
+        elif not managed_readable:
+            source, state, path = "unknown", "unknown", "unknown"
+        elif profile_readable and _provenance_path_present(profile_config, config_key):
+            source = "profile"
+            state = "overridden" if default_present else "configured"
+            path = "config.yaml"
+        elif not profile_readable:
+            source, state, path = "unknown", "unknown", "unknown"
+        elif default_present:
+            source, state, path = "default", "inherited", "built-in defaults"
+        else:
+            source, state, path = "unknown", "unknown", "unknown"
+
+        # Keep the serialized shape intentionally small and source-only. In
+        # particular, do not add the resolved/default value as a convenience:
+        # this feed is public and config values can contain credentials.
+        rows[key] = {
+            "key": key,
+            "source": source,
+            "state": state,
+            "path": path,
+            **visibility,
+        }
+
+    return rows
+
+
+def setting_provenance(key: str) -> Dict[str, Any]:
+    """Single-key convenience wrapper for the CLI config subcommand."""
+    normalized_key = key if isinstance(key, str) else str(key)
+    return settings_provenance([normalized_key])[normalized_key]
+
+
+def print_setting_provenance(key: str, *, as_json: bool = False) -> None:
+    """Print source/lifecycle metadata without reading or displaying a value."""
+    provenance = setting_provenance(key)
+    if as_json:
+        print(json.dumps(provenance, sort_keys=True))
+        return
+
+    print(f"Key: {provenance['key']}")
+    print(f"Source: {provenance['source']} ({provenance['state']})")
+    print(f"Path: {provenance['path']}")
+    for surface in _PROVENANCE_SURFACES:
+        detail = provenance["surfaces"][surface]
+        if detail["status"] == "irrelevant":
+            print(f"{surface}: not used")
+        else:
+            print(f"{surface}: {detail['activation']}")
+    gate = provenance.get("feature_gate")
+    if isinstance(gate, dict):
+        print(f"Feature gate: {gate.get('key', 'unknown')}")
+    if provenance.get("runtime_source") == "unknown":
+        print("Running source: unknown")
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:
@@ -5834,7 +6101,13 @@ def set_config_value(key: str, value: str, force: bool = False):
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
     default_value = _default_value_for_key(key)
-    if isinstance(default_value, list):
+    if key == "delegation.max_iterations":
+        try:
+            coerced_value = normalize_delegation_max_iterations(value)
+        except ValueError as exc:
+            print(f"✗ Cannot set '{key}': {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif isinstance(default_value, list):
         try:
             parsed_value = fast_safe_load(value)
         except Exception as exc:
@@ -6180,6 +6453,17 @@ def config_command(args):
             print("  hermes config get skills.config --json")
             sys.exit(1)
         get_config_value(key, as_json=getattr(args, 'json', False))
+
+    elif subcmd in {"provenance", "source"}:
+        key = getattr(args, 'key', None)
+        if not key:
+            print("Usage: hermes config provenance <key> [--json]")
+            print()
+            print("Examples:")
+            print("  hermes config provenance compression.enabled")
+            print("  hermes config provenance security.redact_secrets --json")
+            sys.exit(1)
+        print_setting_provenance(key, as_json=getattr(args, 'json', False))
 
     elif subcmd == "set":
         key = getattr(args, 'key', None)

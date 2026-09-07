@@ -219,7 +219,7 @@ class SubagentLifecycleService:
         # private delegation helpers or manipulates the active-child registry.
         from tools.delegate_tool import (
             _build_child_preserving_parent_tools,
-            DEFAULT_MAX_ITERATIONS,
+            _get_max_child_iterations,
         )
 
         child = _build_child_preserving_parent_tools(
@@ -230,7 +230,7 @@ class SubagentLifecycleService:
             if request.allowed_toolsets
             else None,
             model=request.model,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_iterations=_get_max_child_iterations(),
             task_count=1,
             parent_agent=parent,
             role=request.role,

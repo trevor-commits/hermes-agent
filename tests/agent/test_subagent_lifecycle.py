@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -161,6 +162,35 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     assert parent.session_cost_status == "estimated"
 
 
+
+
+def test_public_lifecycle_uses_the_configured_unlimited_child_budget(monkeypatch):
+    """Plugin-launched children share delegation.max_iterations semantics."""
+    parent = SimpleNamespace(session_id="parent-unlimited", enabled_toolsets=["file"])
+    child = FakeChild("sa-unlimited")
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return child
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", build)
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {"max_iterations": "unlimited"})
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_child_lifecycle",
+        lambda *_args: {
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0,
+        },
+    )
+
+    service = SubagentLifecycleService(lambda: parent)
+    handle = service.launch(SubagentLaunchRequest(goal="finish the bounded task"))
+
+    assert captured["max_iterations"] == sys.maxsize
+    assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
 
 
 def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):

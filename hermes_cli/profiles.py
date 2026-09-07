@@ -48,7 +48,7 @@ from hermes_constants import (
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
 
 # Directories bootstrapped inside every new profile

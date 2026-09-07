@@ -3,6 +3,9 @@ from unittest.mock import MagicMock, patch
 import json
 import sys
 
+import pytest
+
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -126,3 +129,188 @@ def test_sequential_session_search_forwards_detail(monkeypatch):
     assert captured["db"] is session_db
     assert captured["query"] == "Hermes"
     assert captured["detail"] == "full"
+
+
+@pytest.fixture
+def isolated_session_search_profiles(tmp_path, monkeypatch):
+    """Two disposable profile homes with distinct searchable sessions."""
+    root = tmp_path / "hermes"
+    other_home = root / "profiles" / "other"
+    root.mkdir()
+    other_home.mkdir(parents=True)
+
+    default_db = SessionDB(root / "state.db")
+    other_db = SessionDB(other_home / "state.db")
+    try:
+        default_db.create_session("default-only", source="cli")
+        default_db.append_message(
+            "default-only", role="user", content="sessionprofile routingprobe default"
+        )
+        other_db.create_session("other-only", source="cli")
+        other_db.append_message(
+            "other-only", role="user", content="sessionprofile routingprobe other"
+        )
+        assert default_db._conn is not None
+        assert other_db._conn is not None
+        default_db._conn.commit()
+        other_db._conn.commit()
+    finally:
+        default_db.close()
+        other_db.close()
+
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root)
+    return {"root": root, "other_home": other_home}
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_session_id"),
+    [("default", "default-only"), ("other", "other-only")],
+)
+def test_explicit_profile_search_uses_target_when_current_recall_is_unavailable(
+    isolated_session_search_profiles, profile, expected_session_id
+):
+    """The real dispatcher must route explicit profiles without a current DB."""
+    agent = _make_agent(None, platform="acp")
+    current_recall = MagicMock(return_value=None)
+    agent._get_session_db_for_recall = current_recall
+
+    result = json.loads(
+        agent._invoke_tool(
+            "session_search",
+            {"query": "sessionprofile routingprobe", "limit": 1, "profile": profile},
+            "task-id",
+        )
+    )
+
+    assert current_recall.call_count == 0
+    assert result["success"] is True
+    assert result["results"][0]["session_id"] == expected_session_id
+
+
+@pytest.mark.parametrize("profile", ["missing", "invalid/profile"])
+def test_explicit_unknown_profile_fails_closed_without_current_recall_db(
+    isolated_session_search_profiles, profile
+):
+    """A missing or malformed profile must not fall back to the current DB."""
+    agent = _make_agent(None, platform="acp")
+    current_recall = MagicMock(return_value=None)
+    agent._get_session_db_for_recall = current_recall
+
+    result = json.loads(
+        agent._invoke_tool(
+            "session_search",
+            {"query": "sessionprofile routingprobe", "limit": 1, "profile": profile},
+            "task-id",
+        )
+    )
+
+    assert current_recall.call_count == 0
+    assert result["success"] is False
+    assert f"profile '{profile}'" in result["error"]
+
+
+def test_hook_modified_profile_routes_through_real_dispatcher(
+    isolated_session_search_profiles, monkeypatch
+):
+    """The dispatcher must use hook-modified arguments when routing profiles."""
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda _name, args, **_kwargs: (None, {**args, "profile": "other"}),
+    )
+    agent = _make_agent(None, platform="acp")
+    current_recall = MagicMock(return_value=None)
+    agent._get_session_db_for_recall = current_recall
+
+    result = json.loads(
+        agent._invoke_tool(
+            "session_search",
+            {"query": "sessionprofile routingprobe", "limit": 1, "profile": "default"},
+            "task-id",
+        )
+    )
+
+    assert current_recall.call_count == 0
+    assert result["success"] is True
+    assert result["results"][0]["session_id"] == "other-only"
+
+
+@pytest.mark.parametrize(
+    ("initial_profile", "hook_mutates", "hook_profile"),
+    [
+        pytest.param(None, False, None, id="null"),
+        pytest.param("", False, None, id="empty"),
+        pytest.param(" \t\n", False, None, id="whitespace"),
+        pytest.param(False, False, None, id="false"),
+        pytest.param(0, False, None, id="zero"),
+        pytest.param([], False, None, id="list"),
+        pytest.param({}, False, None, id="object"),
+        pytest.param("other", True, "", id="hook-empty"),
+        pytest.param("other", True, [], id="hook-list"),
+        pytest.param("other\n", False, None, id="target-newline"),
+        pytest.param("default\n", False, None, id="default-newline"),
+        pytest.param("other", True, "other\n", id="hook-target-newline"),
+    ],
+)
+def test_explicit_invalid_profile_fails_closed_before_current_recall(
+    isolated_session_search_profiles,
+    monkeypatch,
+    initial_profile,
+    hook_mutates,
+    hook_profile,
+):
+    """Invalid supplied or hook-mutated profiles cannot use current recall."""
+    if hook_mutates:
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda _name, args, **_kwargs: (None, {**args, "profile": hook_profile}),
+        )
+
+    current_db = SessionDB(
+        isolated_session_search_profiles["other_home"] / "state.db", read_only=True
+    )
+    try:
+        agent = _make_agent(None, platform="acp")
+        current_recall = MagicMock(return_value=current_db)
+        agent._get_session_db_for_recall = current_recall
+        result = json.loads(
+            agent._invoke_tool(
+                "session_search",
+                {
+                    "query": "sessionprofile routingprobe",
+                    "limit": 1,
+                    "profile": initial_profile,
+                },
+                "task-id",
+            )
+        )
+    finally:
+        current_db.close()
+
+    assert current_recall.call_count == 0
+    assert result["success"] is False
+    assert "valid profile identifier" in result["error"]
+
+
+def test_session_search_without_profile_uses_current_recall_db(
+    isolated_session_search_profiles,
+):
+    """An omitted profile retains the ordinary current-profile search path."""
+    current_db = SessionDB(
+        isolated_session_search_profiles["other_home"] / "state.db", read_only=True
+    )
+    try:
+        agent = _make_agent(current_db, platform="acp")
+        result = json.loads(
+            agent._invoke_tool(
+                "session_search",
+                {"query": "sessionprofile routingprobe", "limit": 1},
+                "task-id",
+            )
+        )
+    finally:
+        current_db.close()
+
+    assert result["success"] is True
+    assert result["results"][0]["session_id"] == "other-only"

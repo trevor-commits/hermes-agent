@@ -6,8 +6,8 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import {
   $previewTabs,
   beginPreviewServerRestart,
-  closePreviewMatching,
-  closeRightRail,
+  closeTransientPreviewMatching,
+  closeTransientPreviewTabs,
   completePreviewServerRestart,
   openPreview,
   progressPreviewServerRestart,
@@ -85,11 +85,15 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         // the file browser so URLs, localhost, and file paths all resolve.
         const { url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
+        const sessionCanOffer = () => !event.session_id || sessionIsOnScreen(event.session_id)
 
-        if (target && (!event.session_id || sessionIsOnScreen(event.session_id))) {
+        if (target && sessionCanOffer()) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(
             async resolved => {
-              if (!resolved) {
+              // Normalization and remote loopback reachability can take long
+              // enough for the user to switch windows. Re-check immediately
+              // before changing the rail so a late offer cannot steal it back.
+              if (!resolved || !sessionCanOffer()) {
                 return
               }
 
@@ -100,7 +104,17 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
               const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
               const reached = url === resolved.url ? resolved : { ...resolved, label: resolved.label || target, url }
 
-              openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result')
+              if (!sessionCanOffer()) {
+                return
+              }
+
+              // An agent offer is useful for this window only until the user
+              // explicitly pins it. The preview store already excludes transient
+              // tabs from its persisted representation.
+              openPreview(
+                { ...reached, ...(trimmedLabel ? { label: trimmedLabel } : {}), transient: true },
+                'tool-result'
+              )
             }
           )
         }
@@ -109,28 +123,33 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
       }
 
       if (event.type === 'preview.close') {
-        // Agent-driven close via close_preview. Same on-screen gate as open:
-        // a session the user can see may tidy the pane it opened; a hidden
-        // background turn must not dismiss the user's preview.
+        // Agent-driven close uses the same on-screen gate as open. It only
+        // retires temporary offers: a manually opened or pinned preview is the
+        // user's surface even if it has the same source string.
         const { url } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
+        const sessionCanOffer = () => !event.session_id || sessionIsOnScreen(event.session_id)
 
-        if (event.session_id && !sessionIsOnScreen(event.session_id)) {
+        if (!sessionCanOffer()) {
           return
         }
 
         if (!target) {
-          closeRightRail()
+          closeTransientPreviewTabs()
 
           return
         }
 
-        if (closePreviewMatching(target)) {
+        if (closeTransientPreviewMatching(target)) {
           return
         }
 
         void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(
           async resolved => {
+            if (!sessionCanOffer()) {
+              return
+            }
+
             const candidates = [target]
 
             if (resolved) {
@@ -141,7 +160,9 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
               }
             }
 
-            closePreviewMatching(...candidates)
+            if (sessionCanOffer()) {
+              closeTransientPreviewMatching(...candidates)
+            }
           }
         )
 

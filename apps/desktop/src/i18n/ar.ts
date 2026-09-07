@@ -443,7 +443,7 @@ export const ar = defineLocale({
       toolViewTitle: 'عرض الأدوات',
       toolViewDesc: 'تحكم في كيفية عرض نشاط الأدوات داخل المحادثة.',
       reasoningCollapsedTitle: 'طي التفكير افتراضيًا',
-      reasoningCollapsedDesc: 'أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.',
+      reasoningCollapsedDesc: 'سطح المكتب فقط؛ يسري فورًا. أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.',
       translucencyTitle: 'شفافية النافذة',
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل، بما في ذلك النص.',
       translucencyGlassDesc: 'زجاج غير لامع: يظهر سطح المكتب كضبابية ناعمة بينما يبقى النص واضحًا.',

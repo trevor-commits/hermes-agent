@@ -542,7 +542,8 @@ export const en: Translations = {
       toolViewTitle: 'Tool Call Display',
       toolViewDesc: 'Product hides raw tool payloads; Technical shows full input/output.',
       reasoningCollapsedTitle: 'Collapse thinking by default',
-      reasoningCollapsedDesc: 'Keep streamed reasoning available without expanding it until you open it.',
+      reasoningCollapsedDesc:
+        'Desktop-only; applies immediately. Keep streamed reasoning available without expanding it until you open it.',
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,

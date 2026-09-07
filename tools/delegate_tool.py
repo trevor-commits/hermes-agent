@@ -34,6 +34,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
 
@@ -1146,7 +1147,7 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
-DEFAULT_MAX_ITERATIONS = 250
+DEFAULT_MAX_ITERATIONS = DEFAULT_CONFIG["delegation"]["max_iterations"]
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -1858,7 +1859,8 @@ def _build_child_agent(
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
+    # (configurable via delegation.max_iterations, default 250 or the explicit
+    # "unlimited" symbol). This means
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
@@ -3896,7 +3898,7 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    default_max_iter = _get_max_child_iterations(cfg)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and
@@ -4947,6 +4949,21 @@ def _load_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def _get_max_child_iterations(cfg: Optional[dict] = None) -> int:
+    """Resolve the configured child budget to the positive runner value.
+
+    The public config value may be the explicit ``"unlimited"`` symbol or the
+    historical unsafe integer. Child construction always receives an integer,
+    so the AIAgent loop itself does not need a special branch.
+    """
+    if cfg is None:
+        cfg = _load_config()
+    raw = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS) if isinstance(cfg, dict) else DEFAULT_MAX_ITERATIONS
+    from hermes_cli.config import resolve_delegation_max_iterations
+
+    return resolve_delegation_max_iterations(raw, default=DEFAULT_MAX_ITERATIONS)
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,21 @@
+export type ConfigSettingSource = 'app-local' | 'default' | 'managed' | 'profile' | 'session' | 'unknown'
+export type ConfigSettingState = 'configured' | 'inherited' | 'overridden' | 'unknown'
+export type ConfigSettingSurface = 'cli' | 'desktop' | 'messaging'
+export type ConfigSettingSurfaceStatus = 'applies' | 'irrelevant' | 'unknown'
+export type ConfigActivationBoundary = 'live' | 'new-process' | 'next-turn' | 'unknown'
+
+// Source-only metadata from GET /api/config/schema. It intentionally excludes
+// the resolved setting value and any environment/credential content.
+export interface ConfigSettingProvenance {
+  feature_gate?: { enabled_when: boolean; key: string }
+  key: string
+  path: string
+  runtime_source?: 'session' | 'unknown'
+  source: ConfigSettingSource
+  state: ConfigSettingState
+  surfaces: Record<ConfigSettingSurface, { activation: ConfigActivationBoundary; status: ConfigSettingSurfaceStatus }>
+}
+
 export interface ConfigFieldSchema {
   category?: string
   description?: string
@@ -8,6 +26,7 @@ export interface ConfigFieldSchema {
   /** When true, a searchable select prepends a "clear" item that resets the
    *  value to ''. Matches the existing <Select> EMPTY_SELECT_VALUE pattern. */
   clearable?: boolean
+  provenance?: ConfigSettingProvenance
   type?: 'boolean' | 'list' | 'number' | 'select' | 'string' | 'text'
 }
 

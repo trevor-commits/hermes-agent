@@ -34,6 +34,14 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     config_get.add_argument("key", nargs="?", help="Configuration key (e.g., model)")
     config_get.add_argument("--json", action="store_true", help="Print value as JSON")
 
+    # config provenance — deliberately separate from `get` so a caller can
+    # inspect source/lifecycle without printing a possibly sensitive value.
+    config_provenance = config_subparsers.add_parser(
+        "provenance", aliases=["source"], help="Show a setting's source and activation boundary"
+    )
+    config_provenance.add_argument("key", nargs="?", help="Configuration key (e.g., compression.enabled)")
+    config_provenance.add_argument("--json", action="store_true", help="Print source metadata as JSON")
+
     # config set
     config_set = config_subparsers.add_parser("set", help="Set a configuration value")
     config_set.add_argument(

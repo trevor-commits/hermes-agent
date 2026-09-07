@@ -1407,6 +1407,13 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     },
+    "delegation.max_iterations": {
+        # String transport keeps both the explicit symbol and any finite cap
+        # exact across JSON/desktop; the save boundary validates it as an int
+        # or the one supported unlimited spelling.
+        "type": "string",
+        "description": "Positive child-iteration cap, or 'unlimited'.",
+    },
     "updates.non_interactive_local_changes": {
         "type": "select",
         "description": (
@@ -6031,6 +6038,25 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
     else:
         config["model_context_length"] = 0
+
+    # The desktop control transports this mixed symbolic/numeric setting as
+    # text. That avoids JavaScript rounding a valid Python integer before the
+    # user has chosen to change it. Invalid hand-edited values remain visible
+    # verbatim so an unrelated save never silently rewrites them.
+    delegation = config.get("delegation")
+    if isinstance(delegation, dict) and "max_iterations" in delegation:
+        from hermes_cli.config import normalize_delegation_max_iterations
+
+        normalized_delegation = dict(delegation)
+        try:
+            normalized_limit = normalize_delegation_max_iterations(
+                normalized_delegation["max_iterations"]
+            )
+        except ValueError:
+            pass
+        else:
+            normalized_delegation["max_iterations"] = str(normalized_limit)
+        config["delegation"] = normalized_delegation
     return config
 
 
@@ -7311,8 +7337,22 @@ async def get_schema(profile: Optional[str] = None):
     # Discovery-driven provider options (voice command providers + memory
     # provider plugins) are merged per-request so providers added after server
     # start still show up, scoped to the requested profile's config.
-    with _config_profile_scope(profile):
-        fields = _schema_with_dynamic_provider_options()
+    def _run():
+        # Profile scope may wait for a process-wide lock; discovery and YAML
+        # reads may block too. Keep the entire scoped operation off-loop.
+        with _config_profile_scope(profile):
+            fields = _schema_with_dynamic_provider_options()
+            # This public endpoint returns source metadata, never config/env
+            # values or absolute paths. Keep CONFIG_SCHEMA immutable.
+            from hermes_cli.config import settings_provenance
+
+            provenance = settings_provenance(fields.keys())
+            return {
+                key: {**field, "provenance": provenance[key]}
+                for key, field in fields.items()
+            }
+
+    fields = await asyncio.to_thread(_run)
     return {"fields": fields, "category_order": _CATEGORY_ORDER}
 
 
@@ -8095,6 +8135,18 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     explicit 0 and cleared.
     """
     config = dict(config)
+    # Validate this setting at the JSON write boundary, before the deep merge.
+    # The canonical value is either a Python int (finite) or the explicit
+    # string symbol; no client-side Number conversion participates.
+    delegation = config.get("delegation")
+    if isinstance(delegation, dict) and "max_iterations" in delegation:
+        from hermes_cli.config import normalize_delegation_max_iterations
+
+        normalized_delegation = dict(delegation)
+        normalized_delegation["max_iterations"] = normalize_delegation_max_iterations(
+            normalized_delegation["max_iterations"]
+        )
+        config["delegation"] = normalized_delegation
     # Remove any _model_meta that might have leaked in (shouldn't happen
     # with the stripped GET response, but be defensive)
     config.pop("_model_meta", None)
@@ -8184,7 +8236,10 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # frontend can only overwrite what it explicitly sends.
             with _CONFIG_MUTATION_LOCK:
                 existing = read_raw_config()
-                incoming = _denormalize_config_from_web(body.config)
+                try:
+                    incoming = _denormalize_config_from_web(body.config)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
                 merged = _deep_merge(existing, incoming)
                 # Compare normalized approvals.mode across the in-memory
                 # documents, not config blocks and not cache re-reads: the

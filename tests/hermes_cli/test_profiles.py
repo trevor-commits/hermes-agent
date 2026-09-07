@@ -88,7 +88,10 @@ class TestValidateProfileName:
         validate_profile_name(name)
 
 
-    @pytest.mark.parametrize("name", ["UPPER", "has space", ".hidden", "-leading"])
+    @pytest.mark.parametrize(
+        "name",
+        ["UPPER", "has space", ".hidden", "-leading", "other\n", "default\n", "a" * 64 + "\n"],
+    )
     def test_invalid_names_rejected(self, name):
         with pytest.raises(ValueError):
             validate_profile_name(name)

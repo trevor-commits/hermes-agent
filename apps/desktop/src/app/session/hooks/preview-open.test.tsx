@@ -2,8 +2,9 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesPreviewTarget } from '@/global'
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
-import { $previewTabs, $previewTarget, closeRightRail, type PreviewTarget } from '@/store/preview'
+import { $previewTabs, $previewTarget, closeRightRail, openPreview, persistPreviewTab } from '@/store/preview'
 import { $activeSessionId, $currentCwd, $messages, $selectedStoredSessionId } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -15,7 +16,7 @@ function assistantMessage(id: string, text: string): ChatMessage {
   return { id, parts: [assistantTextPart(text)], role: 'assistant' }
 }
 
-function fileTarget(path: string): PreviewTarget {
+function fileTarget(path: string): HermesPreviewTarget {
   return { kind: 'file', label: path, path, previewKind: 'html', source: path, url: `file://${path}` }
 }
 
@@ -107,6 +108,44 @@ describe('preview routing', () => {
       })
 
       expect($previewTarget.get()?.path).toBe('/tmp/artifact-test.html')
+    })
+
+    it.each([
+      ['a local HTML file', '/tmp/artifact-test.html'],
+      ['a URL', 'https://example.test/offered']
+    ])('keeps an agent-offered %s out of persisted preview state', async (_kind, url) => {
+      window.hermesDesktop.normalizePreviewTarget = vi.fn(async (target: string): Promise<HermesPreviewTarget> =>
+        target.startsWith('https://') ? { kind: 'url', label: target, source: target, url: target } : fileTarget(target)
+      )
+      render(<Harness />)
+
+      await emitPreviewOpen(url)
+
+      await waitFor(() => expect($previewTabs.get()).toHaveLength(1))
+      expect($previewTabs.get()[0]?.target.transient).toBe(true)
+      expect(window.localStorage.getItem('hermes.desktop.previewTabs.v2')).toBe('[]')
+    })
+
+    it('does not front an offer that resolves after its session leaves this window', async () => {
+      let resolveTarget: (target: HermesPreviewTarget) => void = () => undefined
+      window.hermesDesktop.normalizePreviewTarget = vi.fn(
+        () =>
+          new Promise<HermesPreviewTarget>(resolve => {
+            resolveTarget = resolve
+          })
+      )
+      render(<Harness />)
+
+      await emitPreviewOpen('/tmp/late.html')
+      await waitFor(() => expect(window.hermesDesktop.normalizePreviewTarget).toHaveBeenCalledTimes(1))
+
+      await act(async () => {
+        $activeSessionId.set('another-session')
+        resolveTarget(fileTarget('/tmp/late.html'))
+      })
+
+      expect($previewTabs.get()).toHaveLength(0)
+      expect($previewTarget.get()).toBeNull()
     })
 
     it('ignores an open from a session that is not the one on screen', async () => {
@@ -231,6 +270,51 @@ describe('preview routing', () => {
 
       await waitFor(() => expect($previewTabs.get()).toHaveLength(1))
       expect($previewTarget.get()?.path).toBe('/tmp/keep.html')
+    })
+
+    it('does not let an agent close a manually opened preview', async () => {
+      render(<Harness />)
+      openPreview(fileTarget('/tmp/manual.html'), 'manual')
+
+      await emitPreviewOpen('/tmp/offered.html')
+      await waitFor(() => expect($previewTabs.get()).toHaveLength(2))
+
+      await emitPreviewClose('/tmp/manual.html')
+
+      expect($previewTabs.get().map(tab => tab.target.path)).toEqual(['/tmp/manual.html', '/tmp/offered.html'])
+
+      await emitPreviewClose('/tmp/offered.html')
+
+      await waitFor(() => expect($previewTabs.get().map(tab => tab.target.path)).toEqual(['/tmp/manual.html']))
+    })
+
+    it('does not let an agent close a user-pinned offered preview', async () => {
+      render(<Harness />)
+
+      await emitPreviewOpen('/tmp/pinned.html')
+      await waitFor(() => expect($previewTabs.get()).toHaveLength(1))
+
+      const tab = $previewTabs.get()[0]
+      expect(tab).toBeDefined()
+      expect(persistPreviewTab(tab!.id)).toBe(true)
+
+      await emitPreviewClose('/tmp/pinned.html')
+
+      expect($previewTabs.get()).toHaveLength(1)
+      expect($previewTabs.get()[0]?.target.transient).toBeUndefined()
+      expect($previewTabs.get()[0]?.target.path).toBe('/tmp/pinned.html')
+    })
+
+    it('leaves manually opened tabs when an agent closes all offered previews', async () => {
+      render(<Harness />)
+      openPreview(fileTarget('/tmp/manual.html'), 'manual')
+
+      await emitPreviewOpen('/tmp/offered.html')
+      await waitFor(() => expect($previewTabs.get()).toHaveLength(2))
+
+      await emitPreviewClose('')
+
+      await waitFor(() => expect($previewTabs.get().map(tab => tab.target.path)).toEqual(['/tmp/manual.html']))
     })
 
     it('ignores a close from a session that is not the one on screen', async () => {

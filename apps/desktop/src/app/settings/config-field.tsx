@@ -7,7 +7,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import type { ConfigFieldSchema } from '@/types/hermes'
+import type { ConfigFieldSchema, ConfigSettingSurface } from '@/types/hermes'
 
 import { ComboboxInput } from './combobox-input'
 import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, FREE_INPUT_KEYS } from './constants'
@@ -15,6 +15,26 @@ import { FallbackModelsField } from './fallback-models-field'
 import { fieldCopyForSchemaKey } from './field-copy'
 import { ListRow } from './primitives'
 import { SearchableSelect } from './searchable-select'
+
+const PROVENANCE_SURFACES: Array<[ConfigSettingSurface, string]> = [
+  ['cli', 'CLI'],
+  ['desktop', 'Desktop'],
+  ['messaging', 'Messaging']
+]
+
+function nestedConfigValue(config: Record<string, unknown>, key: string): { found: boolean; value: unknown } {
+  let current: unknown = config
+
+  for (const segment of key.split('.')) {
+    if (!current || typeof current !== 'object' || !Object.prototype.hasOwnProperty.call(current, segment)) {
+      return { found: false, value: undefined }
+    }
+
+    current = (current as Record<string, unknown>)[segment]
+  }
+
+  return { found: true, value: current }
+}
 
 /**
  * One generic config row: label + description resolved from the i18n field
@@ -31,7 +51,8 @@ export function ConfigField({
   enumOptions,
   optionLabels,
   onChange,
-  descriptionExtra
+  descriptionExtra,
+  config
 }: {
   schemaKey: string
   schema: ConfigFieldSchema
@@ -40,6 +61,7 @@ export function ConfigField({
   optionLabels?: Record<string, string>
   onChange: (value: unknown) => void
   descriptionExtra?: ReactNode
+  config?: Record<string, unknown>
 }) {
   const { t } = useI18n()
   const c = t.settings.config
@@ -74,11 +96,51 @@ export function ConfigField({
     description
   )
 
+  const provenance = schema.provenance
+  const featureGate = provenance?.feature_gate
+  const gateValue = featureGate && config ? nestedConfigValue(config, featureGate.key) : undefined
+
+  const featureStatus =
+    !featureGate || !gateValue || typeof gateValue.value !== 'boolean'
+      ? undefined
+      : gateValue.value === featureGate.enabled_when
+        ? 'enabled'
+        : 'disabled'
+
+  const provenanceNode = provenance ? (
+    <p
+      className="mt-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)"
+      data-testid={`setting-visibility-${schemaKey}`}
+    >
+      {[
+        `Source: ${provenance.source} (${provenance.state})`,
+        ...PROVENANCE_SURFACES.map(([surface, label]) => {
+          const detail = provenance.surfaces[surface]
+
+          return detail?.status === 'irrelevant'
+            ? `${label}: not used`
+            : `${label}: ${detail?.activation ?? 'unknown'}`.replace('-', ' ')
+        }),
+        featureStatus ? `Feature: ${featureStatus}` : undefined,
+        provenance.runtime_source === 'unknown' ? 'Running source: unknown' : undefined
+      ]
+        .filter(Boolean)
+        .join(' · ')}
+    </p>
+  ) : undefined
+
   // Every config row is addressable by its canonical schema key, so a tour can
   // point at one setting (`[data-tour="field-model"]`) without hunting through
   // the section for an nth-child path. See lib/tour.
   const row = (action: ReactNode, wide = false) => (
-    <ListRow action={action} data-tour={`field-${schemaKey}`} description={descriptionNode} title={label} wide={wide} />
+    <ListRow
+      action={action}
+      below={provenanceNode}
+      data-tour={`field-${schemaKey}`}
+      description={descriptionNode}
+      title={label}
+      wide={wide}
+    />
   )
 
   // `fallback_providers` is a list of {provider, model} objects; the generic

@@ -139,7 +139,10 @@ test('keeps backend startup parked beyond twenty minutes until the update ends',
       },
       sleep: async ms => {
         clock += ms
-        if (clock >= 42 * 60_000) marker = false
+
+        if (clock >= 42 * 60_000) {
+          marker = false
+        }
       }
     }
   )

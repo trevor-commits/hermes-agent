@@ -419,6 +419,7 @@ function ConfigSettingsInner({
           {visibleFields.map(([key, field]) => (
             <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
               <ConfigField
+                config={config}
                 descriptionExtra={
                   key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
                     <MemoryConnect profile={scopeProfile} provider={String(getNested(config, key))} />

@@ -3562,10 +3562,50 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "session_search":
         def _execute(next_args: dict) -> Any:
-            session_db = agent._get_session_db_for_recall()
-            if not session_db:
-                from hermes_state import format_session_db_unavailable
-                return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
+            # This is a cross-profile routing boundary. Inspect the final,
+            # hook-mutated arguments so a supplied invalid profile cannot fall
+            # back to the current profile's recall database.
+            if "profile" in next_args:
+                raw_profile = next_args["profile"]
+                if not isinstance(raw_profile, str):
+                    return _finish_agent_tool(
+                        json.dumps(
+                            {
+                                "success": False,
+                                "error": "profile must be a valid profile identifier",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        next_args,
+                    )
+                try:
+                    from hermes_cli.profiles import validate_profile_name
+
+                    # Validate as supplied; normalization could silently route
+                    # an explicit target to a different profile.
+                    validate_profile_name(raw_profile)
+                except ValueError:
+                    return _finish_agent_tool(
+                        json.dumps(
+                            {
+                                "success": False,
+                                "error": (
+                                    f"profile {raw_profile!r} must be a valid "
+                                    "profile identifier"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        next_args,
+                    )
+                profile = raw_profile
+                session_db = None
+            else:
+                profile = ""
+                session_db = agent._get_session_db_for_recall()
+                if not session_db:
+                    from hermes_state import format_session_db_unavailable
+                    return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
             from tools.session_search_tool import session_search as _session_search
             return _finish_agent_tool(
                 _session_search(
@@ -3577,6 +3617,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
                     detail=next_args.get("detail", "adaptive"),
+                    profile=profile,
                     db=session_db,
                     current_session_id=agent.session_id,
                 ),

@@ -127,4 +127,23 @@ describe('ConfigField searchable routing', () => {
 
     expect(onChange).toHaveBeenCalledWith('')
   })
+
+  it('preserves an unlimited child-iteration value and large finite text without Number coercion', () => {
+    const onChange = vi.fn()
+
+    render(
+      <ConfigField
+        onChange={onChange}
+        schema={{ type: 'string' }}
+        schemaKey="delegation.max_iterations"
+        value="unlimited"
+      />
+    )
+
+    const input = screen.getByDisplayValue('unlimited') as HTMLInputElement
+    expect(input.type).toBe('text')
+    fireEvent.change(input, { target: { value: '9007199254740993' } })
+
+    expect(onChange).toHaveBeenCalledWith('9007199254740993')
+  })
 })
