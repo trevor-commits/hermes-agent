@@ -16,7 +16,7 @@ import { getHermesConfigRecord, type McpTestResult, testMcpServer } from '@/herm
 import { translateNow } from '@/i18n'
 import { classifyProbe, freshProbe, probeCache, probeKey } from '@/lib/mcp-probe-cache'
 import { getServers } from '@/lib/mcp-servers'
-import { notify } from '@/store/notifications'
+import { dismissNotification, notify } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 
@@ -39,15 +39,15 @@ export function shouldNotifyOnTransition(previous: McpHealthStatus | null, next:
 }
 
 // Last-known status per (profile, server) — the transition memory — and the
-// per-app-session notification cap. Both keyed by profile so one profile's
+// notification cap until verified recovery. Both keyed by profile so one profile's
 // broken server can't mute or trigger another's (AGENTS.md scope-in-key).
 const lastStatus = new Map<string, McpHealthStatus>()
 const notifiedThisSession = new Set<string>()
 
 let started = false
 let timer: ReturnType<typeof setInterval> | null = null
-// Bumped on profile switch; in-flight sweeps compare and bail so a slow
-// profile-A probe can't record (or notify) into profile B's state.
+// Bumped on profile switch or gateway disconnect; in-flight sweeps compare
+// and bail so an obsolete connection cannot publish a cached result or toast.
 let sweepEpoch = 0
 // Sweeps are chained, never concurrent — sequential probes, no parallel bursts.
 let sweepChain: Promise<void> = Promise.resolve()
@@ -66,6 +66,11 @@ function recordResult(profileKey: string, name: string, status: McpHealthStatus)
   const key = `${profileKey}::${name}`
   const previous = lastStatus.get(key) ?? null
   lastStatus.set(key, status)
+
+  if (status === 'ok' && previous !== null && previous !== 'ok') {
+    dismissNotification(`mcp-health-${key}`)
+    notifiedThisSession.delete(key)
+  }
 
   if (!shouldNotifyOnTransition(previous, status) || notifiedThisSession.has(key)) {
     return
@@ -176,6 +181,7 @@ export function startMcpHealthChecker(): void {
     if (state === 'open') {
       arm()
     } else {
+      sweepEpoch += 1
       disarm()
     }
   })
