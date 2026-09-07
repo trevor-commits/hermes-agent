@@ -78,11 +78,19 @@ def bedrock_model_routable_from_region(model_id: str, region_name: str) -> bool:
     return matched_geo == geo
 
 
-def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, str]:
-    """Resolve an existing wizard credential without changing its storage."""
+def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, str, str]:
+    """Resolve an existing wizard credential and its endpoint together."""
     from hermes_cli.auth import _resolve_api_key_provider_secret
 
     return _resolve_api_key_provider_secret(provider_id, pconfig)
+
+
+def _retained_credential_allows_endpoint(credential_base: str, endpoint: str) -> bool:
+    if credential_base and credential_base.rstrip("/") != endpoint.rstrip("/"):
+        print("The existing credential belongs to a different endpoint. Replace the key before changing endpoints.")
+        print("No change.")
+        return False
+    return True
 
 
 def _prune_replaced_custom_model_config_credentials(
@@ -197,7 +205,7 @@ def _model_flow_openrouter(config, current_model=""):
         auth_type="api_key",
         api_key_env_vars=("OPENROUTER_API_KEY",),
     )
-    existing_key, existing_source = _existing_api_key_for_model_flow("openrouter", pconfig)
+    existing_key, existing_source, credential_base = _existing_api_key_for_model_flow("openrouter", pconfig)
     if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
@@ -210,6 +218,7 @@ def _model_flow_openrouter(config, current_model=""):
     if abort:
         return
 
+    effective_base = credential_base if _resolved == existing_key and credential_base else OPENROUTER_BASE_URL
     from hermes_cli.models import model_ids, get_pricing_for_provider
 
     openrouter_models = model_ids(force_refresh=True)
@@ -222,7 +231,7 @@ def _model_flow_openrouter(config, current_model=""):
         current_model=current_model,
         pricing=pricing,
         confirm_provider="openrouter",
-        confirm_base_url=OPENROUTER_BASE_URL,
+        confirm_base_url=effective_base,
         confirm_api_key=_resolved or existing_key,
     )
     if selected:
@@ -237,7 +246,7 @@ def _model_flow_openrouter(config, current_model=""):
             model = {"default": model} if model else {}
             cfg["model"] = model
         model["provider"] = "openrouter"
-        model["base_url"] = OPENROUTER_BASE_URL
+        model["base_url"] = effective_base
         model["api_mode"] = "chat_completions"
         clear_model_endpoint_credentials(model, clear_api_mode=False)
         save_config(cfg)
@@ -2119,7 +2128,7 @@ def _model_flow_kimi(config, current_model=""):
     - sk-kimi-* keys   → api.kimi.com/coding/v1  (Kimi Coding Plan)
     - Other keys        → api.moonshot.ai/v1      (legacy Moonshot)
 
-    No manual base URL prompt — endpoint is determined by key prefix.
+    Reused credentials retain their paired endpoint; new keys use the prefix.
     """
     from hermes_cli.main import _prompt_api_key
     from hermes_cli.auth import (
@@ -2142,9 +2151,9 @@ def _model_flow_kimi(config, current_model=""):
     base_url_env = pconfig.base_url_env_var or ""
 
     # Step 1: Check / prompt for API key
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key, existing_source, credential_base = _existing_api_key_for_model_flow(provider_id, pconfig)
 
-    existing_key, abort = _prompt_api_key(
+    resolved_key, abort = _prompt_api_key(
         pconfig,
         existing_key,
         provider_id=provider_id,
@@ -2152,17 +2161,22 @@ def _model_flow_kimi(config, current_model=""):
     )
     if abort:
         return
+    credential_base = credential_base if resolved_key == existing_key else ""
+    existing_key = resolved_key
 
     # Step 2: Auto-detect endpoint from key prefix
     is_coding_plan = existing_key.startswith("sk-kimi-")
-    if is_coding_plan:
+    if credential_base:
+        effective_base = credential_base
+        print(f"  Using existing credential endpoint → {effective_base}")
+    elif is_coding_plan:
         effective_base = KIMI_CODE_BASE_URL
         print(f"  Detected Kimi Coding Plan key → {effective_base}")
     else:
         effective_base = pconfig.inference_base_url
         print(f"  Using Moonshot endpoint → {effective_base}")
     # Clear any manual base URL override so auto-detection works at runtime
-    if base_url_env and get_env_value(base_url_env):
+    if not credential_base and base_url_env and get_env_value(base_url_env):
         save_env_value(base_url_env, "")
     print()
 
@@ -2225,9 +2239,9 @@ def _model_flow_stepfun(config, current_model=""):
     pconfig = PROVIDER_REGISTRY[provider_id]
     base_url_env = pconfig.base_url_env_var or ""
 
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key, existing_source, credential_base = _existing_api_key_for_model_flow(provider_id, pconfig)
 
-    existing_key, abort = _prompt_api_key(
+    resolved_key, abort = _prompt_api_key(
         pconfig,
         existing_key,
         provider_id=provider_id,
@@ -2235,9 +2249,11 @@ def _model_flow_stepfun(config, current_model=""):
     )
     if abort:
         return
+    credential_base = credential_base if resolved_key == existing_key else ""
+    existing_key = resolved_key
 
-    current_base = ""
-    if base_url_env:
+    current_base = credential_base
+    if not current_base and base_url_env:
         current_base = get_env_value(base_url_env) or os.getenv(base_url_env, "")
     if not current_base:
         model_cfg = config.get("model")
@@ -2258,6 +2274,11 @@ def _model_flow_stepfun(config, current_model=""):
             ordered_regions.insert(0, (region_key, f"{label}  ← currently active"))
         else:
             ordered_regions.append((region_key, label))
+    if credential_base and all(
+        credential_base.rstrip("/") != _stepfun_base_url_for_region(key).rstrip("/")
+        for key, _ in region_choices
+    ):
+        ordered_regions.insert(0, ("current", f"Existing credential endpoint ({credential_base})"))
     ordered_regions.append(("cancel", "Cancel"))
 
     region_idx = _prompt_provider_choice([label for _, label in ordered_regions])
@@ -2266,7 +2287,9 @@ def _model_flow_stepfun(config, current_model=""):
         return
 
     selected_region = ordered_regions[region_idx][0]
-    effective_base = _stepfun_base_url_for_region(selected_region)
+    effective_base = credential_base if selected_region == "current" else _stepfun_base_url_for_region(selected_region)
+    if not _retained_credential_allows_endpoint(credential_base, effective_base):
+        return
     if base_url_env:
         save_env_value(base_url_env, effective_base)
 
@@ -2344,9 +2367,11 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         auth_type="api_key",
         api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",),
     )
-    existing_key, existing_source = _resolve_api_key_provider_secret(
+    existing_key, existing_source, credential_base = _resolve_api_key_provider_secret(
         "bedrock", bedrock_pconfig
     )
+    if not _retained_credential_allows_endpoint(credential_base, mantle_base_url):
+        return
     if existing_key:
         from hermes_cli.env_loader import format_secret_source_suffix
         source_suffix = format_secret_source_suffix(
@@ -2825,6 +2850,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     pconfig = PROVIDER_REGISTRY[provider_id]
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
+    credential_base = ""
 
     # OpenCode Free is keyless — the tier is served anonymously and any
     # unrecognized bearer 401s, so there is no key to prompt for.
@@ -2833,9 +2859,9 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         existing_key = ""
     else:
         # Check / prompt for API key
-        existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+        existing_key, existing_source, credential_base = _existing_api_key_for_model_flow(provider_id, pconfig)
 
-        existing_key, abort = _prompt_api_key(
+        resolved_key, abort = _prompt_api_key(
             pconfig,
             existing_key,
             provider_id=provider_id,
@@ -2843,6 +2869,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         )
         if abort:
             return
+        credential_base = credential_base if resolved_key == existing_key else ""
+        existing_key = resolved_key
 
     # Gemini free-tier gate: free-tier daily quotas (<= 250 RPD for Flash)
     # are exhausted in a handful of agent turns, so refuse to wire up the
@@ -2856,7 +2884,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         if probe_gemini_tier is not None:
             print("  Checking Gemini API tier...")
             probe_base = (
-                (get_env_value(base_url_env) if base_url_env else "")
+                credential_base
+                or (get_env_value(base_url_env) if base_url_env else "")
                 or os.getenv(base_url_env or "", "")
                 or pconfig.inference_base_url
             )
@@ -2903,12 +2932,12 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             print()
 
     # Optional base URL override.
-    # Precedence: env var → config.yaml model.base_url → registry default.
+    # Precedence: retained credential endpoint → env → config → default.
     # Reading config.yaml prevents silently overwriting a saved remote URL
     # (e.g. a remote LM Studio endpoint) with localhost when the user just
     # presses Enter at the prompt below.
-    current_base = ""
-    if base_url_env:
+    current_base = credential_base
+    if not current_base and base_url_env:
         current_base = get_env_value(base_url_env) or os.getenv(base_url_env, "")
     if not current_base:
         try:
@@ -2925,6 +2954,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         # a picker instead of a plain text input so users can explicitly
         # choose the endpoint that matches their key type.
         chosen_base = _select_zai_endpoint(effective_base)
+        if not _retained_credential_allows_endpoint(credential_base, chosen_base):
+            return
         if chosen_base and chosen_base != effective_base and base_url_env:
             save_env_value(base_url_env, chosen_base)
         effective_base = chosen_base
@@ -2940,6 +2971,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
                     "  Invalid URL — must start with http:// or https://. Keeping current value."
                 )
             else:
+                if not _retained_credential_allows_endpoint(credential_base, override):
+                    return
                 save_env_value(base_url_env, override)
                 effective_base = override
 

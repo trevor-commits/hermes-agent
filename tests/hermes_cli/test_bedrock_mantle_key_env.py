@@ -11,6 +11,7 @@ runtime resolver then makes of it.
 
 import os
 
+import pytest
 import yaml
 
 import hermes_cli.runtime_provider as rp
@@ -105,3 +106,52 @@ def test_resolution_fails_closed_when_the_token_is_absent(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested=cfg["model"]["provider"])
 
     assert resolved["api_key"] != TOKEN
+
+
+@pytest.mark.parametrize("display_name", [None, "AWS Team Gateway"])
+def test_pool_only_wizard_keeps_a_live_endpoint_bound_credential(monkeypatch, display_name):
+    """Saving the wizard must not lose, copy, or detach its pooled credential."""
+    import hermes_cli.auth as auth
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    monkeypatch.setattr(auth, "_prompt_model_selection", lambda *a, **kw: "fixture-model")
+    monkeypatch.setattr(auth, "_save_model_choice", lambda *a, **kw: None)
+    monkeypatch.setattr(auth, "deactivate_provider", lambda: None)
+    entry = {
+        "id": "fixture-mantle", "source": "manual", "auth_type": "api_key",
+        "access_token": TOKEN, "priority": 0,
+        "base_url": f"https://bedrock-mantle.{REGION}.api.aws/v1",
+    }
+    auth.write_credential_pool("bedrock", [entry])
+    if display_name:
+        from hermes_cli.config import save_config
+        save_config({"providers": {"bedrock-mantle": {"name": display_name}}})
+    _model_flow_bedrock_api_key({}, REGION)
+    home = get_hermes_home()
+    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    assert cfg["providers"]["bedrock-mantle"].get("name") == display_name
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    for token in (TOKEN, TOKEN + "-rotated"):
+        auth.write_credential_pool("bedrock", [dict(entry, access_token=token)])
+        resolved = rp.resolve_runtime_provider(requested=cfg["model"]["provider"])
+        assert (resolved["api_key"], resolved["base_url"]) == (token, entry["base_url"])
+    assert TOKEN not in (home / "config.yaml").read_text()
+    assert not (home / ".env").exists() or TOKEN not in (home / ".env").read_text()
+
+    # An explicit endpoint without its own key cannot inherit the pool secret.
+    other_base = "https://different-owner.example/v1"
+    with pytest.raises(auth.AuthError, match="does not belong"):
+        rp.resolve_runtime_provider(requested=cfg["model"]["provider"], explicit_base_url=other_base)
+    explicit = rp.resolve_runtime_provider(
+        requested=cfg["model"]["provider"], explicit_base_url=other_base, explicit_api_key="own-explicit-key",
+    )
+    assert (explicit["api_key"], explicit["base_url"]) == ("own-explicit-key", other_base)
+
+    # A changed pool binding is also authoritative on the very next resolve.
+    auth.write_credential_pool("bedrock", [dict(entry, base_url=other_base)])
+    with pytest.raises(auth.AuthError, match="does not belong"):
+        rp.resolve_runtime_provider(requested=cfg["model"]["provider"])
+    auth.write_credential_pool("bedrock", [], removed_ids=[entry["id"]])
+    resolved = rp.resolve_runtime_provider(requested=cfg["model"]["provider"])
+    assert TOKEN not in resolved["api_key"]

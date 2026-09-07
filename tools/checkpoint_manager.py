@@ -909,13 +909,15 @@ class CheckpointManager:
         if not self._git_available:
             return False
 
-        abs_dir = str(_normalize_path(working_dir))
+        directory = _normalize_path(working_dir)
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
-            logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+        # Compare canonical paths so a symlinked home cannot bypass this guard.
+        # A root is its own parent on POSIX, drive-letter, and UNC paths.
+        if directory == directory.parent or directory == _normalize_path(str(Path.home())):
+            logger.debug("Checkpoint skipped: directory too broad (%s)", directory)
             return False
 
+        abs_dir = str(directory)
         if abs_dir in self._checkpointed_dirs:
             return False
 

@@ -834,6 +834,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    if key_env:
+                        result["key_env"] = key_env
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
@@ -1306,6 +1308,32 @@ def _resolve_named_custom_runtime(
         _host_derived_api_key(base_url),
     ]
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
+
+    if (
+        not api_key and not custom_provider.get("key_cmd")
+        and requested_norm == "custom:bedrock-mantle"
+        and custom_provider.get("key_env") == "AWS_BEARER_TOKEN_BEDROCK"
+    ):
+        # The wizard can reuse the Bedrock pool. Keep that live reference,
+        # but never move its key to a later custom/explicit endpoint override.
+        bedrock = load_config().get("bedrock")
+        region = str(bedrock.get("region") or "") if isinstance(bedrock, dict) else ""
+        token, _, credential_base = auth_mod._resolve_api_key_provider_secret(
+            "bedrock", auth_mod.ProviderConfig(
+                id="bedrock", name="Bedrock", auth_type="api_key",
+                api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",),
+            ),
+        )
+        if (
+            base_url != str(custom_provider.get("base_url") or "").rstrip("/")
+            or base_url != f"https://bedrock-mantle.{region}.api.aws/v1"
+            or (credential_base and base_url != credential_base.rstrip("/"))
+        ):
+            raise AuthError(
+                "The Bedrock credential does not belong to this endpoint. Configure a key for the selected endpoint.",
+                provider="bedrock", code="credential_endpoint_mismatch",
+            )
+        api_key = token
 
     # A ``key_cmd`` credential is minted per request rather than resolved once:
     # gateways that issue short-lived bearers would otherwise go stale

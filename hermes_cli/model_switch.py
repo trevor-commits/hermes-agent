@@ -2712,7 +2712,7 @@ def _collect_authed_provider_slugs(
             try:
                 from hermes_cli.auth import read_credential_pool
                 has_creds = _credential_pool_is_usable(
-                    hermes_id, raw_pool_present=bool(read_credential_pool(hermes_id))
+                    hermes_id, raw_pool_present=bool(read_credential_pool().get(hermes_id))
                 )
             except Exception:
                 pass
@@ -3113,7 +3113,7 @@ def list_authenticated_providers(
             try:
                 from hermes_cli.auth import read_credential_pool
                 has_creds = _credential_pool_is_usable(
-                    hermes_id, raw_pool_present=bool(read_credential_pool(hermes_id)),
+                    hermes_id, raw_pool_present=bool(read_credential_pool().get(hermes_id)),
                     for_picker=for_picker,
                 )
             except Exception:

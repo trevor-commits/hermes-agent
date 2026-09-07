@@ -157,8 +157,32 @@ class TestTakeCheckpoint:
         assert mgr.ensure_checkpoint(str(work_dir), "first") is True
         assert mgr.ensure_checkpoint(str(work_dir), "second") is False  # dedup'd
         # Never snapshot the filesystem root or the user's home.
-        assert mgr.ensure_checkpoint("/", "root") is False
+        assert mgr.ensure_checkpoint(work_dir.anchor, "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
+
+    def test_skips_symlinked_home_but_checkpoints_child_project(
+        self, fake_home, checkpoint_base, tmp_path, monkeypatch,
+    ):
+        project = fake_home / "project"
+        project.mkdir()
+        (project / "main.py").write_text("print('owned test content')\n")
+        home_alias = tmp_path / "home-alias"
+        try:
+            home_alias.symlink_to(fake_home, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+        monkeypatch.setenv("HOME", str(home_alias))
+        monkeypatch.setenv("USERPROFILE", str(home_alias))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home_alias))
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True)
+
+        assert manager.ensure_checkpoint(str(home_alias), "home alias") is False
+        assert manager.ensure_checkpoint(str(fake_home.resolve()), "resolved home") is False
+        assert not checkpoint_base.exists()
+        assert manager.ensure_checkpoint(str(home_alias / "project"), "child project") is True
+        assert len(manager.list_checkpoints(str(project))) == 1
 
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
