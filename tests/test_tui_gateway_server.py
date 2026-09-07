@@ -4831,6 +4831,11 @@ def test_ws_orphan_reap_preserves_isolated_turn_then_reaps(monkeypatch):
         session["running"] = False
         callbacks.pop(0)()
 
+        assert server._sessions["isolated-sid"] is session
+        assert torn_down == []
+        session["queued_prompt"] = None
+        callbacks.pop(0)()
+
         assert "isolated-sid" not in server._sessions
         assert torn_down == [(session, "ws_orphan_reap")]
     finally:
@@ -5037,6 +5042,59 @@ def test_ws_orphan_reap_preserves_in_process_turn(monkeypatch):
         assert len(callbacks) == 1
     finally:
         server._sessions.pop("inline-sid", None)
+
+
+@pytest.mark.parametrize("unfinished", ["building", "approval", "queued", "queued_tail"])
+def test_passive_reapers_preserve_unfinished_session(monkeypatch, unfinished):
+    """Disconnect, TTL and capacity cleanup share the same work protections."""
+    sid = "unfinished-session"
+    callbacks = []
+    torn_down = []
+    session = _session(transport=server._detached_ws_transport)
+    ready = threading.Event()
+    if unfinished == "building":
+        session.update(agent_ready=ready, agent_build_started=True)
+    elif unfinished == "approval":
+        server._pending["unfinished-approval"] = (sid, threading.Event())
+    elif unfinished == "queued":
+        session["queued_prompt"] = {"text": "run the next step"}
+    else:
+        session["queued_prompts"] = [{"text": "run the next step"}]
+
+    class Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", Timer)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_a: False)
+    monkeypatch.setattr(
+        server, "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append(claimed),
+    )
+    server._sessions[sid] = session
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        callbacks.pop(0)()
+        assert server._sessions.get(sid) is session
+        assert not server._session_is_evictable(sid, session, time.time() + 86_400)
+        assert not server._session_is_lru_evictable(sid, session)
+        assert torn_down == []
+
+        ready.set()
+        server._pending.pop("unfinished-approval", None)
+        session.pop("queued_prompt", None)
+        session.pop("queued_prompts", None)
+        callbacks.pop(0)()
+        assert sid not in server._sessions
+        assert torn_down == [session]
+    finally:
+        server._sessions.pop(sid, None)
+        server._pending.pop("unfinished-approval", None)
+        server._pending_ws_reaps.pop(sid, None)
 
 
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):

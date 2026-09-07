@@ -148,6 +148,155 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+@pytest.mark.parametrize("input_size", [2, 220_000, 480_000])
+@pytest.mark.parametrize("hard_timeout", [None, 90])
+def test_active_codex_stream_survives_long_elapsed_time(monkeypatch, input_size, hard_timeout):
+    """Forty minutes of valid stream activity is not forty minutes of silence."""
+    from agent import chat_completion_helpers as h
+
+    now = [1_000.0]
+    response = SimpleNamespace(ok=True)
+    agent = SimpleNamespace(
+        platform="desktop",
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        model="gpt-6-astra",
+        _consecutive_stale_streams=0,
+        _interrupt_requested=False,
+        _compute_non_stream_stale_timeout=lambda _kwargs: 90.0,
+        _touch_activity=lambda _message: None,
+        _emit_wait_notice=lambda _message: None,
+        _buffer_status=lambda _message: None,
+    )
+
+    class ActiveStreamThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.polls = 0
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            now[0] += 30.0
+            self.polls += 1
+            agent._codex_stream_last_event_ts = now[0]
+
+        def is_alive(self):
+            if self.polls >= 80:
+                self.target()
+                return False
+            return True
+
+    monkeypatch.delenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", raising=False)
+    if hard_timeout is not None:
+        monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", str(hard_timeout))
+    monkeypatch.setattr(h, "time", SimpleNamespace(time=lambda: now[0]))
+    monkeypatch.setattr(h.threading, "Thread", ActiveStreamThread)
+    monkeypatch.setattr(h, "_dispatch_nonstreaming_api_request", lambda *_a, **_k: response)
+
+    payload = {"model": "gpt-6-astra", "input": "x" * input_size}
+    if hard_timeout is None:
+        assert h.interruptible_api_call(agent, payload) is response
+        assert now[0] >= 3_400.0
+        assert agent._consecutive_stale_streams == 0
+    else:
+        with pytest.raises(TimeoutError, match="threshold: 90s"):
+            h.interruptible_api_call(agent, payload)
+        assert now[0] < 1_200.0
+
+
+@pytest.mark.parametrize("hard_timeout, expected", [(0, 480), (450, 450)])
+def test_wait_notice_rearms_after_codex_activity(hard_timeout, expected):
+    from agent.chat_completion_helpers import _codex_wait_notice_recovery
+
+    assert _codex_wait_notice_recovery(
+        stale_timeout=90,
+        ttfb_enabled=True,
+        ttfb_timeout=120,
+        last_event_ts=490,
+        call_start=100,
+        idle_enabled=True,
+        idle_timeout=120,
+        elapsed=400,
+        hard_timeout=hard_timeout,
+    ) == f"; auto-reconnect at {expected}s"
+
+
+def test_codex_sdk_stream_crosses_stale_window_without_reconnect(tmp_path, monkeypatch):
+    """Real HTTP/SSE, SDK parsing, worker ownership and watchdog polling."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import openai
+    from agent import chat_completion_helpers as h
+
+    requests = []
+    aborts = []
+    stop = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            events = [{"type": "response.created", "response": {"id": "resp-local"}}]
+            events += [{"type": "response.reasoning_summary_text.delta", "delta": "thinking"}] * 20
+            events += [
+                {"type": "response.output_text.delta", "delta": "finished"},
+                {"type": "response.completed", "response": {"id": "resp-local", "status": "completed", "output": []}},
+            ]
+            try:
+                for event in events:
+                    self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
+                    self.wfile.flush()
+                    if stop.wait(0.05):
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    client = openai.OpenAI(
+        api_key="local-test-only",
+        base_url=f"http://127.0.0.1:{httpd.server_port}/v1",
+        max_retries=0,
+    )
+    original_abort = agent._abort_request_openai_client
+
+    def record_abort(*args, **kwargs):
+        aborts.append(kwargs.get("reason"))
+        return original_abort(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", record_abort)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda _k: 0.4)
+    monkeypatch.delenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", raising=False)
+    try:
+        result = h.interruptible_api_call(agent, {"model": "gpt-6-astra", "input": "hello"})
+        assert result.output_text == "finished"
+        assert len(requests) == 1
+        assert requests[0]["stream"] is True
+        assert aborts == []
+        assert client.is_closed()
+    finally:
+        stop.set()
+        client.close()
+        agent.close()
+        httpd.shutdown()
+        httpd.server_close()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+
 
 
 
@@ -345,7 +494,5 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
-
 
 

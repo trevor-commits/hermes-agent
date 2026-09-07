@@ -1413,7 +1413,7 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             current = _sessions.get(sid)
             if current is None or not _ws_session_is_detached(current):
                 return
-            if current.get("running") or _session_has_active_delegations(sid, current):
+            if not _session_is_lru_evictable(sid, current):
                 # Losing the UI transport is not a request to cancel work.
                 # Keep one timer so normal completion still releases idle
                 # resources, and a reconnect can reuse the live turn.
@@ -1732,16 +1732,7 @@ def _transport_is_dead(transport) -> bool:
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
-    if session.get("running") or _session_pending_kind(sid):
-        return False
-    if _session_has_active_delegations(sid, session):
-        return False
-    ready = session.get("agent_ready")
-    # Lazy watch sessions (subagent spectator windows) never start a build,
-    # so their forever-unset agent_ready must not make them immortal.
-    if ready is not None and not ready.is_set() and not session.get("lazy"):
-        return False
-    if not _transport_is_dead(session.get("transport")):
+    if not _session_is_lru_evictable(sid, session):
         return False
     last_active = float(session.get("last_active") or 0.0)
     created_at = float(session.get("created_at") or 0.0)
@@ -1834,10 +1825,16 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # moment it loses its client.
     if session.get("running") or _session_pending_kind(sid):
         return False
+    if session.get("queued_prompt") or session.get("queued_prompts"):
+        return False
     if _session_has_active_delegations(sid, session):
         return False
     ready = session.get("agent_ready")
-    if ready is not None and not ready.is_set() and not session.get("lazy"):
+    # Hosted turns and lazy spectators never build an in-process agent.
+    if (
+        ready is not None and not ready.is_set()
+        and not session.get("lazy") and not session.get("_compute_host_active")
+    ):
         return False
     return _transport_is_dead(session.get("transport"))
 
@@ -10245,8 +10242,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        queued_transport = queued.get("transport")
+        # A reconnect may have replaced the socket captured at submission.
+        if queued_transport is not None and not _transport_is_dead(queued_transport):
+            session["transport"] = queued_transport
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
