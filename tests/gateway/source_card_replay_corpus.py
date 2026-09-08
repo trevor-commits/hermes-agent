@@ -146,12 +146,9 @@ def run_packet(
     requested_model: str,
 ) -> PacketResult:
     """Run one packet through the production render/validate/land path."""
-    from gateway.run import (
-        _finalize_source_card_worker_draft,
-        _land_source_card,
-        _parse_source_card_worker_draft,
-        _source_card_attestation_error,
-    )
+    from gateway.source_card_render import (_finalize_source_card_worker_draft, _parse_source_card_worker_draft)
+    from gateway.source_card_landing import (_land_source_card)
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     packet_id = str(packet["packet_id"])
     response = str(packet["worker_response"])

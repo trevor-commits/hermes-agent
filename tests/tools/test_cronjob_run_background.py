@@ -42,7 +42,7 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
     """Context manager binding the approval session key contextvar."""
     import contextlib
 
-    from tools.approval import _approval_session_key
+    from tools.approval_context import _approval_session_key
 
     @contextlib.contextmanager
     def _cm():
@@ -60,6 +60,7 @@ class TestBackgroundDispatch:
         """With a routable session, run claims sync then dispatches async."""
         run_started = threading.Event()
         run_release = threading.Event()
+        job_read = threading.Event()
 
         def slow_run_one_job(job, **kw):
             run_started.set()
@@ -70,20 +71,22 @@ class TestBackgroundDispatch:
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
+                       side_effect=lambda jid: (job_read.set(), {"last_status": "ok", "last_error": None})[1]):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
 
-        try:
-            # Returned BEFORE the job finished — that's the whole point.
-            assert res is not None
-            assert res["claimed"] is True
-            assert res["dispatched"] is True
-            assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
-        finally:
-            run_release.set()
+                try:
+                    # Returned BEFORE the job finished — that's the whole point.
+                    assert not run_release.is_set()
+                    assert res is not None
+                    assert res["claimed"] is True
+                    assert res["dispatched"] is True
+                    assert res["delegation_id"]
+                    m_claim.assert_called_once_with("job-bg-01", return_job=True)
+                    # The job actually starts on the daemon executor.
+                    assert run_started.wait(timeout=5.0), "job never started in background"
+                finally:
+                    run_release.set()
+                assert job_read.wait(timeout=5.0), "background job did not finish reading its state"
 
     def test_completion_event_reaches_shared_queue(self):
         """The finished run pushes a type='async_delegation' event carrying
@@ -236,6 +239,28 @@ class TestInFlightDedupe:
         assert res["success"] is True
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
+
+    def test_run_claimed_job_reports_exact_unknown_execution_not_stale_success(self):
+        from tools.cronjob_tools import _run_claimed_job
+
+        def probe_run(job, **_kwargs):
+            job["execution_id"] = "exec-unknown"
+            return True
+
+        with patch("cron.scheduler.run_one_job", side_effect=probe_run), \
+             patch("cron.executions.get_execution", return_value={
+                 "id": "exec-unknown",
+                 "status": "unknown",
+                 "error": "worker owner exited",
+             }), \
+             patch("tools.cronjob_tools.get_job", return_value={
+                 "last_status": "ok",
+                 "last_error": None,
+             }):
+            res = _run_claimed_job(_job("job-bg-unknown"))
+
+        assert res["success"] is False
+        assert res["error"] == "worker owner exited"
 
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job

@@ -132,26 +132,28 @@ class TestAutoSkillPendingClaim:
         def fail_canonical_write(*_args, **_kwargs):
             raise OSError("canonical routing unavailable")
 
-        monkeypatch.setattr(
-            store._db,
-            "replace_gateway_routing_entries",
-            fail_canonical_write,
-        )
+        with monkeypatch.context() as failure:
+            failure.setattr(
+                store._db,
+                "replace_gateway_routing_entries",
+                fail_canonical_write,
+            )
 
-        assert store.claim_auto_skill_pending(
-            entry.session_key,
-            entry.session_id,
-            active_turn_token=token,
-        ) is False
-        assert store._persisted_routing_generation == persisted_generation
-        assert entry.auto_skill_pending is True
-        assert entry.auto_skill_claim_token is None
+            assert store.claim_auto_skill_pending(
+                entry.session_key,
+                entry.session_id,
+                active_turn_token=token,
+            ) is False
+            assert store._persisted_routing_generation == persisted_generation
+            assert entry.auto_skill_pending is True
+            assert entry.auto_skill_claim_token is None
 
-        mirror = json.loads(
-            (tmp_path / "sessions.json").read_text(encoding="utf-8")
-        )
-        assert mirror[entry.session_key]["auto_skill_pending"] is True
+            mirror = json.loads(
+                (tmp_path / "sessions.json").read_text(encoding="utf-8")
+            )
+            assert mirror[entry.session_key]["auto_skill_pending"] is True
 
+        store.close_all_db_handles()
         restarted = _make_store(tmp_path)
         restored = restarted.lookup_by_session_key(entry.session_key)
         assert restored is not None

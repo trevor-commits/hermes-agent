@@ -10,6 +10,8 @@ sessions, sub-threshold usage, and the default-off config must never roll.
 
 from __future__ import annotations
 
+from gateway import run_turn
+
 import asyncio
 import dataclasses
 import json
@@ -22,7 +24,8 @@ from gateway import run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.turn_lease import SessionTurnLeaseRegistry
-from hermes_state import CompressionSessionClosedError, SessionDB
+from hermes_state import SessionDB
+from hermes_state_errors import CompressionSessionClosedError
 from tests.gateway.test_42039_duplicate_user_message import (
     _bootstrap,
     _event,
@@ -780,7 +783,7 @@ def test_restart_reconstructs_committed_rollover_route(tmp_path):
 
 
 def test_carryover_digest_prefers_compacted_summary():
-    digest = gateway_run._build_proactive_rollover_carryover(
+    digest = run_turn._build_proactive_rollover_carryover(
         [
             {"role": "user", "content": "first ask"},
             {

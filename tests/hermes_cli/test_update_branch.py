@@ -163,7 +163,7 @@ class TestUpdateSurfaceAgreement:
         assert written["behind"] == 5
 
     def test_recent_upstream_commits_follows_branch(self, monkeypatch):
-        from hermes_cli import web_server
+        from hermes_cli.web_routers import actions
 
         recorded = []
 
@@ -171,8 +171,8 @@ class TestUpdateSurfaceAgreement:
             recorded.append(list(cmd))
             return _completed(0, "")
 
-        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
-        web_server._recent_upstream_commits("keeper")
+        monkeypatch.setattr(actions.subprocess, "run", fake_run)
+        actions._recent_upstream_commits("keeper")
         assert recorded and any(
             "HEAD..origin/keeper" in part for part in recorded[0])
 

@@ -462,7 +462,8 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       metadata: {
         custom: {
           ...timelineMeta,
-          ...(message.contextHandoff ? { contextHandoff: message.contextHandoff } : {})
+          ...(message.contextHandoff ? { contextHandoff: message.contextHandoff } : {}),
+          ...(message.asyncResult ? { asyncResult: message.asyncResult } : {})
         }
       }
     } as ThreadMessage

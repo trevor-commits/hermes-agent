@@ -5,6 +5,11 @@ dispatch one durable worker without allowing the parent model or parent tools
 to interpret the router prompt.
 """
 
+from gateway import run_source_card
+from gateway import source_card_landing
+from gateway import source_card_prefetch
+from gateway import source_card_render
+
 import json
 import os
 import sqlite3
@@ -113,7 +118,7 @@ def _write_worker_environment(home):
 
 
 def test_route_requires_trusted_telegram_binding_url_and_external_event():
-    from gateway.run import _is_source_card_intake_event
+    from gateway.run_source_card import (_is_source_card_intake_event)
 
     assert _is_source_card_intake_event(_event(), _source())
     assert not _is_source_card_intake_event(_event(route=None), _source())
@@ -131,7 +136,7 @@ def test_route_requires_trusted_telegram_binding_url_and_external_event():
 
 
 def test_worker_context_ceiling_and_iteration_limit_cannot_be_reported_as_success():
-    from gateway.run import _normalize_source_card_worker_result
+    from gateway.run_source_card import (_normalize_source_card_worker_result)
 
     normalized = _normalize_source_card_worker_result(
         {
@@ -155,7 +160,7 @@ def test_worker_context_ceiling_and_iteration_limit_cannot_be_reported_as_succes
 
 
 def test_legacy_tool_withholding_does_not_override_a_completed_no_tool_draft():
-    from gateway.run import _normalize_source_card_worker_result
+    from gateway.run_source_card import (_normalize_source_card_worker_result)
 
     normalized = _normalize_source_card_worker_result(
         {
@@ -176,7 +181,7 @@ def test_legacy_tool_withholding_does_not_override_a_completed_no_tool_draft():
 
 
 def test_no_tool_normalizer_preserves_an_existing_worker_failure():
-    from gateway.run import _normalize_source_card_worker_result
+    from gateway.run_source_card import (_normalize_source_card_worker_result)
 
     provider_failure = _normalize_source_card_worker_result(
         {
@@ -194,7 +199,7 @@ def test_no_tool_normalizer_preserves_an_existing_worker_failure():
 
 
 def test_worker_tool_surface_is_empty_regardless_of_configured_toolsets():
-    from gateway.run import _source_card_worker_toolsets
+    from gateway.run_source_card import (_source_card_worker_toolsets)
 
     assert _source_card_worker_toolsets(
         ["browser", "file", "memory", "terminal", "web"]
@@ -203,7 +208,7 @@ def test_worker_tool_surface_is_empty_regardless_of_configured_toolsets():
 
 
 def test_worker_environment_resolves_exact_paths_and_origin(tmp_path):
-    from gateway.run import _resolve_source_card_worker_environment
+    from gateway.source_card_prefetch import (_resolve_source_card_worker_environment)
 
     fixture = _write_worker_environment(tmp_path)
     source = _source()
@@ -231,8 +236,33 @@ def test_worker_environment_resolves_exact_paths_and_origin(tmp_path):
     }
 
 
+@pytest.mark.parametrize("configured", [True, False])
+def test_worker_environment_uses_scoped_profile_without_root_fallback(tmp_path, monkeypatch, configured):
+    import gateway.run as gateway_run
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    _write_worker_environment(tmp_path)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    if configured:
+        fixture = _write_worker_environment(profile)
+    token = set_hermes_home_override(profile)
+    entry = SimpleNamespace(session_id="parent-session-9")
+    try:
+        if not configured:
+            with pytest.raises(RuntimeError, match="research decision config"):
+                source_card_prefetch._resolve_source_card_worker_environment(_event(), _source(), entry)
+        else:
+            environment = source_card_prefetch._resolve_source_card_worker_environment(_event(), _source(), entry)
+            assert environment["decision_writer"] == str(fixture["writer"].resolve())
+            assert environment["transcript_db"] == str(fixture["transcript_db"].resolve())
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_worker_environment_rejects_symlinked_managed_paths(tmp_path):
-    from gateway.run import _resolve_source_card_worker_environment
+    from gateway.source_card_prefetch import (_resolve_source_card_worker_environment)
 
     fixture = _write_worker_environment(tmp_path)
     outside = tmp_path / "outside-writer"
@@ -292,14 +322,14 @@ def test_x_prefetch_runs_each_status_once_and_normalizes_untrusted_json(
             stderr="",
         )
 
-    monkeypatch.setattr(gateway_run.subprocess, "run", _run)
+    monkeypatch.setattr(subprocess, "run", _run)
     text = (
         "https://x.com/i/web/status/2088573393121509655 and "
         "https://x.com/author/status/2088626767669981398 plus "
         "https://x.com/i/status/2088573393121509655"
     )
 
-    posts = gateway_run._prefetch_source_card_x_posts(text, fixture["x_lookup"])
+    posts = source_card_prefetch._prefetch_source_card_x_posts(text, fixture["x_lookup"])
 
     assert [post["status_id"] for post in posts] == [
         "2088573393121509655",
@@ -316,7 +346,7 @@ def test_x_prefetch_runs_each_status_once_and_normalizes_untrusted_json(
         assert argv[:2] == [str(fixture["x_lookup"].resolve()), "--json"]
         assert "/i/web/status/" not in argv[-1]
         assert argv[-1].startswith("https://x.com/i/status/")
-        assert kwargs["timeout"] == gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT
+        assert kwargs["timeout"] == source_card_prefetch._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
 
@@ -354,7 +384,7 @@ def test_x_prefetch_rejects_non_http_untrusted_urls(
     else:
         payload[field] = [invalid_url]
     monkeypatch.setattr(
-        gateway_run.subprocess,
+        subprocess,
         "run",
         lambda argv, **kwargs: subprocess.CompletedProcess(
             argv, 0, stdout=json.dumps(payload), stderr=""
@@ -362,10 +392,10 @@ def test_x_prefetch_rejects_non_http_untrusted_urls(
     )
 
     with pytest.raises(
-        gateway_run._SourceCardPrefetchError,
+        source_card_prefetch._SourceCardPrefetchError,
         match=f"invalid {expected_label} URL",
     ):
-        gateway_run._prefetch_source_card_x_posts(
+        source_card_prefetch._prefetch_source_card_x_posts(
             "https://x.com/i/status/2088573393121509655",
             fixture["x_lookup"],
         )
@@ -396,8 +426,8 @@ def test_x_prefetch_runs_distinct_statuses_concurrently(monkeypatch, tmp_path):
             stderr="",
         )
 
-    monkeypatch.setattr(gateway_run.subprocess, "run", _run)
-    posts = gateway_run._prefetch_source_card_x_posts(
+    monkeypatch.setattr(subprocess, "run", _run)
+    posts = source_card_prefetch._prefetch_source_card_x_posts(
         "https://x.com/i/status/2088573393121509655 "
         "https://x.com/i/status/2088626767669981398",
         fixture["x_lookup"],
@@ -414,20 +444,20 @@ def test_x_prefetch_rejects_more_than_bounded_concurrent_limit(monkeypatch, tmp_
 
     fixture = _write_worker_environment(tmp_path)
     run = MagicMock(side_effect=AssertionError("lookup should not start"))
-    monkeypatch.setattr(gateway_run.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
     intake = " ".join(
         f"https://x.com/i/status/{2088573393121509655 + offset}"
         for offset in range(9)
     )
 
-    with pytest.raises(gateway_run._SourceCardPrefetchError, match="maximum 8"):
-        gateway_run._prefetch_source_card_x_posts(intake, fixture["x_lookup"])
+    with pytest.raises(source_card_prefetch._SourceCardPrefetchError, match="maximum 8"):
+        source_card_prefetch._prefetch_source_card_x_posts(intake, fixture["x_lookup"])
 
     run.assert_not_called()
 
 
 def test_mixed_intake_duplicate_identifiers_include_x_status_and_other_urls():
-    from gateway.run import _source_card_duplicate_identifiers
+    from gateway.source_card_prefetch import (_source_card_duplicate_identifiers)
 
     assert _source_card_duplicate_identifiers(
         "https://x.com/i/status/2088573393121509655 "
@@ -437,7 +467,7 @@ def test_mixed_intake_duplicate_identifiers_include_x_status_and_other_urls():
 
 
 def test_duplicate_lookup_ignores_nested_intake_records(tmp_path):
-    from gateway.run import _source_card_duplicate_lookup
+    from gateway.source_card_prefetch import (_source_card_duplicate_lookup)
 
     cards_root = tmp_path / "researched-repos"
     nested = cards_root / "_intake" / "external-source-intake.md"
@@ -454,7 +484,7 @@ def test_duplicate_lookup_ignores_nested_intake_records(tmp_path):
 
 
 def test_no_tool_worker_guard_blocks_full_tree_search_before_execution():
-    from gateway.run import _install_source_card_no_tool_guard
+    from gateway.run_source_card import (_install_source_card_no_tool_guard)
 
     executed = []
     agent = SimpleNamespace(
@@ -496,16 +526,16 @@ async def test_real_x_prefetch_failure_starts_no_worker(
         outcome = subprocess.CompletedProcess(
             ["x-lookup"], 4, stdout="", stderr="all routes failed\n"
         )
-        monkeypatch.setattr(gateway_run.subprocess, "run", lambda *args, **kwargs: outcome)
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: outcome)
         expected_error = "exit 4: all routes failed"
     else:
         monkeypatch.setattr(
-            gateway_run.subprocess,
+            subprocess,
             "run",
-            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
+            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], source_card_prefetch._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
         )
         expected_error = (
-            f"timeout after {gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
+            f"timeout after {source_card_prefetch._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
         )
     load_skill = MagicMock(side_effect=AssertionError("skill was loaded"))
     monkeypatch.setattr(skill_commands, "_load_skill_payload", load_skill)
@@ -534,7 +564,7 @@ async def test_non_x_intake_dispatches_without_x_lookup(monkeypatch, tmp_path):
         async_delegation, "find_delegation_by_work_key", lambda _key: ""
     )
     monkeypatch.setattr(
-        gateway_run,
+        source_card_prefetch,
         "_prefetch_source_card_x_posts",
         MagicMock(side_effect=AssertionError("non-X prefetch was attempted")),
     )
@@ -585,16 +615,16 @@ async def test_real_x_prefetch_failure_returns_exact_user_message_without_worker
         outcome = subprocess.CompletedProcess(
             ["x-lookup"], 4, stdout="", stderr="all routes failed\n"
         )
-        monkeypatch.setattr(gateway_run.subprocess, "run", lambda *args, **kwargs: outcome)
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: outcome)
         expected_error = "exit 4: all routes failed"
     else:
         monkeypatch.setattr(
-            gateway_run.subprocess,
+            subprocess,
             "run",
-            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
+            MagicMock(side_effect=subprocess.TimeoutExpired(["x-lookup"], source_card_prefetch._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT)),
         )
         expected_error = (
-            f"timeout after {gateway_run._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
+            f"timeout after {source_card_prefetch._SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT} seconds"
         )
 
     response = await runner._handle_message_with_agent(
@@ -834,7 +864,7 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
         "quote": None,
     }
     prefetch = MagicMock(return_value=[prefetched_post])
-    monkeypatch.setattr(gateway_run, "_prefetch_source_card_x_posts", prefetch)
+    monkeypatch.setattr(source_card_prefetch, "_prefetch_source_card_x_posts", prefetch)
     landing = MagicMock(
         return_value={
             "path": "researched-repos/example-source.md",
@@ -842,11 +872,11 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
             "receipt_results": [],
         }
     )
-    monkeypatch.setattr(gateway_run, "_land_source_card", landing)
+    monkeypatch.setattr(source_card_landing, "_land_source_card", landing)
     monkeypatch.setattr(
         async_delegation, "find_delegation_by_work_key", lambda _key: ""
     )
-    monkeypatch.setattr(delegate_tool, "_get_max_async_children", lambda: 3)
+    monkeypatch.setattr("tools.delegate_tool_config._get_max_async_children", lambda: 3)
 
     dispatched = {}
 
@@ -910,7 +940,7 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     assert "Return exactly one JSON object" in dispatched["goal"]
     assert "at or below 30000 UTF-8 bytes" in dispatched["goal"]
     assert (
-        f"above {gateway_run._SOURCE_CARD_WORKER_RESULT_MAX_BYTES} bytes are rejected"
+        f"above {source_card_prefetch._SOURCE_CARD_WORKER_RESULT_MAX_BYTES} bytes are rejected"
         in dispatched["goal"]
     )
     assert "SOURCE-CARD TEMPLATE" in dispatched["goal"]
@@ -1172,7 +1202,7 @@ def _write_offline_route_fixture(tmp_path: Path) -> dict:
 
 
 def test_template_prefetch_neutralizes_real_helper_subject_identity(tmp_path):
-    from gateway.run import _prefetch_source_card_template
+    from gateway.source_card_prefetch import (_prefetch_source_card_template)
 
     fixture = _write_offline_route_fixture(tmp_path)
 
@@ -1188,7 +1218,7 @@ def test_template_prefetch_neutralizes_real_helper_subject_identity(tmp_path):
 
 
 def test_x_prefetch_rejects_a_multiline_author_handle():
-    from gateway.run import _SourceCardPrefetchError, _normalize_source_card_x_post
+    from gateway.source_card_prefetch import (_SourceCardPrefetchError, _normalize_source_card_x_post)
 
     payload = {
         "id": "2088554041710145903",
@@ -1210,7 +1240,7 @@ def test_x_prefetch_rejects_a_multiline_author_handle():
 
 
 def test_worker_draft_finalizer_replaces_validator_rejected_placeholders(tmp_path):
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     card_path = tmp_path / "alibaba-opensandbox-claim.md"
     draft = _REAL_NEW_SOURCE_CARD_OUTPUT + (
@@ -1260,7 +1290,7 @@ def test_worker_draft_finalizer_replaces_validator_rejected_placeholders(tmp_pat
 
 
 def test_worker_draft_finalizer_normalizes_canary_routing_explanations(tmp_path):
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     draft = _REPLAY_CARD.replace(
         "- downstream learning targets: hermes",
@@ -1285,7 +1315,7 @@ def test_worker_draft_finalizer_normalizes_canary_routing_explanations(tmp_path)
 
 
 def test_worker_draft_finalizer_selects_the_repository_named_by_the_worker(tmp_path):
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     first = {
         "owner_name": "example/first",
@@ -1321,7 +1351,7 @@ def test_worker_draft_finalizer_selects_the_repository_named_by_the_worker(tmp_p
 
 
 def test_worker_draft_finalizer_selects_the_x_post_named_by_the_worker(tmp_path):
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     first = {
         "status_id": "1111111111111111111",
@@ -1354,7 +1384,7 @@ def test_worker_draft_finalizer_selects_the_x_post_named_by_the_worker(tmp_path)
 
 
 def test_finalizer_keeps_an_x_post_card_when_github_prefetch_was_capped(tmp_path):
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     first = {
         "owner_name": "example/first",
@@ -1395,7 +1425,8 @@ def test_finalizer_keeps_an_x_post_card_when_github_prefetch_was_capped(tmp_path
 def test_worker_draft_finalizer_rejects_quoted_todo_without_mutating_evidence(
     tmp_path,
 ):
-    from gateway.run import _SourceCardLandingError, _finalize_source_card_worker_draft
+    from gateway.source_card_landing import (_SourceCardLandingError)
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     quoted_evidence = "> Upstream says: TODO: add a retry boundary."
     draft = _REPLAY_CARD.rstrip() + "\n\n" + quoted_evidence + "\n"
@@ -1415,7 +1446,8 @@ def test_worker_draft_finalizer_rejects_quoted_todo_without_mutating_evidence(
 
 
 def test_worker_draft_path_rejects_a_lexical_parent_traversal(tmp_path):
-    from gateway.run import _SourceCardLandingError, _source_card_candidate_path
+    from gateway.source_card_landing import (_SourceCardLandingError)
+    from gateway.source_card_render import (_source_card_candidate_path)
 
     cards_root = tmp_path / "cards"
     (cards_root / "nested").mkdir(parents=True)
@@ -1426,7 +1458,7 @@ def test_worker_draft_path_rejects_a_lexical_parent_traversal(tmp_path):
 
 
 def test_new_worker_draft_lands_without_publishing_to_shared_checkout(tmp_path):
-    from gateway.run import _land_source_card
+    from gateway.source_card_landing import (_land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
@@ -1467,7 +1499,7 @@ def test_new_worker_draft_lands_without_publishing_to_shared_checkout(tmp_path):
 
 
 def test_rejected_worker_draft_never_reaches_shared_checkout_or_remote(tmp_path):
-    from gateway.run import _SourceCardLandingError, _land_source_card
+    from gateway.source_card_landing import (_SourceCardLandingError, _land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
@@ -1509,7 +1541,7 @@ def test_rejected_worker_draft_never_reaches_shared_checkout_or_remote(tmp_path)
 
 
 def test_landing_error_redacts_validator_temporary_paths():
-    from gateway.run import _source_card_safe_landing_detail
+    from gateway.source_card_landing import (_source_card_safe_landing_detail)
 
     detail = (
         "ERROR /private/var/folders/x1/example/T/"
@@ -1529,16 +1561,11 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
     monkeypatch,
 ):
     import gateway.run as gateway_run
-    from gateway.run import (
-        _SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT,
-        _prefetch_source_card_github_repositories,
-        _source_card_github_prefetch_bound_note,
-        _source_card_github_repositories,
-    )
+    from gateway.source_card_prefetch import (_SOURCE_CARD_NETWORK_PREFETCH_TIMEOUT, _prefetch_source_card_github_repositories, _source_card_github_prefetch_bound_note, _source_card_github_repositories)
 
     fixture = _write_offline_route_fixture(tmp_path)
     helper = fixture["repo"] / "scripts" / "source-card-prefetch"
-    real_run = gateway_run.subprocess.run
+    real_run = subprocess.run
     observed_timeouts = []
 
     def record_network_timeout(*args, **kwargs):
@@ -1546,7 +1573,7 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
             observed_timeouts.append(kwargs.get("timeout"))
         return real_run(*args, **kwargs)
 
-    monkeypatch.setattr(gateway_run.subprocess, "run", record_network_timeout)
+    monkeypatch.setattr(subprocess, "run", record_network_timeout)
     posts = [
         {
             "links": [
@@ -1590,7 +1617,7 @@ def test_github_prefetch_uses_each_link_once_and_caps_the_batch(
 
 
 def test_worker_failure_preserves_terminal_reconciliation_contract():
-    from gateway.run import _format_direct_source_card_completion
+    from gateway.run_source_card import (_format_direct_source_card_completion)
 
     message = _format_direct_source_card_completion(
         {
@@ -1605,11 +1632,8 @@ def test_worker_failure_preserves_terminal_reconciliation_contract():
 
 
 def test_receipt_failure_reports_the_already_contained_card(tmp_path):
-    from gateway.run import (
-        _SourceCardPostLandingError,
-        _format_direct_source_card_completion,
-        _land_source_card,
-    )
+    from gateway.source_card_landing import (_SourceCardPostLandingError, _land_source_card)
+    from gateway.run_source_card import (_format_direct_source_card_completion)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
@@ -1668,7 +1692,8 @@ def test_receipt_failure_reports_the_already_contained_card(tmp_path):
 def test_receipt_preflight_rejects_a_decision_key_without_exact_card_filename(
     tmp_path,
 ):
-    from gateway.run import _SourceCardLandingError, _source_card_fields_and_manifest
+    from gateway.source_card_landing import (_SourceCardLandingError)
+    from gateway.source_card_render import (_source_card_fields_and_manifest)
 
     card = tmp_path / "example-card.md"
     card.write_text(
@@ -1693,7 +1718,7 @@ def test_receipt_preflight_accepts_a_legacy_card_without_any_manifest(tmp_path):
     1,988 of 2,073 landed cards have no manifest at all; re-submitting one of
     those sources must not die in the receipt preflight (observed 2026-08-22).
     """
-    from gateway.run import _source_card_fields_and_manifest
+    from gateway.source_card_render import (_source_card_fields_and_manifest)
 
     card = tmp_path / "legacy-card.md"
     card.write_text(
@@ -1714,7 +1739,8 @@ def test_receipt_preflight_still_rejects_a_present_but_unparseable_manifest(
     tmp_path,
 ):
     """The legacy escape covers only a wholly absent manifest heading."""
-    from gateway.run import _SourceCardLandingError, _source_card_fields_and_manifest
+    from gateway.source_card_landing import (_SourceCardLandingError)
+    from gateway.source_card_render import (_source_card_fields_and_manifest)
 
     card = tmp_path / "broken-card.md"
     # Heading present at EOF without a trailing newline: the section regex
@@ -1730,7 +1756,7 @@ def test_receipt_preflight_still_rejects_a_present_but_unparseable_manifest(
 
 
 def test_landing_rejects_an_invalid_decision_key_before_push(tmp_path):
-    from gateway.run import _SourceCardLandingError, _land_source_card
+    from gateway.source_card_landing import (_SourceCardLandingError, _land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "example-card.md"
@@ -1781,7 +1807,7 @@ def test_landing_rejects_an_invalid_decision_key_before_push(tmp_path):
 def test_landing_uses_isolated_origin_main_when_shared_checkout_is_behind_and_dirty(
     tmp_path,
 ):
-    from gateway.run import _land_source_card
+    from gateway.source_card_landing import (_land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     repo = fixture["repo"]
@@ -1902,7 +1928,7 @@ def test_landing_receipts_use_the_immutable_landed_card_after_shared_edit(
         "platform_message_id": "msg-source-42",
         "transcript_db": str(fixture["home"] / "state.db"),
     }
-    original_builder = run_module._source_card_receipt_commands
+    original_builder = source_card_render._source_card_receipt_commands
     parsed_paths = []
 
     def edit_shared_card_then_build(**kwargs):
@@ -1916,10 +1942,10 @@ def test_landing_receipts_use_the_immutable_landed_card_after_shared_edit(
         return original_builder(**kwargs)
 
     monkeypatch.setattr(
-        run_module, "_source_card_receipt_commands", edit_shared_card_then_build
+        source_card_render, "_source_card_receipt_commands", edit_shared_card_then_build
     )
 
-    landed = run_module._land_source_card(
+    landed = source_card_landing._land_source_card(
         card_path=card,
         intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
         environment=environment,
@@ -1956,19 +1982,19 @@ def test_landing_recovers_when_push_succeeds_but_reports_a_timeout(
         "platform_message_id": "msg-source-42",
         "transcript_db": str(fixture["home"] / "state.db"),
     }
-    original_run_step = run_module._source_card_run_step
+    original_run_step = source_card_landing._source_card_run_step
 
     def accepted_then_timeout(step, arguments, **kwargs):
         result = original_run_step(step, arguments, **kwargs)
         if step == "git_push":
-            raise run_module._SourceCardLandingError(
+            raise source_card_landing._SourceCardLandingError(
                 "git_push", "timeout after 120 seconds"
             )
         return result
 
-    monkeypatch.setattr(run_module, "_source_card_run_step", accepted_then_timeout)
+    monkeypatch.setattr(source_card_landing, "_source_card_run_step", accepted_then_timeout)
 
-    landed = run_module._land_source_card(
+    landed = source_card_landing._land_source_card(
         card_path=card,
         intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
         environment=environment,
@@ -2002,25 +2028,25 @@ def test_landing_reports_unknown_when_push_and_remote_verification_both_fail(
         "platform_message_id": "msg-source-42",
         "transcript_db": str(fixture["home"] / "state.db"),
     }
-    original_run_step = run_module._source_card_run_step
+    original_run_step = source_card_landing._source_card_run_step
 
     def fail_push_and_probe(step, arguments, **kwargs):
         if step == "git_push":
-            raise run_module._SourceCardLandingError(
+            raise source_card_landing._SourceCardLandingError(
                 "git_push",
                 "exit 128: https://secret-token@example.invalid/repo.git "
                 "/tmp/hermes-source-card-landing-private/repo",
             )
         if step == "git_verify":
-            raise run_module._SourceCardLandingError(
+            raise source_card_landing._SourceCardLandingError(
                 "git_verify", "timeout after 60 seconds"
             )
         return original_run_step(step, arguments, **kwargs)
 
-    monkeypatch.setattr(run_module, "_source_card_run_step", fail_push_and_probe)
+    monkeypatch.setattr(source_card_landing, "_source_card_run_step", fail_push_and_probe)
 
-    with pytest.raises(run_module._SourceCardLandingOutcomeUnknownError) as caught:
-        run_module._land_source_card(
+    with pytest.raises(source_card_landing._SourceCardLandingOutcomeUnknownError) as caught:
+        source_card_landing._land_source_card(
             card_path=card,
             intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
             environment=environment,
@@ -2037,7 +2063,7 @@ def test_landing_reports_unknown_when_push_and_remote_verification_both_fail(
         "⚠️ Card landing outcome could not be verified: "
         f"{failure.path} @ {failure.commit}; {failure.step}: {failure.detail}"
     )
-    assert run_module._format_direct_source_card_completion(
+    assert run_source_card._format_direct_source_card_completion(
         {"status": "partial", "summary": summary, "error": str(failure)}
     ) == summary
 
@@ -2062,21 +2088,21 @@ def test_landing_reports_unknown_when_successful_push_cannot_be_verified(
         "platform_message_id": "msg-source-42",
         "transcript_db": str(fixture["home"] / "state.db"),
     }
-    original_run_step = run_module._source_card_run_step
+    original_run_step = source_card_landing._source_card_run_step
 
     def push_then_fail_first_probe(step, arguments, **kwargs):
         if step == "git_verify":
-            raise run_module._SourceCardLandingError(
+            raise source_card_landing._SourceCardLandingError(
                 "git_verify", "timeout after 60 seconds"
             )
         return original_run_step(step, arguments, **kwargs)
 
     monkeypatch.setattr(
-        run_module, "_source_card_run_step", push_then_fail_first_probe
+        source_card_landing, "_source_card_run_step", push_then_fail_first_probe
     )
 
-    with pytest.raises(run_module._SourceCardLandingOutcomeUnknownError) as caught:
-        run_module._land_source_card(
+    with pytest.raises(source_card_landing._SourceCardLandingOutcomeUnknownError) as caught:
+        source_card_landing._land_source_card(
             card_path=card,
             intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
             environment=environment,
@@ -2092,10 +2118,7 @@ def test_landing_reports_unknown_when_successful_push_cannot_be_verified(
 
 
 def test_isolated_landing_rejects_multiple_push_urls(tmp_path):
-    from gateway.run import (
-        _SourceCardLandingError,
-        _source_card_isolated_landing_repository,
-    )
+    from gateway.source_card_landing import (_SourceCardLandingError, _source_card_isolated_landing_repository)
 
     fixture = _write_offline_route_fixture(tmp_path)
     second_remote = tmp_path / "second-remote.git"
@@ -2129,10 +2152,10 @@ def test_isolated_landing_rejects_embedded_remote_credentials(
             )
         raise AssertionError("credential-bearing remote must fail before clone")
 
-    monkeypatch.setattr(run_module, "_source_card_run_step", credential_remote_only)
+    monkeypatch.setattr(source_card_landing, "_source_card_run_step", credential_remote_only)
 
-    with pytest.raises(run_module._SourceCardLandingError) as caught:
-        with run_module._source_card_isolated_landing_repository(fixture["repo"]):
+    with pytest.raises(source_card_landing._SourceCardLandingError) as caught:
+        with source_card_landing._source_card_isolated_landing_repository(fixture["repo"]):
             pass
     assert caught.value.step == "git_remote"
     assert "embedded credentials" in caught.value.detail
@@ -2140,7 +2163,7 @@ def test_isolated_landing_rejects_embedded_remote_credentials(
 
 
 def test_landing_rejects_a_clean_tracked_card_absent_from_origin_main(tmp_path):
-    from gateway.run import _SourceCardLandingError, _land_source_card
+    from gateway.source_card_landing import (_SourceCardLandingError, _land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     repo = fixture["repo"]
@@ -2181,7 +2204,7 @@ def test_landing_rejects_a_clean_tracked_card_absent_from_origin_main(tmp_path):
 
 
 def test_landing_rejects_a_dirty_tracked_duplicate_without_absorbing_it(tmp_path):
-    from gateway.run import _SourceCardLandingError, _land_source_card
+    from gateway.source_card_landing import (_SourceCardLandingError, _land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
@@ -2298,15 +2321,15 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
             )
         ),
     )
-    monkeypatch.setattr(run_agent, "OpenAI", MagicMock(return_value=provider_client))
-    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **_kwargs: [])
-    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", MagicMock(return_value=provider_client))
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **_kwargs: [])
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(run_agent.AIAgent, "_execute_tool_calls", _tracked_execute)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {}})
     monkeypatch.setattr(gateway_run, "_checkpoint_agent_kwargs", lambda _cfg: {})
     monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 99)
     monkeypatch.setattr(async_delegation, "find_delegation_by_work_key", lambda _key: "")
-    monkeypatch.setattr(delegate_tool, "_get_max_async_children", lambda: 3)
+    monkeypatch.setattr("tools.delegate_tool_config._get_max_async_children", lambda: 3)
     runner._resolve_session_agent_runtime = MagicMock(
         return_value=(
             "openai/gpt-4o-mini",
@@ -2413,7 +2436,7 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     assert worker_result["worker_api_call_budget"] == worker_result["api_calls"] + 1
     assert worker_result["worker_goal_byte_budget"] == 16_384
     assert worker_result["worker_result_byte_budget"] == (
-        gateway_run._SOURCE_CARD_WORKER_RESULT_MAX_BYTES
+        source_card_prefetch._SOURCE_CARD_WORKER_RESULT_MAX_BYTES
     )
     assert worker_result["worker_system_byte_budget"] == 24_576
     assert (
@@ -2550,7 +2573,7 @@ async def test_offline_recorded_route_replay_lands_and_receipts_one_card(
     ],
 )
 def test_hermes_relevance_renders_to_the_validator_grammar(raw, expected):
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     relevance, _targets = _source_card_render_routing_fields(raw, "hermes")
     assert relevance == expected
@@ -2570,7 +2593,7 @@ def test_hermes_relevance_renders_to_the_validator_grammar(raw, expected):
     ],
 )
 def test_downstream_targets_render_to_slugs(raw, expected):
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     # `none:` relevance is used for the `none:` target case so the cross-field
     # rule does not inject `hermes` into the expectation.
@@ -2581,7 +2604,7 @@ def test_downstream_targets_render_to_slugs(raw, expected):
 
 def test_enum_relevance_forces_the_bare_hermes_target():
     """`adjacent` without `hermes` downstream is the exact 04:08 UTC failure."""
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     relevance, targets = _source_card_render_routing_fields(
         "adjacent", "hermes-agent, codex-cli"
@@ -2592,7 +2615,7 @@ def test_enum_relevance_forces_the_bare_hermes_target():
 
 
 def test_none_relevance_removes_the_hermes_target():
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     relevance, targets = _source_card_render_routing_fields(
         "none: unrelated to any Hermes surface", "hermes, codex-cli"
@@ -2603,7 +2626,7 @@ def test_none_relevance_removes_the_hermes_target():
 
 
 def test_none_relevance_with_only_hermes_target_renders_none_targets():
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     _relevance, targets = _source_card_render_routing_fields(
         "none: unrelated to any Hermes surface", "hermes"
@@ -2614,7 +2637,7 @@ def test_none_relevance_with_only_hermes_target_renders_none_targets():
 
 def test_unresolvable_relevance_is_left_for_the_validator_not_guessed():
     """Rendering never invents a routing decision it cannot read."""
-    from gateway.run import _source_card_render_routing_fields
+    from gateway.source_card_render import (_source_card_render_routing_fields)
 
     relevance, _targets = _source_card_render_routing_fields(
         "probably worth a look someday", "hermes"
@@ -2649,7 +2672,7 @@ def _routing_environment(fixture):
 
 def test_duplicate_landing_path_renders_untracked_card_routing(tmp_path):
     """An untracked card written by an earlier run still gets rendered."""
-    from gateway.run import _land_source_card
+    from gateway.source_card_landing import (_land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
@@ -2684,7 +2707,7 @@ def test_duplicate_landing_path_fails_closed_on_a_tracked_nonconforming_card(
     tmp_path,
 ):
     """A committed card that renders differently is an operator conflict."""
-    from gateway.run import _land_source_card, _SourceCardLandingError
+    from gateway.source_card_landing import (_land_source_card, _SourceCardLandingError)
 
     fixture = _write_offline_route_fixture(tmp_path)
     repo = fixture["repo"]
@@ -2720,7 +2743,7 @@ def test_duplicate_landing_path_fails_closed_on_a_tracked_nonconforming_card(
 
 
 def test_typed_analysis_overrides_routing_prose_in_the_card_body(tmp_path):
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2745,10 +2768,8 @@ def test_typed_analysis_overrides_routing_prose_in_the_card_body(tmp_path):
 
 
 def test_worker_json_above_the_old_16kb_limit_is_accepted(tmp_path):
-    from gateway.run import (
-        _SOURCE_CARD_WORKER_RESULT_MAX_BYTES,
-        _parse_source_card_worker_draft,
-    )
+    from gateway.source_card_prefetch import (_SOURCE_CARD_WORKER_RESULT_MAX_BYTES)
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2769,7 +2790,7 @@ def test_worker_json_above_the_old_16kb_limit_is_accepted(tmp_path):
 
 
 def test_typed_analysis_is_optional_and_absent_payloads_still_parse(tmp_path):
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2791,7 +2812,7 @@ def test_none_relevance_with_empty_target_list_is_the_live_natebjones_failure(tm
     The card body already had matching `none:` lines. The parser required
     1-16 slugs and failed the whole intake.
     """
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2826,7 +2847,7 @@ def test_referenced_chat_prefix_is_the_live_daievolutionhub_failure(tmp_path):
     DeepSeek prefixed a complete card JSON with a Referenced Chat block because
     the packet contains parent_session_id. The first character was not `{`.
     """
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2851,7 +2872,8 @@ def test_referenced_chat_prefix_is_the_live_daievolutionhub_failure(tmp_path):
 
 
 def test_worker_json_with_trailing_prose_is_still_rejected(tmp_path):
-    from gateway.run import _parse_source_card_worker_draft, _SourceCardLandingError
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
+    from gateway.source_card_landing import (_SourceCardLandingError)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2870,7 +2892,7 @@ def test_worker_json_with_trailing_prose_is_still_rejected(tmp_path):
 
 
 def test_enum_relevance_with_empty_target_list_inserts_hermes(tmp_path):
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2900,7 +2922,8 @@ def test_enum_relevance_with_empty_target_list_inserts_hermes(tmp_path):
     ],
 )
 def test_invalid_typed_analysis_is_rejected_not_guessed(tmp_path, analysis):
-    from gateway.run import _parse_source_card_worker_draft, _SourceCardLandingError
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
+    from gateway.source_card_landing import (_SourceCardLandingError)
 
     cards_root = tmp_path / "researched-repos"
     cards_root.mkdir()
@@ -2923,7 +2946,7 @@ def test_finalizer_substitutes_embedded_todo_values(tmp_path):
     `no advisories found - TODO: verify` fell through to the global
     fail-closed guard and cost the user the whole card.
     """
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     content = _REPLAY_CARD.replace(
         "- risk signal:",
@@ -2942,7 +2965,7 @@ def test_finalizer_substitutes_embedded_todo_values(tmp_path):
 
 def test_finalizer_repairs_freshness_trigger_and_bare_watch_until(tmp_path):
     """Live 2026-08-18 DAIEvolutionHub: validator rejected renamed/colon-less fields."""
-    from gateway.run import _finalize_source_card_worker_draft
+    from gateway.source_card_render import (_finalize_source_card_worker_draft)
 
     content = _REPLAY_CARD.replace(
         "- freshness threshold:",
@@ -2977,7 +3000,7 @@ def test_finalizer_repairs_freshness_trigger_and_bare_watch_until(tmp_path):
 
 
 def test_source_card_worker_pin_is_read_from_auxiliary_config():
-    from gateway.run import _source_card_worker_pin
+    from gateway.run_source_card import (_source_card_worker_pin)
 
     pin = _source_card_worker_pin(
         {
@@ -2998,7 +3021,7 @@ def test_pinned_route_declares_its_own_fallback_chain():
     exhaustion then took out the primary model and this worker together with
     nothing to fall to -- which is exactly what happened on 2026-08-16.
     """
-    from gateway.run import _source_card_worker_pin
+    from gateway.run_source_card import (_source_card_worker_pin)
 
     pin = _source_card_worker_pin(
         {
@@ -3045,7 +3068,7 @@ def test_malformed_route_fallback_chain_fails_closed(fallback):
     Silently dropping to [] would reproduce the no-escape-hatch failure this
     key exists to fix, without any signal that it had happened.
     """
-    from gateway.run import _source_card_worker_pin
+    from gateway.run_source_card import (_source_card_worker_pin)
 
     with pytest.raises(RuntimeError) as excinfo:
         _source_card_worker_pin(
@@ -3063,7 +3086,7 @@ def test_malformed_route_fallback_chain_fails_closed(fallback):
 
 
 def test_source_card_worker_pin_absent_returns_none():
-    from gateway.run import _source_card_worker_pin
+    from gateway.run_source_card import (_source_card_worker_pin)
 
     assert _source_card_worker_pin({"auxiliary": {"vision": {"model": "x"}}}) is None
     assert _source_card_worker_pin({}) is None
@@ -3081,7 +3104,7 @@ def test_source_card_worker_pin_absent_returns_none():
 )
 def test_incomplete_source_card_worker_pin_fails_closed(block):
     """A half-written pin must not silently fall back to the session model."""
-    from gateway.run import _source_card_worker_pin
+    from gateway.run_source_card import (_source_card_worker_pin)
 
     with pytest.raises(RuntimeError) as excinfo:
         _source_card_worker_pin({"auxiliary": {"source_card_worker": block}})
@@ -3091,7 +3114,7 @@ def test_incomplete_source_card_worker_pin_fails_closed(block):
 def test_worker_pin_overrides_the_session_resolved_model(monkeypatch):
     """The pin outranks whatever the five-layer session stack produced."""
     import gateway.run as gateway_run
-    from gateway.run import _apply_source_card_worker_pin
+    from gateway.run_source_card import (_apply_source_card_worker_pin)
 
     monkeypatch.setattr(
         gateway_run,
@@ -3110,7 +3133,7 @@ def test_worker_pin_overrides_the_session_resolved_model(monkeypatch):
 
 
 def test_absent_worker_pin_leaves_the_session_runtime_untouched():
-    from gateway.run import _apply_source_card_worker_pin
+    from gateway.run_source_card import (_apply_source_card_worker_pin)
 
     runtime = {"api_key": "session-key", "provider": "openrouter"}
     model, resolved, pin = _apply_source_card_worker_pin(
@@ -3132,7 +3155,7 @@ def test_absent_worker_pin_leaves_the_session_runtime_untouched():
 
 
 def test_attestation_gate_passes_a_fully_attested_turn():
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     assert (
         _source_card_attestation_error(
@@ -3147,7 +3170,7 @@ def test_attestation_gate_passes_a_fully_attested_turn():
 
 
 def test_attestation_gate_fails_closed_on_a_substitution():
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     error = _source_card_attestation_error(
         [{"call": 1, "requested": "glm-5.2", "served": "glm-5.3"}],
@@ -3160,7 +3183,7 @@ def test_attestation_gate_fails_closed_on_a_substitution():
 
 def test_attestation_gate_fails_closed_when_nothing_was_attested():
     """A turn that ran but reported no served model is unattested, not clean."""
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     assert _source_card_attestation_error([], ran_turn=True) is not None
     assert (
@@ -3182,10 +3205,7 @@ def test_a_failed_worker_turn_is_not_reported_as_an_attestation_failure():
     while _normalize_source_card_worker_result would have propagated the real
     error correctly had this gate not returned first.
     """
-    from gateway.run import (
-        _source_card_attestation_error,
-        _source_card_worker_turn_failed,
-    )
+    from gateway.run_source_card import (_source_card_attestation_error, _source_card_worker_turn_failed)
 
     quota_outage = {
         "failed": True,
@@ -3218,13 +3238,13 @@ def test_a_failed_worker_turn_is_not_reported_as_an_attestation_failure():
 
 def test_attestation_gate_exempts_the_duplicate_path():
     """The duplicate short-circuit runs no model turn, so there is nothing to attest."""
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     assert _source_card_attestation_error([], ran_turn=False) is None
 
 
 def test_attestation_gate_reports_every_mismatched_call_not_just_the_last():
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     error = _source_card_attestation_error(
         [
@@ -3259,7 +3279,7 @@ def test_attestation_receipt_flows_from_the_real_conversation_loop():
 
     receipt = served_model_receipt(agent)
     assert len(receipt) == 3
-    from gateway.run import _source_card_attestation_error
+    from gateway.run_source_card import (_source_card_attestation_error)
 
     error = _source_card_attestation_error(receipt, ran_turn=True)
     assert error is not None
@@ -3291,7 +3311,7 @@ def test_attestation_receipt_flows_from_the_real_conversation_loop():
     ],
 )
 def test_authenticated_rejection_is_recognised(porcelain):
-    from gateway.run import _source_card_push_rejected_authenticated
+    from gateway.source_card_landing import (_source_card_push_rejected_authenticated)
 
     assert _source_card_push_rejected_authenticated(porcelain, "refs/heads/main") is True
 
@@ -3315,7 +3335,7 @@ def test_authenticated_rejection_is_recognised(porcelain):
     ],
 )
 def test_ambiguous_or_foreign_push_output_is_not_an_authenticated_rejection(porcelain):
-    from gateway.run import _source_card_push_rejected_authenticated
+    from gateway.source_card_landing import (_source_card_push_rejected_authenticated)
 
     assert _source_card_push_rejected_authenticated(porcelain, "refs/heads/main") is False
 
@@ -3328,7 +3348,7 @@ def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
     card must still land, the concurrent writer's commit must survive, and the
     shared checkout must be untouched.
     """
-    from gateway.run import _land_source_card
+    from gateway.source_card_landing import (_land_source_card)
 
     fixture = _write_offline_route_fixture(tmp_path)
     repo = fixture["repo"]
@@ -3341,7 +3361,7 @@ def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
 
     import gateway.run as gateway_run
 
-    real_clone_cm = gateway_run._source_card_isolated_landing_repository
+    real_clone_cm = source_card_landing._source_card_isolated_landing_repository
     advanced = {}
 
     from contextlib import contextmanager
@@ -3367,7 +3387,7 @@ def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
                 advanced["sha"] = _git(peer, "rev-parse", "HEAD")
             yield checkout
 
-    gateway_run._source_card_isolated_landing_repository = _clone_then_advance_remote
+    source_card_landing._source_card_isolated_landing_repository = _clone_then_advance_remote
     try:
         landed = _land_source_card(
             card_path=card,
@@ -3376,7 +3396,7 @@ def test_landing_survives_a_concurrent_writer_advancing_origin_main(tmp_path):
             source_message_row_id=77,
         )
     finally:
-        gateway_run._source_card_isolated_landing_repository = real_clone_cm
+        source_card_landing._source_card_isolated_landing_repository = real_clone_cm
 
     _git(repo, "fetch", "origin", "main")
     remote_tip = _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
@@ -3408,19 +3428,19 @@ def test_landing_does_not_unshallow_the_isolated_clone(tmp_path, monkeypatch):
     card = fixture["cards_root"] / "igorwarzocha-howaboua-pi-stuff.md"
     card.write_text(_REPLAY_CARD, encoding="utf-8")
     recorded = []
-    original_run_step = run_module._source_card_run_step
+    original_run_step = source_card_landing._source_card_run_step
 
     def reject_unshallow(step, arguments, **kwargs):
         recorded.append(list(arguments))
         if "--unshallow" in arguments:
-            raise run_module._SourceCardLandingError(
+            raise source_card_landing._SourceCardLandingError(
                 step, "timeout after 120 seconds"
             )
         return original_run_step(step, arguments, **kwargs)
 
-    monkeypatch.setattr(run_module, "_source_card_run_step", reject_unshallow)
+    monkeypatch.setattr(source_card_landing, "_source_card_run_step", reject_unshallow)
 
-    landed = run_module._land_source_card(
+    landed = source_card_landing._land_source_card(
         card_path=card,
         intake_text=f"https://x.com/i/status/{_REPLAY_X_STATUS_ID}",
         environment=_routing_environment(fixture),

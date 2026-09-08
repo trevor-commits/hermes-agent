@@ -143,10 +143,11 @@ def _cancel_silent_request(
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
-    assert started.wait(timeout=1), "request never entered its silent transport"
+    # Thread start-up on a loaded CI runner can exceed 1 s; the bound is only "eventually entered the transport".
+    assert started.wait(timeout=5), "request never entered its silent transport"
     cancelled_at = time.monotonic()
     cancel_event.set()
-    worker.join(timeout=1)
+    worker.join(timeout=5)
     elapsed = time.monotonic() - cancelled_at
     assert not worker.is_alive(), "explicit cancellation did not wake the silent request"
     return result["exc"], elapsed
@@ -197,13 +198,23 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
     class _SilentOwnerStream:
         def __init__(self) -> None:
             self.closed = threading.Event()
+            self.wake = threading.Event()
+            self.close_threads = []
+            self.reader_tid = None
+            self.response = SimpleNamespace(extensions={
+                "network_stream": SimpleNamespace(_sock=SimpleNamespace(
+                    shutdown=lambda how: self.wake.set())),
+            })
 
         def __iter__(self):
+            self.reader_tid = threading.get_ident()
             owner_started.set()
-            self.closed.wait(timeout=5)
+            self.wake.wait(timeout=5)
             raise RuntimeError("owner stream closed")
 
         def close(self) -> None:
+            self.close_threads.append(threading.get_ident())
+            self.wake.set()
             self.closed.set()
 
     class _SuccessStream:
@@ -291,9 +302,10 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         )
         assert concurrent.choices[0].message.content == "ok"
 
-        # Let the orphan's real adapter timer fire. It may close the attempt's
-        # event stream to wake that worker, but never the process-shared client.
+        # The timer shuts down only this attempt's socket; its reader closes
+        # the response while the process-shared client stays usable.
         assert owner_stream.closed.wait(timeout=1)
+        assert owner_stream.close_threads == [owner_stream.reader_tid]
         time.sleep(0.03)
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
@@ -336,13 +348,23 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
     class _SilentStream:
         def __init__(self) -> None:
             self.closed = threading.Event()
+            self.wake = threading.Event()
+            self.close_threads = []
+            self.reader_tid = None
+            self.response = SimpleNamespace(extensions={
+                "network_stream": SimpleNamespace(_sock=SimpleNamespace(
+                    shutdown=lambda how: self.wake.set())),
+            })
 
         def __iter__(self):
+            self.reader_tid = threading.get_ident()
             stream_started.set()
-            self.closed.wait(timeout=5)
+            self.wake.wait(timeout=5)
             raise RuntimeError("stream closed")
 
         def close(self) -> None:
+            self.close_threads.append(threading.get_ident())
+            self.wake.set()
             self.closed.set()
 
     stream = _SilentStream()
@@ -391,6 +413,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
     else:
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
         assert stream.closed.wait(timeout=1), "cancelled timer did not wake its stream"
+        assert stream.close_threads == [stream.reader_tid]
         assert not real_client.closed.is_set()
 
 
@@ -552,11 +575,8 @@ def test_isolated_provider_worker_inherits_protection_and_progress_hook() -> Non
 
 
 def test_isolated_provider_worker_inherits_caller_contextvars() -> None:
-    from tools.approval import (
-        get_current_session_key,
-        reset_current_session_key,
-        set_current_session_key,
-    )
+    from tools.approval import get_current_session_key
+    from tools.approval_context import reset_current_session_key, set_current_session_key
 
     arbitrary = contextvars.ContextVar("isolated-provider-test", default="missing")
     arbitrary_token = arbitrary.set("caller-value")

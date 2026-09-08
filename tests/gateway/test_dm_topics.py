@@ -375,7 +375,7 @@ def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id
 
 def test_build_message_event_sets_auto_skill():
     """When topic has a skill binding, auto_skill should be set on the event."""
-    from gateway.platforms.base import MessageType
+    from gateway.platforms.event import MessageType
 
     adapter = _make_adapter([
         {
@@ -397,7 +397,7 @@ def test_build_message_event_sets_auto_skill():
 
 def test_build_message_event_no_auto_skill_without_binding():
     """Topics without skill binding should have auto_skill=None."""
-    from gateway.platforms.base import MessageType
+    from gateway.platforms.event import MessageType
 
     adapter = _make_adapter([
         {
@@ -427,7 +427,7 @@ from telegram.constants import ChatType as _ChatType  # noqa: E402
 
 def test_group_topic_skill_binding():
     """Group topic with skill config should set auto_skill on the event."""
-    from gateway.platforms.base import MessageType
+    from gateway.platforms.event import MessageType
 
     adapter = _make_adapter(group_topics_config=[
         {
@@ -455,7 +455,7 @@ def test_group_topic_skill_binding():
 
 def test_group_topic_skill_binding_second_topic():
     """A different thread_id in the same group should resolve its own skill."""
-    from gateway.platforms.base import MessageType
+    from gateway.platforms.event import MessageType
 
     adapter = _make_adapter(group_topics_config=[
         {

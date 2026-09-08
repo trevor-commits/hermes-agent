@@ -39,9 +39,9 @@ def _make_agent(monkeypatch, tmp_path: Path) -> tuple[AIAgent, SessionDB]:
     db = SessionDB(db_path=tmp_path / "state.db")
     with (
         contextlib.redirect_stdout(io.StringIO()),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         agent = AIAgent(
             base_url="https://openrouter.ai/api/v1",
@@ -80,6 +80,8 @@ def test_provider_is_not_called_after_compression_stalls_above_ceiling(
 ):
     agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 2000
 
     history = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -143,7 +145,9 @@ def test_split_ceiling_sends_below_ceiling_despite_stalled_compression(
     stall only fails closed once the request is actually over the ceiling.
     """
     agent, _db = _make_agent(monkeypatch, tmp_path)
-    agent.context_compressor.threshold_tokens = 1_000  # trigger: compress early
+    agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 2000  # trigger: compress early
     agent._hard_ceiling_tokens = 5_000  # ceiling: stop late
 
     history = [
@@ -188,6 +192,8 @@ def test_pre_api_compression_rebinds_before_next_iteration_hard_ceiling(
 
     agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 2000
     history = [
         {
             "role": "user" if index % 2 == 0 else "assistant",
@@ -246,6 +252,8 @@ def test_execution_middleware_cannot_expand_stalled_turn_over_ceiling(
 ):
     agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 2000
     history = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
         for i in range(60)
@@ -295,6 +303,8 @@ def test_swallowed_db_failure_disables_continuity_and_rollover(
 ):
     agent, db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 2000
     history = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
         for i in range(60)
@@ -1239,13 +1249,15 @@ def _kwargs_content_estimate(request):
     return sum(len(str(m.get("content") or "")) for m in msgs) // 4
 
 
-def test_last_mile_trim_converges_small_overshoot(monkeypatch, tmp_path):
-    """A block within the deficit window gets one free truncation pass and the
-    provider send then succeeds — no model-backed compression spent on it."""
+@pytest.mark.parametrize("terminal_stays_oversized", [False, True])
+def test_last_mile_trim_converges_small_overshoot(monkeypatch, tmp_path, terminal_stays_oversized):
+    """Free trimming charges only actual sends, even when the final guard still blocks."""
     from agent.context_compressor import LAST_MILE_TRIM_MARKER
 
     agent, _db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 1500
     history = _tool_loop_history(6_000)
 
     def _no_progress(messages, system_message, **_kwargs):
@@ -1262,7 +1274,7 @@ def test_last_mile_trim_converges_small_overshoot(monkeypatch, tmp_path):
         ),
         patch(
             "agent.conversation_loop._provider_request_tokens_rough",
-            side_effect=_kwargs_content_estimate,
+            side_effect=(lambda _request: 1_500) if terminal_stays_oversized else _kwargs_content_estimate,
         ),
         patch.object(agent, "_compress_context", side_effect=_no_progress),
         patch.object(agent, "_save_trajectory"),
@@ -1270,9 +1282,11 @@ def test_last_mile_trim_converges_small_overshoot(monkeypatch, tmp_path):
     ):
         result = agent.run_conversation("continue", conversation_history=history)
 
-    agent.client.chat.completions.create.assert_called_once()
-    assert result.get("hard_context_ceiling_blocked") is not True
-    assert result["completed"] is True
+    expected_calls = 0 if terminal_stays_oversized else 1
+    assert agent.client.chat.completions.create.call_count == expected_calls
+    assert result["api_calls"] == agent._api_call_count == agent.iteration_budget.used == expected_calls
+    assert bool(result.get("hard_context_ceiling_blocked")) is terminal_stays_oversized
+    assert result["completed"] is not terminal_stays_oversized
     assert any(
         m.get("role") == "tool" and LAST_MILE_TRIM_MARKER in str(m.get("content"))
         for m in result["messages"]
@@ -1285,6 +1299,8 @@ def test_last_mile_trim_skips_large_deficit(monkeypatch, tmp_path):
 
     agent, _db = _make_agent(monkeypatch, tmp_path)
     agent.context_compressor.threshold_tokens = 1_000
+    # Upstream defers cold rough estimates; this scenario has provider-confirmed pressure.
+    agent.context_compressor.last_real_prompt_tokens = 10000
     history = _tool_loop_history(40_000)
 
     def _no_progress(messages, system_message, **_kwargs):

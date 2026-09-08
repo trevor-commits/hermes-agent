@@ -144,7 +144,7 @@ def main() -> int:
     if args.min_valid is not None and args.min_valid < 0:
         return _cannot_gate("--min-valid must be >= 0")
 
-    from gateway.run import _parse_source_card_worker_draft
+    from gateway.source_card_render import (_parse_source_card_worker_draft)
 
     cards_root = Path(args.cards_root)
     cards_root.mkdir(parents=True, exist_ok=True)

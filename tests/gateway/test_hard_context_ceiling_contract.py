@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from gateway import run_turn
+
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,14 +31,14 @@ _STRUCTURED_FIELDS = {
 
 
 def test_gateway_context_ceiling_projection_preserves_every_structured_field():
-    project = getattr(gateway_run, "_gateway_context_ceiling_result_fields", None)
+    project = getattr(run_turn, "_gateway_context_ceiling_result_fields", None)
     assert callable(project), "gateway needs one shared structured-result adapter"
     source = {name: f"value:{name}" for name in _STRUCTURED_FIELDS}
     assert project(source) == source
 
 
 def test_rollover_requires_explicit_authoritative_continuity():
-    authorize = getattr(gateway_run, "_gateway_rollover_is_authorized", None)
+    authorize = getattr(run_turn, "_gateway_rollover_is_authorized", None)
     assert callable(authorize), "gateway needs a single rollover authorization predicate"
     assert authorize({}) is False
     assert authorize({"compression_exhausted": True}) is False

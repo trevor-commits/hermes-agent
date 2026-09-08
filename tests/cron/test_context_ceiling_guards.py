@@ -643,7 +643,7 @@ class TestCumulativeToolOutputBudget:
         with contextlib.ExitStack() as stack:
             for cm in (
                 patch("cron.scheduler._hermes_home", tmp_path),
-                patch("cron.scheduler._resolve_origin", return_value=None),
+                patch("cron.scheduler_delivery._resolve_origin", return_value=None),
                 patch("hermes_cli.env_loader.load_hermes_dotenv"),
                 patch("hermes_cli.env_loader.reset_secret_source_cache"),
                 patch("hermes_state.SessionDB", return_value=fake_db),
@@ -688,7 +688,7 @@ class TestCumulativeToolOutputBudget:
             "tool_result_total_max_chars": 40_000,
         }
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
              patch("hermes_state.SessionDB", return_value=MagicMock()), \
@@ -719,7 +719,7 @@ class TestCumulativeToolOutputBudget:
             "tool_result_total_max_chars": 10,
         }
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
              patch("hermes_state.SessionDB", return_value=MagicMock()), \
@@ -873,7 +873,8 @@ class TestHardCeilingAutoPause:
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock:
             for _ in range(HARD_CONTEXT_CEILING_PAUSE_AFTER):
-                assert run_one_job(job_record) is True
+                # Each fire owns a fresh durable execution; run_one_job stamps its input.
+                assert run_one_job(dict(job_record)) is True
 
         pause_alerts = [
             call for call in deliver_mock.call_args_list

@@ -97,6 +97,29 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
     assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
 
 
+@pytest.mark.parametrize("group_exited", [False, True])
+def test_group_signal_permission_error_is_ignored_only_after_verified_exit(monkeypatch, group_exited):
+    calls = []
+    polls = []
+    proc = SimpleNamespace(pid=99_999_999, poll=lambda: polls.append(1) or (0 if group_exited else None))
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+
+    def killpg(pgid, sig):
+        calls.append((pgid, sig))
+        if sig == 0 and group_exited:
+            raise ProcessLookupError
+        raise PermissionError
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    if group_exited:
+        local_mod._kill_process_group_posix(proc)
+    else:
+        with pytest.raises(PermissionError):
+            local_mod._kill_process_group_posix(proc)
+    assert polls
+    assert calls == [(proc.pid, signal.SIGTERM), (proc.pid, 0)]
+
+
 def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""

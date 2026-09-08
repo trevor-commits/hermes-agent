@@ -174,7 +174,7 @@ def test_public_lifecycle_uses_the_configured_unlimited_child_budget(monkeypatch
         captured.update(kwargs)
         return child
 
-    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", build)
+    monkeypatch.setattr("tools.delegate_tool_results._build_child_preserving_parent_tools", build)
     monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {"max_iterations": "unlimited"})
     monkeypatch.setattr(
         "tools.delegate_tool._run_child_lifecycle",
