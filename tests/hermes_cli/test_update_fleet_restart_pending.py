@@ -351,7 +351,11 @@ def test_stale_fleet_matrix_on_latest_receipt_is_pending(monkeypatch):
     assert update_cmd._pending_fleet_restart_needed() is True
 
 
-def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
+def test_run_pending_restart_true_when_no_systemd_gateways(monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway.is_windows", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: pytest.fail("Unexpected process spawn"))
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **k: []
     )
