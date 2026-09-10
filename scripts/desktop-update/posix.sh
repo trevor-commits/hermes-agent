@@ -699,7 +699,68 @@ if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
     || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
   STARTED_AT="$NOW"
 fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
+
+# Atomic claim under the marker's sidecar mutex (the same file update_lock.py
+# serializes on). A bare `> "$MARKER"` overwrite could clobber a still-running
+# foreign updater between the Desktop's earlier conflict check and here
+# (reproduced 2026-09-09: live owner overwritten by --self-test-marker).
+# Inside the mutex: refuse a live foreign pid; adopt a dead one; write ours.
+MUTEX="$MARKER.mutex"
+claim_marker() {
+  python3 - "$MARKER" "$MUTEX" "$$" "$STARTED_AT" <<'PY_CLAIM'
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+mutex_path = Path(sys.argv[2])
+my_pid = int(sys.argv[3])
+started_at = int(sys.argv[4])
+try:
+    mutex_path.parent.mkdir(parents=True, exist_ok=True)
+    with mutex_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        owner_pid = None
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+            owner_pid = int(lines[0].strip())
+        except (OSError, ValueError, IndexError):
+            owner_pid = None
+        if owner_pid and owner_pid != my_pid:
+            try:
+                os.kill(owner_pid, 0)
+            except ProcessLookupError:
+                owner_pid = None
+            except PermissionError:
+                # Alive but unprobeable counts as a live owner: fail closed.
+                print("live-foreign-owner %d" % owner_pid)
+                sys.exit(1)
+            else:
+                print("live-foreign-owner %d" % owner_pid)
+                sys.exit(1)
+        tmp = marker.with_name(marker.name + ".claim")
+        tmp.write_text("%d\n%d\n" % (my_pid, started_at), encoding="utf-8")
+        os.replace(tmp, marker)
+except OSError as exc:
+    print("marker-write-failed %s" % exc)
+    sys.exit(2)
+PY_CLAIM
+}
+CLAIM_OUT="$(claim_marker 2>&1)"
+CLAIM_RC=$?
+case "$CLAIM_RC" in
+  0)
+    log "update marker claimed pid=$$ started_at=$STARTED_AT"
+    ;;
+  *)
+    log "marker claim REFUSED ($CLAIM_OUT)"
+    FINAL_CODE=2
+    FINAL_MSG="Update aborted: another Hermes update appears to be running ($CLAIM_OUT). Nothing was changed. Close other Hermes windows/updaters and try again."
+    log "$FINAL_MSG"
+    exit "$FINAL_CODE"
+    ;;
+esac
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT
