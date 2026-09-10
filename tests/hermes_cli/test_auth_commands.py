@@ -1166,3 +1166,74 @@ def test_qwen_oauth_login_marks_active_through_moved_owner(monkeypatch):
 
     assert auth_commands._qwen_oauth_login(None) is creds
     assert marked == [creds]
+
+
+def test_auth_remove_borrowed_root_row_says_not_deleted(
+    tmp_path, monkeypatch, capsys
+):
+    """Removing a BORROWED single-use OAuth row must NOT claim "Removed".
+
+    A profile with no local rows for a single-use-refresh provider (Anthropic,
+    Codex, xAI OAuth) resolves that provider's rows through the global-root
+    fallback and marks them ``_borrowed_root_ids``. ``persist_pool_entries``
+    routes such pools through ``_update_root_pool_rows``, which is UPDATE-ONLY
+    and ignores ``removed_ids`` — so the root row survives. The old message
+    ("Removed anthropic credential #1 (...)") told the user the grant was
+    deleted when it was not; the exit code and store contents were fine, only
+    the report lied. Regression: 2026-09-09 session removed a root-owned dead
+    Anthropic grant from the x-alpha profile, saw success, and the row was
+    still in the root store afterwards.
+    """
+    import agent.credential_pool as CP
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_remove_command
+
+    profile_path = tmp_path / "profile" / "auth.json"
+    root_path = tmp_path / "root" / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    monkeypatch.setattr(CP.auth_mod, "_auth_file_path", lambda: profile_path)
+    # Patch where _load_global_auth_store resolves it (hermes_cli.auth), not the
+    # CP-local import: read_credential_pool's root fallback lives in auth.py.
+    monkeypatch.setattr(CP.auth_mod, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP.auth_mod, "_global_auth_store_cache", None)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    # Empty profile store with no anthropic rows: the profile therefore reads
+    # the provider through the root fallback (borrows it).
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {}}))
+    # No ANTHROPIC_* env vars: otherwise _seed_from_env would give the profile
+    # its own row and it would own (not borrow) the provider.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+    root_path.parent.mkdir(parents=True, exist_ok=True)
+    root_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "anthropic": [{
+                "id": "root-grant",
+                "label": "claude-sub",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:hermes_pkce",
+                "access_token": "«redacted:sk-…»",
+                "refresh_token": "«redacted:sk-…»",
+            }],
+        },
+    }))
+
+    auth_remove_command(SimpleNamespace(provider="anthropic", target="1"))
+
+    out = capsys.readouterr().out
+    assert "NOT deleted" in out, f"borrowed-row removal must say it was not deleted: {out!r}"
+    assert "Removed anthropic credential" not in out, (
+        f"must not claim a plain removal for a borrowed root row: {out!r}"
+    )
+    # The root row is untouched: UPDATE-ONLY write-through never deletes.
+    root_after = json.loads(root_path.read_text())
+    assert [e["id"] for e in root_after["credential_pool"]["anthropic"]] == ["root-grant"]
+    # And the profile-local store materialized no grant fork: the worst it may
+    # hold is the now-empty anthropic list remove_index persists.
+    profile_after = json.loads(profile_path.read_text()).get("credential_pool", {})
+    assert profile_after.get("anthropic", []) == []

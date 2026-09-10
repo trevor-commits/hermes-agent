@@ -464,10 +464,24 @@ def auth_remove_command(args) -> None:
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:
         raise SystemExit(f"{error} Provider: {provider}.")
+    # A pool whose rows are BORROWED from the global root (profile with no
+    # local rows for this provider) resolves targets fine, but persisting the
+    # removal would be a no-op: root-owned rows are only ever updated, never
+    # deleted, on write-through (_update_root_pool_rows ignores removals).
+    # surface that boundary BEFORE removing, so the message can be honest.
+    borrowed_ids = getattr(pool, "_borrowed_root_ids", None)
+    borrowed = bool(borrowed_ids) and matched.id in borrowed_ids
     removed = pool.remove_index(index)
     if removed is None:
         raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
-    print(f"Removed {provider} credential #{index} ({removed.label})")
+    if borrowed:
+        print(
+            f"Note: {provider} credential #{index} ({removed.label}) is owned by the global root "
+            f"auth store and was NOT deleted. This profile only borrows it. "
+            f"Run the removal from the root (no profile) to delete it: hermes auth remove {provider} {index}"
+        )
+    else:
+        print(f"Removed {provider} credential #{index} ({removed.label})")
 
     # Every credential source Hermes reads from (env vars, external OAuth files, auth.json blocks,
     # custom config) has a RemovalStep in agent.credential_sources; it does the source-specific

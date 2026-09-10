@@ -273,20 +273,40 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
 def _post_oauth_token(
     data: bytes, *, content_type: str, timeout: int, what: str, user_agent: str = _OAUTH_TOKEN_USER_AGENT
 ) -> Dict[str, Any]:
-    """POST to the token endpoints in order; raise the last error if all fail."""
+    """POST to the token endpoints in order; raise a combined error if all fail.
+
+    The first endpoint is the live host (platform.claude.com); later ones are
+    legacy fallbacks. Raising only the LAST exception buried the real failure
+    (e.g. ``invalid_grant`` for a revoked refresh token) under the fallback's
+    bare 404, so each endpoint's outcome is preserved in the raised message.
+    """
+    import urllib.error
     import urllib.request
-    last_error = None
+    from urllib.parse import urlsplit
+
+    attempts: list[str] = []
+    last_error: Optional[BaseException] = None
     for endpoint in _OAUTH_TOKEN_URLS:
+        host = urlsplit(endpoint).hostname or endpoint
         req = urllib.request.Request(
             endpoint, data=data, method="POST", headers={"Content-Type": content_type, "User-Agent": user_agent}
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            body = ""
+            with contextlib.suppress(Exception):
+                body = exc.read().decode("utf-8", "replace").strip()[:300]
+            attempts.append(f"{host}: HTTP {exc.code}" + (f" {body}" if body else ""))
+            logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, exc)
         except Exception as exc:
             last_error = exc
+            attempts.append(f"{host}: {exc}")
             logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, exc)
-    raise last_error or ValueError(f"Anthropic token {what} failed")
+    detail = "; ".join(attempts) if attempts else "no endpoints attempted"
+    raise RuntimeError(f"Anthropic token {what} failed at every endpoint - {detail}") from last_error
 
 
 def _oauth_token_state(result: Dict[str, Any], *, fallback_refresh_token: str = "") -> Dict[str, Any]:
@@ -540,7 +560,17 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
     print("\nAfter authorizing, you'll see a code. Paste it below.\n")
     try:
         auth_code = input("Authorization code: ").strip()
-    except (KeyboardInterrupt, EOFError):
+    except KeyboardInterrupt:
+        return None
+    except EOFError:
+        # Non-interactive stdin (pipes, daemons, background jobs): input() hits
+        # EOF immediately, so waiting for a pasted code can never succeed. Say
+        # so explicitly instead of returning a bare None that surfaces only as
+        # "did not return credentials" with no hint at the real cause.
+        print(
+            "\nNo interactive terminal is available, so the authorization code prompt cannot be answered.\n"
+            "Run this login in a real terminal and paste the code there: hermes auth add anthropic --type oauth"
+        )
         return None
     if not auth_code:
         print("No code entered.")

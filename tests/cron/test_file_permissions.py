@@ -12,7 +12,14 @@ class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 
     def setUp(self):
+        # resolve(): on macOS the default tmpdir lives under the symlinked
+        # /var -> /private/var. Hermes home hardening deliberately skips
+        # chmod when any parent is a symlink (the operator owns permissions
+        # beyond the link), so an unresolved tmpdir makes the 0700 assertions
+        # below fail with 0755 regardless of the code under test.
         self.tmpdir = tempfile.mkdtemp()
+        os.chmod(self.tmpdir, 0o700)
+        self.tmpdir = os.path.realpath(self.tmpdir)
         self.cron_dir = Path(self.tmpdir) / "cron"
         self.output_dir = self.cron_dir / "output"
 
@@ -78,7 +85,14 @@ class TestConfigFilePermissions(unittest.TestCase):
     """Verify config files get secure permissions."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        # resolve(): on macOS the default tmpdir lives under the symlinked
+        # /var -> /private/var. Hermes home hardening deliberately skips
+        # chmod when any parent is a symlink (the operator owns permissions
+        # beyond the link), so an unresolved tmpdir makes the 0700 assertion
+        # in test_ensure_hermes_home_sets_0700 fail with 0755 regardless of
+        # the code under test.
+        self.tmpdir = os.path.realpath(tempfile.mkdtemp())
+        os.chmod(self.tmpdir, 0o700)
 
     def tearDown(self):
         import shutil

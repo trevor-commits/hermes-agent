@@ -15,7 +15,9 @@ History:
 
 from __future__ import annotations
 
+import io
 import json
+import pytest
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
@@ -215,3 +217,79 @@ def test_callback_state_mismatch_aborts(monkeypatch, tmp_path, caplog):
     assert "url" not in captured_token, (
         "token exchange must NOT happen when state mismatches"
     )
+
+
+def test_token_endpoint_failure_reports_every_attempt(monkeypatch, tmp_path):
+    """A token-endpoint failure must name each endpoint's outcome.
+
+    ``_post_oauth_token`` tries platform.claude.com first, then the legacy
+    console.anthropic.com fallback. When the PRIMARY returns a meaningful
+    error (e.g. HTTP 400 ``invalid_grant`` for a revoked refresh token) and
+    the FALLBACK 404s, raising only the last exception surfaced the fallback's
+    bare "HTTP Error 404: Not Found" and buried the diagnostic 400. Callers
+    (``hermes auth refresh``) then show a symptom-free error. Regression:
+    2026-09-09 — refresh of a revoked grant reported 404; the actual first
+    endpoint response was ``invalid_grant: Refresh token not found or
+    invalid``.
+    """
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    seen_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=None):  # noqa: ARG001 - signature mirrors urllib
+        seen_urls.append(req.full_url)
+        if "platform.claude.com" in req.full_url:
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", {},
+                io.BytesIO(b'{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}'),
+            )
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    from agent.anthropic_credentials import refresh_anthropic_oauth_pure
+
+    with pytest.raises(RuntimeError) as excinfo:
+        refresh_anthropic_oauth_pure("«redacted:sk-…»")
+
+    message = str(excinfo.value)
+    assert "platform.claude.com" in message, f"primary host missing from error: {message!r}"
+    assert "invalid_grant" in message, f"primary error body missing from error: {message!r}"
+    assert "404" in message, f"fallback outcome missing from error: {message!r}"
+    assert seen_urls == [
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    ], f"both endpoints must be attempted in order: {seen_urls!r}"
+
+
+def test_login_eof_names_the_non_interactive_cause(monkeypatch, tmp_path, capsys):
+    """EOF at the authorization-code prompt must explain the non-interactive stdin.
+
+    ``run_hermes_oauth_login_pure`` reads the pasted code with ``input()``.
+    Under a non-interactive stdin (agent-driven background process), it hits
+    EOF immediately and returned None indistinguishably from Ctrl-C, so the
+    CLI printed only "Anthropic OAuth login did not return credentials." with
+    no hint. Regression: 2026-09-09 — a background pty-less launch died at the
+    prompt, the code pasted afterwards was bound to a dead PKCE verifier, and
+    the user had to authorize a second time.
+    """
+    import builtins
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def raising_input(*_a, **_kw):
+        raise EOFError
+
+    monkeypatch.setattr(builtins, "input", raising_input)
+
+    from agent.anthropic_credentials import run_hermes_oauth_login_pure
+
+    result = run_hermes_oauth_login_pure()
+
+    assert result is None, "EOF must abort the login without credentials"
+    out = capsys.readouterr().out
+    assert "No interactive terminal is available" in out, f"EOF cause missing: {out!r}"
+    assert "hermes auth add anthropic --type oauth" in out, f"remedy missing: {out!r}"
