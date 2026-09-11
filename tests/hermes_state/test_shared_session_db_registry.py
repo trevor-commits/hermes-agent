@@ -644,3 +644,51 @@ class TestMultiGenerationTeardownBarrier:
         fresh = registry.acquire(db_path)
         assert fresh is not db
         assert registry.release(fresh) is True
+
+
+class TestPathLikeGuard:
+    """acquire() must refuse non-path-like db_path values.
+
+    A non-path here is essentially always a leaked unittest.mock:
+    ``os.fspath(MagicMock())`` evaluates to a relative ``MagicMock/...``
+    path inside the process CWD, and acquire() then creates REAL SQLite
+    files there (keeper publish gate 2026-09-10: the worktree grew
+    ``MagicMock/mock._session_db.db_path/<id>/`` and failed the
+    clean-worktree publish guard after a fully green gate+smoke).
+    """
+
+    def test_rejects_magicmock_db_path(self):
+        from unittest.mock import MagicMock
+
+        with pytest.raises(TypeError, match="path-like"):
+            registry.acquire(MagicMock())
+
+    def test_rejects_plain_mock_db_path(self):
+        from unittest.mock import Mock
+
+        with pytest.raises(TypeError, match="path-like"):
+            registry.acquire(Mock())
+
+    def test_rejects_arbitrary_object_db_path(self):
+        class NotAPath:
+            pass
+
+        with pytest.raises(TypeError, match="path-like"):
+            registry.acquire(NotAPath())
+
+    def test_accepts_str_path(self, tmp_path):
+        """Real str paths keep working (SessionDB accepts them)."""
+        db = registry.acquire(str(tmp_path / "state.db"))
+        try:
+            assert Path(db.db_path) == (tmp_path / "state.db").resolve()
+        finally:
+            registry.release(db)
+
+    def test_accepts_none_uses_default(self, tmp_path, monkeypatch):
+        """acquire() with no argument still resolves the default DB."""
+        monkeypatch.chdir(tmp_path)
+        db = registry.acquire()
+        try:
+            assert db is not None
+        finally:
+            registry.release(db)

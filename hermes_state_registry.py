@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
@@ -186,8 +187,29 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
     replaced (different inode) since the generation opened, that generation is RETIRED
     but stays alive for its holders, and a fresh one is opened in its place. Raises
     whatever ``SessionDB.__init__`` raises; on a replacement-open failure the registry
-    holds NO entry for the path."""
+    holds NO entry for the path.
+
+    ``db_path`` must be path-like (``Path``/``str``/``bytes``) or ``None``. A non-path
+    is essentially always a leaked ``unittest.mock`` — ``MagicMock`` configures
+    ``__fspath__`` on its class, so ``os.fspath`` happily returns a mock-derived
+    RELATIVE path (``MagicMock/...``) inside the process CWD and this registry would
+    silently create REAL SQLite files there (keeper publish gate 2026-09-10). Fail
+    loudly instead; callers already wrap degraded paths in try/except.
+    """
     from hermes_state import _default_db_path
+
+    if db_path is not None:
+        # The unittest.mock module check must come first: MagicMock instances
+        # pass isinstance(..., os.PathLike) because __fspath__ is a class
+        # attribute, yet fspath() yields garbage.
+        if type(db_path).__module__ == "unittest.mock" or not isinstance(
+            db_path, (str, bytes, os.PathLike)
+        ):
+            raise TypeError(
+                "hermes_state_registry.acquire: db_path must be path-like or None, "
+                "got %r. Non-path values are almost always leaked test mocks; "
+                "refusing to create a database at a mock-derived path." % (type(db_path),)
+            )
 
     raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
     try:
