@@ -403,10 +403,14 @@ def _read_scoped(db, sid: str, profile: Optional[str]) -> str:
     ask properly: ``@session:<profile>/<id>`` or ``profile=``.
     """
     result = _read_session(db, sid, link_profile=profile)
-    if json.loads(result).get("success") is not False or profile:
+    payload = json.loads(result)
+    if payload.get("success") is not False or profile:
         return result
-    return tool_error(f"session_id not found in this profile: {sid}. If it belongs to another "
-                      "profile, pass profile=<name> (or the @session:<profile>/<id> link).", success=False)
+    if not str(payload.get("error", "")).startswith("session_id not found:"):
+        return result
+    payload["error"] = (f"session_id not found in this profile: {sid}. If it belongs to another "
+                        "profile, pass profile=<name> (or the @session:<profile>/<id> link).")
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:

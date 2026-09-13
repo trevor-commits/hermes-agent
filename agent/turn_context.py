@@ -489,7 +489,9 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     turn_id = str(getattr(agent, "_current_turn_id", "") or "")
     if not isinstance(messages, list) or not turn_id or user_message is None:
         return result
-    idx = reanchor_current_turn_user_idx(messages, user_message)
+    idx = reanchor_current_turn_user_idx(
+        messages, user_message, turn_identity=getattr(agent, "_persist_user_turn_identity", None)
+    )
     if idx < 0 or idx >= len(messages):
         return result
     row = messages[idx]

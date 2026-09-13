@@ -513,7 +513,7 @@ def test_actual_setup_keeps_provider_settings_in_yaml(
     monkeypatch.setattr(
         setup,
         "_ensure_flow_api_key",
-        lambda *_a, **_kw: ("actual-test-key", "actual-test-key", False),
+        lambda *_a, **_kw: ("actual-test-key", "actual-test-key", False, ""),
     )
     monkeypatch.setattr(setup, "_ask", lambda *_a, **_kw: override)
     monkeypatch.setattr(setup, "_api_key_provider_model_list", lambda *_a: [])

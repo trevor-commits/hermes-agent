@@ -215,7 +215,9 @@ def test_reattach_does_not_adopt_foreign_or_retired_generations(runtime):
     with server._session_resume_lock:
         assert server._reattach_refusal(1, "ui-owner", {**owner})["error"]["code"] == 4007
         owner["_client_gone_interrupt_requested"] = True
-        assert server._reattach_refusal(1, "ui-owner", owner)["error"]["code"] == 4009
+        # Transport loss no longer interrupts live work. A legacy flag cannot
+        # fence the current owner; the foreign-record assertion above still rejects.
+        assert server._reattach_refusal(1, "ui-owner", owner) is None
         del owner["_client_gone_interrupt_requested"]
         server._rebind_live_transport("ui-owner", owner, new)
     assert call("subagent.list", via=new)["result"]["subagents"] == []

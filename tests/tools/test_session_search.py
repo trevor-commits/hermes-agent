@@ -496,6 +496,19 @@ class TestReadShape:
         assert result["success"] is False
         assert "chat-source describe" in result["chat_source_hint"]
         assert "chat-source doctor" in result["chat_source_hint"]
+        assert "not found in this profile" in result["error"]
+
+    def test_read_failure_is_not_replaced_with_profile_miss(self, db, monkeypatch):
+        db.create_session("unreadable", source="cli")
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("synthetic storage failure")
+
+        monkeypatch.setattr(db, "get_messages", fail)
+        result = json.loads(session_search(session_id="unreadable", db=db))
+        assert result["success"] is False
+        assert "failed to load session" in result["error"]
+        assert "not found" not in result["error"]
 
     def test_read_truncates_large_session(self, db):
         db.create_session("s_big", source="cli")
@@ -1228,4 +1241,3 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
-

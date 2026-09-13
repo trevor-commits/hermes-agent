@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_state_common import (
-    _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression,
+    _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression, _ended_by_continuation,
     _sql_json_extract, _sql_session_last_active, is_automatic_end_reason)
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
@@ -100,7 +100,7 @@ class SessionCompressionMixin:
             if row is None or row["ended_at"] is None:
                 return None
             reason = row["end_reason"]
-            if is_automatic_end_reason(reason) or reason == "compression" or reason in _BOUNDARY_END_REASONS:
+            if is_automatic_end_reason(reason) or _ended_by_continuation(row) or reason in _BOUNDARY_END_REASONS:
                 return None
             superseded = conn.execute(
                 "SELECT 1 FROM sessions WHERE parent_session_id = ?"
@@ -148,7 +148,7 @@ class SessionCompressionMixin:
                 return None
             end_reason = str(parent["end_reason"])
             rows = conn.execute(
-                """
+                f"""
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
                            AS _system_prompt_resolved
@@ -160,14 +160,8 @@ class SessionCompressionMixin:
                     ? = 'compression'
                     OR (
                       ? = 'proactive_rollover'
-                      AND json_extract(
-                        COALESCE(s.model_config, '{}'),
-                        '$._proactive_rollover'
-                      ) = 1
-                      AND json_extract(
-                        COALESCE(s.model_config, '{}'),
-                        '$._reset_from'
-                      ) = ?
+                      AND {_sql_json_extract('s.model_config', '$._proactive_rollover')} = 1
+                      AND {_sql_json_extract('s.model_config', '$._reset_from')} = ?
                     )
                   )
                 """

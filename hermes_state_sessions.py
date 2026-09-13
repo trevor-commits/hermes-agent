@@ -322,6 +322,9 @@ class SessionSessionsMixin:
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = CASE
+                           WHEN sessions.model_config IS NOT NULL
+                                AND NOT json_valid(sessions.model_config)
+                           THEN sessions.model_config
                            WHEN excluded.model_config IS NOT NULL
                                 AND json_type(
                                     sessions.model_config, '$._reset_from'
@@ -479,7 +482,8 @@ class SessionSessionsMixin:
         def _do(conn):
             conn.execute(
                 "UPDATE sessions AS child SET model_config = json_set("
-                "COALESCE(child.model_config, '{}'), '$._reset_from', child.parent_session_id) "
+                "CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE '{}' END, "
+                "'$._reset_from', child.parent_session_id) "
                 f"WHERE child.parent_session_id = ? AND {_sql_json_extract('child.model_config', '$._reset_from')} IS NULL "
                 f"AND {_legacy_reset_child_sql('child', _session_ids_placeholders(_RESET_END_REASONS))}",
                 (session_id, *_RESET_END_REASONS),
@@ -1065,9 +1069,7 @@ class SessionSessionsMixin:
         compression_parent_edge = f"""
             parent.end_reason = 'compression'
             AND child.parent_session_id = parent.id
-            AND json_extract(
-                COALESCE(child.model_config, '{{}}'), '$._branched_from'
-            ) IS NULL
+            AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
             AND {_delegate_from_json('child.model_config')} IS NULL
             AND COALESCE(child.source, '') != 'tool'
         """
