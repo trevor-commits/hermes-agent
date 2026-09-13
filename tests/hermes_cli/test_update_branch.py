@@ -111,31 +111,16 @@ class TestBranchPinnedUpdateCommand:
 
 class TestUpdateSurfaceAgreement:
     def test_banner_local_git_check_follows_branch(self, monkeypatch, tmp_path):
-        """The banner fetches and counts against origin/<branch>, not main."""
+        """Passive update checks query the configured fork branch without fetching."""
         from hermes_cli import banner
-
         repo = _fake_repo(tmp_path)
-        recorded = []
-
-        def fake_run(cmd, **kwargs):
-            recorded.append(list(cmd))
-            joined = " ".join(cmd)
-            if "get-url" in joined:
-                return _completed(0, "git@github.com:someone/fork.git\n")
-            if "--is-shallow-repository" in joined:
-                return _completed(0, "false\n")
-            if "fetch" in joined:
-                return _completed(0)
-            if "rev-list" in joined:
-                return _completed(0, "3\n")
-            return _completed(0, "")
-
-        monkeypatch.setattr(banner.subprocess, "run", fake_run)
+        calls = []
+        monkeypatch.setattr(banner, "_git_stdout", lambda args, **kw: "git@github.com:someone/fork.git" if args[:2] == ["remote", "get-url"] else "a" * 40)
+        monkeypatch.setattr(banner, "_github_branch_tip", lambda slug, branch: calls.append((slug, branch)) or "b" * 40)
+        monkeypatch.setattr(banner, "_tips_behind", lambda head, target, path: 3 if (head, target, path) == ("a" * 40, "b" * 40, repo) else None)
+        monkeypatch.setattr(banner, "_git_run", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("unexpected git network request")))
         assert banner._check_via_local_git(repo, "keeper") == 3
-        fetches = [c for c in recorded if "fetch" in c]
-        counts = [c for c in recorded if "rev-list" in c]
-        assert fetches and fetches[0][-2:] == ["keeper", "--quiet"]
-        assert counts and counts[0][-1] == "HEAD..origin/keeper"
+        assert calls == [("someone/fork", "keeper")]
 
     def test_update_check_cache_keyed_on_branch(self, monkeypatch, tmp_path):
         """A cached count for one branch is a MISS for another branch."""

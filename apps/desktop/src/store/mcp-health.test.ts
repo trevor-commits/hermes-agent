@@ -41,25 +41,30 @@ const { $gatewayState } = await import('@/store/session')
 
 type Status = 'error' | 'needs-auth' | 'ok'
 
+const flush = () => new Promise(resolve => setTimeout(resolve, 0))
+
+afterEach(() => {
+  stopMcpHealthChecker()
+  $gatewayState.set('closed')
+  $activeGatewayProfile.set('default')
+  vi.mocked(getHermesConfigRecord).mockReset()
+  vi.mocked(notify).mockReset()
+})
+
 describe('shouldNotifyOnTransition', () => {
   // The full previous × next decision table: notify only on a TRANSITION into
   // a bad state. Rechecks of an already-bad server stay quiet; ok never nudges.
   it.each<[previous: Status | null, next: Status, notify: boolean]>([
-    // First observation of the session (previous unknown).
     [null, 'ok', false],
     [null, 'needs-auth', true],
     [null, 'error', true],
-    // Healthy server stays healthy / breaks.
     ['ok', 'ok', false],
     ['ok', 'needs-auth', true],
     ['ok', 'error', true],
-    // Already-broken server: rechecks must NOT re-notify…
     ['needs-auth', 'needs-auth', false],
     ['error', 'error', false],
-    // …but flipping from one bad state to the other is a new transition.
     ['needs-auth', 'error', true],
     ['error', 'needs-auth', true],
-    // Recovery is silent.
     ['needs-auth', 'ok', false],
     ['error', 'ok', false]
   ])('previous=%s next=%s → notify=%s', (previous, next, expected) => {
@@ -204,4 +209,59 @@ describe('background MCP health sweeps', () => {
     expect(notify).not.toHaveBeenCalled()
     expect(probeCache.size).toBe(0)
   })
+
+})
+
+it('coalesces reconnects during a sweep into one fresh follow-up sweep', async () => {
+  let releaseFirst!: (config: Record<string, unknown>) => void
+
+  const first = new Promise<Record<string, unknown>>(resolve => {
+    releaseFirst = resolve
+  })
+
+  vi.mocked(getHermesConfigRecord).mockReturnValueOnce(first).mockResolvedValue({ mcp_servers: {} })
+
+  startMcpHealthChecker()
+  $gatewayState.set('open')
+  await flush()
+  expect(vi.mocked(getHermesConfigRecord)).toHaveBeenCalledTimes(1)
+
+  for (let index = 0; index < 12; index += 1) {
+    $gatewayState.set('closed')
+    $gatewayState.set('open')
+  }
+
+  await flush()
+  expect(vi.mocked(getHermesConfigRecord)).toHaveBeenCalledTimes(1)
+
+  releaseFirst({ mcp_servers: {} })
+  await flush()
+  await flush()
+  expect(vi.mocked(getHermesConfigRecord)).toHaveBeenCalledTimes(2)
+})
+
+it('runs one follow-up when the active sweep fails through the handled config-error path', async () => {
+  let rejectFirst!: (err: Error) => void
+
+  const first = new Promise<Record<string, unknown>>((_resolve, reject) => {
+    rejectFirst = reject
+  })
+
+  vi.mocked(getHermesConfigRecord).mockReturnValueOnce(first).mockResolvedValue({ mcp_servers: {} })
+
+  startMcpHealthChecker()
+  $gatewayState.set('open')
+
+  for (let index = 0; index < 12; index += 1) {
+    $gatewayState.set('closed')
+    $gatewayState.set('open')
+  }
+
+  await flush()
+  expect(vi.mocked(getHermesConfigRecord)).toHaveBeenCalledTimes(1)
+
+  rejectFirst(new Error('backend restarting'))
+  await flush()
+  await flush()
+  expect(vi.mocked(getHermesConfigRecord)).toHaveBeenCalledTimes(2)
 })

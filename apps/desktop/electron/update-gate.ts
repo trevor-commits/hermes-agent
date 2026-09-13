@@ -1,5 +1,7 @@
 'use strict'
 
+import { runBackendStartStep } from './backend-start-cancellation'
+
 /**
  * update-gate.ts
  *
@@ -50,6 +52,7 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
 export type UpdateClearanceOutcome = 'clear' | 'finished'
 
 export interface WaitForUpdateClearanceOptions {
+  signal?: AbortSignal
   pollMs: number
   /** Invoked once per poll while parked (boot progress / logging). */
   onWaitTick?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
@@ -72,7 +75,7 @@ export async function waitForUpdateClearance(
 ): Promise<UpdateClearanceOutcome> {
   const sleep = options.sleep || (ms => new Promise<void>(r => setTimeout(r, ms)))
   const checkCancellation = () => {
-    if (options.isCancelled?.()) {
+    if (options.signal?.aborted || options.isCancelled?.()) {
       throw new Error('Backend startup cancelled because Hermes is shutting down.')
     }
   }
@@ -85,12 +88,34 @@ export async function waitForUpdateClearance(
   }
 
   while (reason) {
-    if (options.onWaitTick) {
-      await options.onWaitTick(reason)
+    checkCancellation()
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    try {
+      if (options.onWaitTick) {
+        await runBackendStartStep(options.signal, () => options.onWaitTick!(reason!))
+      }
+
+      checkCancellation()
+
+      await runBackendStartStep(options.signal, () =>
+        options.sleep
+          ? sleep(options.pollMs)
+          : new Promise<void>(resolve => {
+              timer = setTimeout(resolve, options.pollMs)
+            })
+      )
+    } catch (error) {
+      checkCancellation()
+
+      throw error
+    } finally {
+      clearTimeout(timer)
     }
 
-    await sleep(options.pollMs)
     checkCancellation()
+
     reason = updateGateReason(deps)
   }
 

@@ -14,13 +14,13 @@ $displayTimestamps.set(true)
 const timestamp = new Date('2026-05-01T00:00:00.000Z')
 stubThreadEnvironment()
 
-function Harness({ custom, text }: { custom?: Record<string, unknown>; text: string }) {
+function Harness({ custom, text, asyncResult }: { custom?: Record<string, unknown>; text: string; asyncResult?: string }) {
   const message = {
     id: 'system-1',
     role: 'system',
     content: [{ type: 'text', text }],
     createdAt: timestamp,
-    metadata: { custom: { timelineTimestamp: timestamp.getTime() / 1000, ...custom } }
+    metadata: { custom: { timelineTimestamp: timestamp.getTime() / 1000, ...custom, asyncResult } }
   } as unknown as ThreadMessage
 
   const runtime = useExternalStoreRuntime<ThreadMessage>({
@@ -45,6 +45,26 @@ function expectTimestampSeparated(container: HTMLElement, precedingText: string)
 }
 
 afterEach(cleanup)
+
+describe('background report disclosure', () => {
+  it('keeps result bodies out of the transcript until opened and removes them when collapsed', () => {
+    const report = '{"blockers":[{"title":"Local-model readiness uses the wrong endpoint"}]}'
+    const { container, getByRole } = render(<Harness asyncResult={report} text="2 background agents finished" />)
+
+    expect(container.textContent).not.toContain('blockers')
+    expectTimestampSeparated(container, '2 background agents finished')
+    const toggle = getByRole('button', { name: '2 background agents finished' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(container.textContent).toContain(report)
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(container.textContent).not.toContain('blockers')
+  })
+})
 
 describe('system message timestamp text separation', () => {
   it('collapses preserved compression tasks under a context handoff label', () => {

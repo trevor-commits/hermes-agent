@@ -301,10 +301,10 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = non_applyable()
         return payload
 
-    # banner.check_for_updates() handles git / nix-revision paths and caches
-    # the result for 6h. ``force`` busts the cache so "Check now" reflects reality.
+    # banner.check_for_updates() handles git / nix-revision paths through the GitHub API and
+    # caches the result for 24h. ``force`` busts the cache so "Check now" reflects reality.
     try:
-        from hermes_cli.banner import check_for_updates
+        from hermes_cli.banner import check_for_updates, upstream_commits_behind
 
         if force:
             with contextlib.suppress(OSError):
@@ -321,10 +321,10 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = "You're on the latest version."
     else:
         payload["update_available"] = True
-        # "What's changed" for the desktop's remote update overlay; git only,
-        # best-effort (empty list on any failure).
-        if install_method == "git":
+        if install_method == "git" and resolve_update_branch() != "main":
             payload["commits"] = await asyncio.to_thread(_recent_upstream_commits, resolve_update_branch())
+        else:
+            payload["commits"] = await asyncio.to_thread(upstream_commits_behind)
     return payload
 
 
