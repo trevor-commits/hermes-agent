@@ -272,6 +272,10 @@ export function foregroundSessionScopes(): Set<string> {
   for (const tile of $sessionTiles.get()) {
     addRuntimeScope(tile.runtimeId)
     addRouteScope(tile.ownerRoute)
+
+    if (!tile.ownerRoute && tile.ownerProfile) {
+      scopes.add(normalizeProfileKey(tile.ownerProfile))
+    }
   }
 
   // Create → foreground holds. A hold whose scope the rungs above already
@@ -771,12 +775,16 @@ export interface SessionTile {
   workspaceOwnerKey?: string
   /** Credential-free exact route used to resume this tab after relaunch. */
   ownerRoute?: SessionOwnerRoute
+  /** Profile-pool owner captured at creation, when no registry route was used. */
+  ownerProfile?: string
   /** Stable title for hidden relationship chats absent from the Sessions list. */
   workspaceTabTitle?: string
 }
 
 export interface SessionTileWorkspaceScope {
   ownerRoute?: SessionOwnerRoute
+  /** Profile-pool owner captured at creation, when no registry route was used. */
+  ownerProfile?: string
   workspaceMode: WorkspaceMode
   workspaceOwnerKey?: string
   workspaceTabTitle?: string
@@ -802,6 +810,7 @@ type StoredTile = Pick<
   | 'before'
   | 'dir'
   | 'ownerRoute'
+  | 'ownerProfile'
   | 'storedSessionId'
   | 'workspaceMode'
   | 'workspaceOwnerKey'
@@ -813,6 +822,7 @@ const toStored = (t: SessionTile): StoredTile => ({
   before: t.before,
   dir: t.dir,
   ...(t.ownerRoute ? { ownerRoute: t.ownerRoute } : {}),
+  ...(t.ownerProfile ? { ownerProfile: t.ownerProfile } : {}),
   storedSessionId: t.storedSessionId,
   ...(t.workspaceMode ? { workspaceMode: t.workspaceMode } : {}),
   ...(t.workspaceOwnerKey ? { workspaceOwnerKey: t.workspaceOwnerKey } : {}),
@@ -843,6 +853,7 @@ function parseTileList(value: unknown): StoredTile[] {
                       : {})
                   }
                 : undefined,
+            ownerProfile: typeof raw.ownerProfile === 'string' ? raw.ownerProfile.trim() || undefined : undefined,
             storedSessionId: raw.storedSessionId,
             workspaceMode: raw.workspaceMode === 'bots' ? 'bots' : 'sessions',
             workspaceOwnerKey:
@@ -964,8 +975,10 @@ export function patchSessionTile(storedSessionId: string, patch: Partial<Session
   saveTiles($sessionTiles.get().map(t => (t.storedSessionId === storedSessionId ? { ...t, ...patch } : t)))
 }
 
-export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | undefined {
-  return $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.ownerRoute
+export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | string | undefined {
+  const tile = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)
+
+  return tile?.ownerRoute ?? (tile?.ownerProfile?.trim() || undefined)
 }
 
 /**
@@ -984,6 +997,10 @@ export function openTileGatewayScopes(): Set<string> {
     const route = tile.ownerRoute
 
     if (!route) {
+      if (tile.ownerProfile) {
+        scopes.add(normalizeProfileKey(tile.ownerProfile))
+      }
+
       continue
     }
 
@@ -1485,6 +1502,7 @@ export function openSessionTile(
         // closes the unpinned socket (the resume/reclaim flicker loop,
         // #93892 shape).
         ownerRoute: workspaceScope.ownerRoute,
+        ownerProfile: workspaceScope.ownerProfile,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,

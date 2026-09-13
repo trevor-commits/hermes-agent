@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vite
 
 import { createSessionRpcDispatcher } from '@/app/contrib/session-rpc-dispatcher'
 import { getSession } from '@/hermes'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   activeGateway,
   activeGatewayConnectionId,
@@ -40,7 +41,12 @@ import {
   setSelectedStoredSessionId,
   setSessions
 } from '@/store/session'
-import { foregroundSessionScopes } from '@/store/session-states'
+import {
+  $sessionTiles,
+  foregroundSessionScopes,
+  openTileGatewayScopes,
+  requestForOwnedSession
+} from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
@@ -255,6 +261,7 @@ function makePrimary(): MockGateway {
 }
 
 interface HarnessHandle {
+  openNewSessionTile: ReturnType<typeof useSessionActions>['openNewSessionTile']
   busyRef: { current: boolean }
   bindings: () => { runtimeForStored: null | string; storedForRuntime: null | string }
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
@@ -348,6 +355,7 @@ function Harness({
 
   useEffect(() => {
     onReady({
+      openNewSessionTile: sessionActions.openNewSessionTile,
       busyRef,
       bindings: () => ({
         runtimeForStored: cache.runtimeIdByStoredSessionIdRef.current.get(mintedStoredId) ?? null,
@@ -361,6 +369,7 @@ function Harness({
     cache.sessionStateByRuntimeIdRef,
     cache.updateSessionState,
     onReady,
+    sessionActions.openNewSessionTile,
     submitText
   ])
 
@@ -371,6 +380,8 @@ const omarScope = registryBackendScopeKey(SOURCE_ID, 'omar')
 
 describe('profile rail: a fresh Omar chat keeps its exact registry owner across turns (#94071)', () => {
   beforeEach(() => {
+    $sessionTiles.set([])
+    $connectionsRegistry.set(null)
     sockets.length = 0
     runtimeOwner = null
     ownerPort = OMAR_PORT
@@ -776,5 +787,56 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     expect($sessions.get().find(session => sessionMatchesStoredId(session, LEGACY_STORED_ID))).toMatchObject({
       profile: 'omar'
     })
+  })
+  it.each(['local', SOURCE_ID])('an unlisted tab on %s can read controls before its first prompt', async source => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+    $connectionsRegistry.set({ connections: [{ id: source }] } as never)
+    await ensureGatewayAgent(source, 'default')
+    ownerPort = source === 'local' ? V1_PORT : OMAR_PORT
+    selectProfile('omar')
+    await waitFor(() => expect(activeGatewayProfileKey()).toBe('omar'))
+
+    const ambientRequest = vi.fn(async (method: string, params?: Record<string, unknown>) =>
+      (activeGateway() as unknown as MockGateway).request(method, params)
+    )
+
+    let handle: HarnessHandle | null = null
+    render(<Harness ambientRequest={ambientRequest} onReady={h => (handle = h)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+    await act(async () => handle!.openNewSessionTile('center', { listed: false }))
+    expect(runtimeOwner).not.toBeNull()
+    expect($sessionTiles.get()).toContainEqual(
+      expect.objectContaining({ storedSessionId: STORED_ID, runtimeId: RUNTIME_ID })
+    )
+    expect($sessions.get()).toEqual([])
+    const ownerScope = source === 'local' ? 'omar' : registryBackendScopeKey(source, 'omar')
+    expect(foregroundSessionScopes()).toContain(ownerScope)
+    expect(openTileGatewayScopes()).toContain(ownerScope)
+    const persisted = JSON.parse(window.localStorage.getItem('hermes.desktop.sessionTiles.v2')!)
+    expect(persisted.omar).toContainEqual(
+      expect.objectContaining(
+        source === 'local'
+          ? { storedSessionId: STORED_ID, ownerProfile: 'omar' }
+          : { storedSessionId: STORED_ID, ownerRoute: { connectionId: source, profile: 'omar' } }
+      )
+    )
+    // A different foreground source with the same profile cannot own this draft.
+    await act(async () => ensureGatewayAgent('other-source', 'omar'))
+
+    const wrongOwner = vi.fn(async () => {
+      throw new Error('ambient is not the draft owner')
+    })
+
+    await expect(
+      requestForOwnedSession(RUNTIME_ID, wrongOwner, 'session.control.read', { session_id: RUNTIME_ID })
+    ).resolves.toEqual({})
+    expect(
+      runtimeOwner!.request.mock.calls.some(
+        ([method, params]) => method === 'session.control.read' && params?.session_id === RUNTIME_ID
+      )
+    ).toBe(true)
+    expect(wrongOwner).not.toHaveBeenCalled()
+    expect(calls(runtimeOwner!)).not.toContain('prompt.submit')
   })
 })

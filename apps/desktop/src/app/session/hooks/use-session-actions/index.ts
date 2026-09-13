@@ -758,7 +758,7 @@ export function useSessionActions({
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
-        const params = {
+        const params: Record<string, unknown> = {
           ...(await desktopSessionCreateParams(cwd, capturedRoute)),
           ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
@@ -828,7 +828,14 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
-        openSessionTile(stored, dir, options?.anchor, options?.before, workspaceScope)
+        // Unlisted drafts have no sidebar/DB row to recover their owner from.
+        // Publish the creating route or profile with the tile before controls mount.
+        openSessionTile(stored, dir, options?.anchor, options?.before, {
+          ...workspaceScope,
+          ...(capturedRoute
+            ? { ownerRoute: capturedRoute }
+            : { ownerProfile: typeof params.profile === 'string' ? params.profile : undefined })
+        })
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
