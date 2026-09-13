@@ -313,7 +313,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
         ):
             try:
-                start()
+                # Initial heartbeat registration may build indexes in a large state.db.
+                # Keep SQLite and registry-lock waits off the socket event loop.
+                await asyncio.to_thread(start)
             except Exception:
                 _log.warning("%s failed", what, exc_info=True)
         if not ready_ok:

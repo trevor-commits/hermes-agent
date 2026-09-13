@@ -397,11 +397,13 @@ def _start_backend_heartbeat_refresher() -> None:
     with _heartbeat_refresher_lock:
         if _heartbeat_refresher_started:
             return
+        # Concurrent first sockets must wait for the initial registration before
+        # scheduling their orphan sweep. Callers on an event loop use to_thread.
         _heartbeat_refresher_started = True
-    try:
-        _refresh_backend_heartbeat()
-    except Exception:
-        logger.debug("initial backend heartbeat write failed", exc_info=True)
+        try:
+            _refresh_backend_heartbeat()
+        except Exception:
+            logger.debug("initial backend heartbeat write failed", exc_info=True)
     if _HEARTBEAT_REFRESH_S <= 0:
         return
     stop_event = threading.Event()

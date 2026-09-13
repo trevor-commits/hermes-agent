@@ -263,7 +263,7 @@ export function useGatewayBoot({
     // RECONNECT_ESCALATE_AFTER_MS so we fire a single non-blocking toast.
     // Reset on a clean open or a manual/wake-driven reconnect.
     let escalated = false
-    // Bounded automatic boot retry for transient REMOTE failures (#82679).
+    // Bounded automatic boot retry for transient transport failures (#82679).
     let bootRetryAttempt = 0
     let bootRetryTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -1125,10 +1125,10 @@ export function useGatewayBoot({
           'Timed out minting the gateway WebSocket URL'
         )
 
-        // Only a valid WebSocket dial against a remote descriptor counts as a
+        // Only a valid WebSocket dial against a resolved descriptor counts as a
         // transient renderer-side failure; URL and capability failures stay
         // terminal at their own boundaries.
-        if (conn.mode === 'remote' && isGatewayWebSocketUrl(wsUrl)) {
+        if (isGatewayWebSocketUrl(wsUrl)) {
           stage = 'dialing'
         }
 
@@ -1183,7 +1183,7 @@ export function useGatewayBoot({
           // Main's classification (#82679) still decides every failure it can
           // see. The one it cannot see is the renderer-owned WebSocket dial:
           // after a renderer reload main serves its cached descriptor with a
-          // stale `backend.ready / retryable:false` snapshot, so a remote dial
+          // stale `backend.ready / retryable:false` snapshot, so a local or remote dial
           // that never became usable is retryable on its own. Anything after a
           // successful dial keeps the terminal recovery surface.
           const canRetry = bootRetryAttempt < BOOT_RETRY_MAX_ATTEMPTS
@@ -1192,7 +1192,7 @@ export function useGatewayBoot({
           if (retryable && !cancelled) {
             const delay = reconnectBackoffDelayMs(bootRetryAttempt, { baseDelayMs: BOOT_RETRY_BASE_DELAY_MS })
             bootRetryAttempt += 1
-            resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))
+            resumeDesktopBootForRetry(translateNow('boot.steps.connectingGateway'))
             clearBootRetryTimer()
             bootRetryTimer = setTimeout(() => {
               bootRetryTimer = null
