@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { once } from 'node:events'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -857,34 +858,63 @@ test.skipIf(process.platform === 'win32')('detached backend does not inherit the
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-update-mutex-'))
   const hermesPath = path.join(directory, 'hermes')
   const reportPath = path.join(directory, 'descriptor-report')
+  const reporterPath = path.join(directory, 'reporter.cjs')
+  const mutexPath = path.join(directory, 'home', '.hermes-update-in-progress.mutex')
   const logPath = path.join(directory, 'spawn.log')
+  const env = {
+    ...process.env,
+    HERMES_TEST_NODE: process.execPath,
+    HERMES_TEST_REPORTER: reporterPath,
+    HERMES_TEST_MUTEX: mutexPath,
+    HERMES_TEST_REPORT: reportPath
+  }
 
   try {
-    await writeFile(
-      hermesPath,
-      `#!/bin/sh
-: > ${reportPath}
-for fd in /proc/$$/fd/*; do
-  target=$(readlink "$fd" 2>/dev/null || true)
-  case "$target" in
-    *hermes-update-in-progress.mutex) printf '%s\\n' "$target" >> ${reportPath} ;;
-  esac
-done
-`,
-      { mode: 0o700 }
-    )
+    await mkdir(path.dirname(mutexPath))
+    await writeFile(reporterPath, `
+const fs = require('node:fs')
+const mutex = fs.statSync(process.env.HERMES_TEST_MUTEX)
+const inherited = []
+for (const name of fs.readdirSync('/dev/fd')) {
+  try {
+    const stat = fs.fstatSync(Number(name))
+    if (stat.dev === mutex.dev && stat.ino === mutex.ino) inherited.push(Number(name))
+  } catch {}
+}
+const report = process.env.HERMES_TEST_REPORT
+fs.writeFileSync(report + '.tmp', JSON.stringify(inherited))
+fs.renameSync(report + '.tmp', report)
+`)
+    await writeFile(hermesPath, '#!/bin/sh\nexec "$HERMES_TEST_NODE" "$HERMES_TEST_REPORTER"\n', { mode: 0o700 })
+
+    // A positive control proves detection on macOS too; /proc-only scanning
+    // silently passed there. Publish reports only after inspection finishes.
+    const mutex = await open(mutexPath, 'a')
+    const controlPath = path.join(directory, 'control-report')
+    try {
+      const child = spawn(process.execPath, [reporterPath], {
+        env: { ...env, HERMES_TEST_REPORT: controlPath },
+        stdio: ['ignore', 'ignore', 'ignore', mutex.fd]
+      })
+      const [code] = await once(child, 'exit')
+      assert.equal(code, 0)
+      assert.ok(JSON.parse(await readFile(controlPath, 'utf8')).includes(3))
+    } finally {
+      await mutex.close()
+    }
 
     const command = buildSpawnCommand(hermesPath, '', {
       hermesHome: path.join(directory, 'home'),
       logPath
     })
 
-    await exec(command, { shell: '/bin/bash', cwd: directory })
+    await exec(command, { shell: '/bin/bash', cwd: directory, env })
 
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    const deadline = performance.now() + 10_000
+    while (performance.now() < deadline) {
       try {
         const report = await readFile(reportPath, 'utf8')
-        assert.equal(report, '', 'the backend process must not retain the update mutex descriptor')
+        assert.deepEqual(JSON.parse(report), [], 'the backend process must not retain the update mutex descriptor')
 
         return
       } catch (error: any) {
@@ -896,7 +926,7 @@ done
       }
     }
 
-    assert.fail('the detached backend did not write its descriptor report')
+    assert.fail('the detached backend did not write its completed descriptor report')
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

@@ -170,3 +170,61 @@ class TestEntryAndWsWiring:
 
         asyncio.run(ws_mod.handle_ws(FakeWS()))
         assert started["n"] == 1
+
+
+def test_concurrent_first_sockets_keep_loop_responsive_and_register_before_sweep(monkeypatch):
+    import asyncio
+    import threading
+    import json
+    from tui_gateway import server, ws as ws_mod
+
+    entered, release = threading.Event(), threading.Event()
+    registrations, sweeps = [], []
+    def register():
+        entered.set()
+        assert release.wait(3), "test controller must run while registration waits"
+        registrations.append(True)
+    def sweep():
+        assert registrations, "cleanup must not precede the initial heartbeat"
+        sweeps.append(True)
+    monkeypatch.setattr(server, "_refresh_backend_heartbeat", register)
+    monkeypatch.setattr(server, "_heartbeat_refresher_started", False)
+    monkeypatch.setattr(server, "_HEARTBEAT_REFRESH_S", 0)
+    monkeypatch.setattr(server, "_schedule_startup_orphan_sweep", sweep)
+    monkeypatch.setattr(server, "resolve_skin", lambda: {})
+    monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+
+    class Socket:
+        def __init__(self):
+            self.ready, self.pong = asyncio.Event(), asyncio.Event()
+            self.reads = 0
+        async def accept(self): pass
+        async def send_text(self, line):
+            frame = json.loads(line)
+            if frame.get("id") == 1: self.pong.set()
+            else: self.ready.set()
+        async def receive_text(self):
+            self.reads += 1
+            if self.reads == 1: return json.dumps({"id": 1, "method": "gateway.ping"})
+            raise ws_mod._WebSocketDisconnect()
+        async def close(self): pass
+
+    async def scenario():
+        first, second = Socket(), Socket()
+        one = asyncio.create_task(ws_mod.handle_ws(first))
+        two = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            two = asyncio.create_task(ws_mod.handle_ws(second))
+            await asyncio.wait_for(second.pong.wait(), .5)
+            assert not registrations and not sweeps
+        finally:
+            release.set()
+            await one
+            if two is not None: await two
+            await asyncio.gather(*ws_mod._backend_startup_tasks)
+        assert not ws_mod._backend_startup_tasks
+        assert len(registrations) == 1
+        assert len(sweeps) == 2
+    asyncio.run(scenario())

@@ -39,7 +39,13 @@ def main_mod(monkeypatch):
     monkeypatch.setattr(mod, "_has_any_provider_configured", lambda: True)
     monkeypatch.setattr(mod, "_sync_bundled_skills_for_startup", lambda: False)
     monkeypatch.setattr(mod, "_pin_kanban_board_env", lambda: None)
-    return mod
+    from agent.runtime_cwd import set_session_cwd
+
+    token = set_session_cwd(None)
+    try:
+        yield mod
+    finally:
+        token.var.reset(token)
 
 
 @pytest.fixture
@@ -277,3 +283,26 @@ def test_in_dir_leaves_unset_terminal_cwd_unset(main_mod, monkeypatch, tmp_path)
     main_mod._apply_in_dir(_args(in_dir=str(target)))
 
     assert "TERMINAL_CWD" not in os.environ
+
+
+def test_in_dir_survives_later_config_and_loads_requested_project(main_mod, monkeypatch, tmp_path):
+    from agent.prompt_builder import build_context_files_prompt
+    from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
+
+    configured = tmp_path / "configured"
+    target = tmp_path / "requested"
+    configured.mkdir()
+    target.mkdir()
+    (configured / "AGENTS.md").write_text("Configured directory instructions", encoding="utf-8")
+    (target / "AGENTS.md").write_text("Requested directory instructions", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    main_mod._apply_in_dir(_args(in_dir=str(target)))
+    # Agent construction can load terminal.cwd after argument normalization.
+    monkeypatch.setenv("TERMINAL_CWD", str(configured))
+
+    assert resolve_agent_cwd().resolve() == target.resolve()
+    context = build_context_files_prompt(cwd=str(resolve_context_cwd()), skip_soul=True)
+    assert "Requested directory instructions" in context
+    assert "Configured directory instructions" not in context
