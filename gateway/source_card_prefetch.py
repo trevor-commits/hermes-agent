@@ -855,16 +855,41 @@ def _source_card_message_row_id(
 
 
 
+def _source_card_worker_protocol_payload(loaded_skill: dict, skill_dir: Path) -> dict:
+    """Preload only Worker Mode for a v2 router; retain legacy skill support."""
+    if "references/intake-protocol.md" not in str(loaded_skill.get("content", "")):
+        return loaded_skill
+    root = _source_card_require_path(Path(skill_dir), label="skill directory", directory=True)
+    references = _source_card_require_path(
+        root / "references", label="worker reference directory", directory=True,
+    )
+    protocol = _source_card_read_utf8(
+        references / "intake-protocol.md",
+        label="worker protocol", max_bytes=14_000,
+    )
+    start = "<!-- SOURCE-CARD WORKER MODE START -->"
+    end = "<!-- SOURCE-CARD WORKER MODE END -->"
+    if protocol.count(start) != 1 or protocol.count(end) != 1:
+        raise RuntimeError("source_card_worker_protocol_markers_invalid")
+    left, right = protocol.index(start), protocol.index(end)
+    if right <= left or not protocol[left + len(start):right].strip():
+        raise RuntimeError("source_card_worker_protocol_markers_invalid")
+    return {**loaded_skill, "content": protocol[left:right + len(end)]}
+
+
 def _source_card_worker_reference_context(skill_dir: Path) -> str:
     """Load the exact three source-controlled worker references once."""
     root = _source_card_require_path(
         Path(skill_dir), label="skill directory", directory=True
     )
+    references = _source_card_require_path(
+        root / "references", label="worker reference directory", directory=True,
+    )
     sections = []
     total_bytes = 0
     for relative in _SOURCE_CARD_WORKER_REFERENCES:
         body = _source_card_read_utf8(
-            root / relative,
+            references / Path(relative).name,
             label=f"worker reference {relative}",
             max_bytes=_SOURCE_CARD_WORKER_REFERENCE_TOTAL_MAX_BYTES,
         )
