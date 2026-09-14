@@ -175,6 +175,7 @@ class TestEntryAndWsWiring:
 def test_concurrent_first_sockets_keep_loop_responsive_and_register_before_sweep(monkeypatch):
     import asyncio
     import threading
+    import json
     from tui_gateway import server, ws as ws_mod
 
     entered, release = threading.Event(), threading.Event()
@@ -195,10 +196,18 @@ def test_concurrent_first_sockets_keep_loop_responsive_and_register_before_sweep
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
 
     class Socket:
-        def __init__(self): self.ready = asyncio.Event()
+        def __init__(self):
+            self.ready, self.pong = asyncio.Event(), asyncio.Event()
+            self.reads = 0
         async def accept(self): pass
-        async def send_text(self, line): self.ready.set()
-        async def receive_text(self): raise ws_mod._WebSocketDisconnect()
+        async def send_text(self, line):
+            frame = json.loads(line)
+            if frame.get("id") == 1: self.pong.set()
+            else: self.ready.set()
+        async def receive_text(self):
+            self.reads += 1
+            if self.reads == 1: return json.dumps({"id": 1, "method": "gateway.ping"})
+            raise ws_mod._WebSocketDisconnect()
         async def close(self): pass
 
     async def scenario():
@@ -208,12 +217,14 @@ def test_concurrent_first_sockets_keep_loop_responsive_and_register_before_sweep
         try:
             assert await asyncio.to_thread(entered.wait, 1)
             two = asyncio.create_task(ws_mod.handle_ws(second))
-            await asyncio.wait_for(second.ready.wait(), .5)
+            await asyncio.wait_for(second.pong.wait(), .5)
             assert not registrations and not sweeps
         finally:
             release.set()
             await one
             if two is not None: await two
+            await asyncio.gather(*ws_mod._backend_startup_tasks)
+        assert not ws_mod._backend_startup_tasks
         assert len(registrations) == 1
         assert len(sweeps) == 2
     asyncio.run(scenario())
