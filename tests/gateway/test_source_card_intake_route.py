@@ -571,7 +571,7 @@ async def test_non_x_intake_dispatches_without_x_lookup(monkeypatch, tmp_path):
     monkeypatch.setattr(
         skill_commands,
         "_load_skill_payload",
-        MagicMock(return_value=("canonical skill", tmp_path, "Source Card Intake")),
+        MagicMock(return_value=({"content": "canonical skill"}, tmp_path, "Source Card Intake")),
     )
     monkeypatch.setattr(
         skill_commands,
@@ -762,8 +762,9 @@ async def test_active_turn_journal_failure_prevents_worker_dispatch(monkeypatch,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("progressive", [False, True])
 async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, progressive,
 ):
     import agent.skill_commands as skill_commands
     import gateway.run as gateway_run
@@ -837,10 +838,14 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
         def get_activity_summary(self):
             return {}
 
+    worker_protocol = "<!-- SOURCE-CARD WORKER MODE START -->\ntrusted worker rules\n<!-- SOURCE-CARD WORKER MODE END -->"
+    payload = {"content": "canonical skill"}
+    if progressive:
+        payload["content"] = "Read references/intake-protocol.md"
+        (tmp_path / "references" / "intake-protocol.md").write_text("parent-only\n" + worker_protocol + "\nreceipt-only")
     monkeypatch.setattr(
-        skill_commands,
-        "_load_skill_payload",
-        MagicMock(return_value=("canonical skill", tmp_path, "Source Card Intake")),
+        skill_commands, "_load_skill_payload",
+        MagicMock(return_value=(payload, tmp_path, "Source Card Intake")),
     )
 
     def _build_skill_message(skill, skill_dir, note):
@@ -975,6 +980,9 @@ async def test_worker_is_no_tool_bounded_and_dispatched_for_direct_delivery(
     assert "WORKER PACKET: gateway-prefetched" in built["skill_args"][2]
     assert "Never call skill_view or delegate_task" in built["skill_args"][2]
 
+    if progressive:
+        assert built["skill_args"][0]["content"] == worker_protocol
+
 
 @pytest.mark.asyncio
 async def test_oversized_preloaded_references_reject_before_dispatch(
@@ -991,7 +999,7 @@ async def test_oversized_preloaded_references_reject_before_dispatch(
     monkeypatch.setattr(
         skill_commands,
         "_load_skill_payload",
-        MagicMock(return_value=("canonical skill", tmp_path, "Source Card Intake")),
+        MagicMock(return_value=({"content": "canonical skill"}, tmp_path, "Source Card Intake")),
     )
     monkeypatch.setattr(
         skill_commands,
