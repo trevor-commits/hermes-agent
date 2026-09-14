@@ -1463,6 +1463,10 @@ def _apply_in_dir(args) -> None:
     # container backends keep their own remote/sandbox default).
     if os.environ.get("TERMINAL_CWD", "").strip():
         os.environ["TERMINAL_CWD"] = _target_dir
+    # Later config loading must not replace the user's explicit session directory.
+    from agent.runtime_cwd import set_session_cwd
+
+    set_session_cwd(_target_dir)
     args.no_restore_cwd = True
 
 
