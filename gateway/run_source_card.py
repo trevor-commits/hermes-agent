@@ -587,11 +587,14 @@ class GatewaySourceCardMixin:
             if not loaded:
                 raise RuntimeError("source-card-intake skill is not installed")
             loaded_skill, skill_dir, _display_name = loaded
+            from gateway.source_card_prefetch import _source_card_worker_protocol_payload
+
+            loaded_skill = _source_card_worker_protocol_payload(loaded_skill, skill_dir)
             note = (
                 "[TRUSTED GATEWAY ROUTE: This agent is the single focused "
                 "source-card worker. MODE: source-card-worker is authorized. "
                 "WORKER PACKET: gateway-prefetched is bound by this trusted system note. "
-                "The full canonical skill is loaded below. Never call "
+                "The applicable canonical worker protocol is loaded below. Never call "
                 "skill_view or delegate_task for this intake.]"
             )
             worker_system = _build_skill_message(loaded_skill, skill_dir, note)

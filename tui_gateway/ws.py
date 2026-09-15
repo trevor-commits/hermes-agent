@@ -261,6 +261,22 @@ class _SendFailed(Exception):
     """Raised by handle_ws._reply when a reply could not be written: ends the read loop."""
 
 
+# These tasks belong to the backend, not the socket that first connected.
+# Keep strong references until completion, including after a readiness probe disconnects.
+_backend_startup_tasks: set[asyncio.Task] = set()
+
+
+async def _start_backend_lifecycle() -> None:
+    for start, what in (
+        (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
+        (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
+    ):
+        try:
+            await asyncio.to_thread(start)
+        except Exception:
+            _log.warning("%s failed", what, exc_info=True)
+
+
 async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``. *auth_identity* is the server-minted
     ``{user_id, provider}`` recorded at WS-upgrade auth, stored as ``WSTransport.auth_identity`` (the only identity
@@ -308,14 +324,13 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # Cross-backend liveness: a heartbeat row lets the startup orphan sweep tell "live but idle
         # backend" from "truly orphaned". Idempotent and once-per-process, like the orphan sweep (the
         # desktop app and web dashboard reach the agent via this sidecar, not entry.main()).
-        for start, what in (
-            (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
-            (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
-        ):
-            try:
-                start()
-            except Exception:
-                _log.warning("%s failed", what, exc_info=True)
+        # Database initialization can take longer than the client's heartbeat deadline.
+        # Keep serving RPCs while it runs; the worker sequence preserves registration
+        # before orphan cleanup, and is independent of this socket's lifetime.
+        startup = asyncio.create_task(_start_backend_lifecycle())
+        _backend_startup_tasks.add(startup)
+        startup.add_done_callback(_backend_startup_tasks.discard)
+        await asyncio.sleep(0)  # admit the worker even when a readiness probe closes immediately
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1

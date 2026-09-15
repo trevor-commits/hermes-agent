@@ -1840,12 +1840,12 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
   })
 
-  it('RETRY CONTRACT: a resolved remote whose first renderer gateway dial fails retries even when main still reports stale non-retryable ready progress', async () => {
+  it.each(['local', 'remote'] as const)('RETRY CONTRACT: a resolved %s whose first renderer gateway dial fails retries even when main still reports stale non-retryable ready progress', async mode => {
     // Renderer reload against a saved direct remote: Electron has already
     // reported a successful backend.ready snapshot, so that stale progress
     // cannot classify the renderer-owned WebSocket dial which follows it.
     const desktop = fakeDesktop()
-    desktop.getConnection = vi.fn(async () => remotePrimaryConn)
+    desktop.getConnection = vi.fn(async () => ({ ...remotePrimaryConn, mode }))
     desktop.getBootProgress = vi.fn(async () => ({
       error: null,
       fakeMode: false,
@@ -1877,9 +1877,26 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
   })
 
-  it('RETRY CONTRACT: an invalid remote WebSocket URL is not a dial failure — it stays terminal under the stale ready snapshot', async () => {
+  it('local dial failures exhaust a bounded retry budget without restarting the backend', async () => {
     const desktop = fakeDesktop()
-    desktop.getConnection = vi.fn(async () => ({ ...remotePrimaryConn, wsUrl: 'not a WebSocket URL' }))
+    desktop.getConnection = vi.fn(async () => ({ ...remotePrimaryConn, mode: 'local' as const }))
+    desktop.getBootProgress = vi.fn(async () => ({ retryable: false }) as never)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    FakeWebSocket.mode = 'fail'
+    render(<Harness />)
+    await flushAsync()
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await advanceBackoff()
+    }
+    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    expect($desktopBoot.get().error).toBe('Could not connect to Hermes gateway')
+    await advanceBackoff()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+  })
+
+  it.each(['local', 'remote'] as const)('RETRY CONTRACT: an invalid %s WebSocket URL is not a dial failure — it stays terminal under the stale ready snapshot', async mode => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () => ({ ...remotePrimaryConn, mode, wsUrl: 'not a WebSocket URL' }))
     desktop.getGatewayWsUrl = vi.fn(async () => 'not a WebSocket URL')
     desktop.getBootProgress = vi.fn(async () => ({
       error: null,
@@ -1903,9 +1920,9 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect(desktop.getConnection).toHaveBeenCalledTimes(1)
   })
 
-  it('RETRY CONTRACT: a post-connect failure stays terminal even when its socket closes before boot catches it — a closed socket after a good dial is not a dial failure', async () => {
+  it.each(['local', 'remote'] as const)('RETRY CONTRACT: a post-connect failure stays terminal even when its socket closes before boot catches it — a closed socket after a good dial is not a dial failure (%s)', async mode => {
     const desktop = fakeDesktop()
-    desktop.getConnection = vi.fn(async () => remotePrimaryConn)
+    desktop.getConnection = vi.fn(async () => ({ ...remotePrimaryConn, mode }))
     desktop.getBootProgress = vi.fn(async () => ({
       error: null,
       fakeMode: false,
