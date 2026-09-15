@@ -1,8 +1,8 @@
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $previewTabs, closeRightRail, openPreview } from '@/store/preview'
 import { onComposerAttachImagesRequest } from '@/app/chat/composer/focus'
+import { $previewTabs, closeRightRail, openPreview } from '@/store/preview'
 import { $connection, $selectedStoredSessionId } from '@/store/session'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
