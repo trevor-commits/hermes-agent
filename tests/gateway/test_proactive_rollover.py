@@ -26,7 +26,7 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from hermes_state import SessionDB
 from hermes_state_errors import CompressionSessionClosedError
-from tests.gateway.test_42039_duplicate_user_message import (
+from tests.gateway.test_duplicate_user_message import (
     _bootstrap,
     _event,
     _source,

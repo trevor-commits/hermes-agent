@@ -20,7 +20,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.turn_lease import SessionTurnLeaseRegistry
-from tests.gateway.test_42039_duplicate_user_message import _bootstrap
+from tests.gateway.test_duplicate_user_message import _bootstrap
 
 
 def _composite_carrier(ask="REAL ASK"):
