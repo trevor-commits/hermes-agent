@@ -26,14 +26,6 @@ class TranscriptReadError(RuntimeError):
         super().__init__(f"transcript read failed for session {session_id}")
 
 
-def _plain_text(content) -> str:
-    """Text of a message content (str or text-part list); "" for anything else."""
-    if isinstance(content, list):
-        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-        return "\n".join(t for t in parts if t)
-    return content if isinstance(content, str) else ""
-
-
 def _spool_dropped(session_id: str, message: Dict[str, Any]):
     """Spool one evicted/undeliverable message to disk (same machinery as the shutdown flush, so it
     is replayed after DB recovery); path or None."""
@@ -420,6 +412,19 @@ class SessionTranscriptMixin:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def transcript_tail_role(self, session_id: str) -> Optional[str]:
+        """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
+        when empty, no DB, or the read fails — the boundary write would fail the same way)."""
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return None
+        try:
+            return db.latest_conversation_role(session_id)
+        except Exception:
+            logger.debug("transcript tail lookup failed for %s", session_id, exc_info=True)
+            return None
+
     def rewrite_transcript(
         self,
         session_id: str,
@@ -545,24 +550,16 @@ class SessionTranscriptMixin:
         *,
         require_retryable_composite: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Back up ``n`` user turns via soft-delete, keeping rows for audit.
-
-        Unlike :meth:`rewrite_transcript` (a hard replace used by /retry),
-        this flips the truncated rows to ``active=0`` in state.db so they
-        survive for audit and stay hidden from re-prompts and search. Mirrors
-        the CLI/TUI ``/undo [N]`` behavior via ``SessionDB.rewind_to_message``.
-
-        Returns a dict ``{"rewound_count", "turns_undone", "target_text"}`` on
-        success, or ``None`` if there's no DB or no user message to back up to.
-        ``n`` clamps to the oldest user turn when it exceeds the turn count.
-        ``require_retryable_composite`` is the gateway ``/retry`` guard: the
-        selected current turn must still be a composite carrier, and its live
-        payload must be losslessly replayable as text before anything changes.
-        """
+        """Back up ``n`` user turns via soft-delete (``active=0``), mirroring CLI ``/undo [N]``.
+        Returns ``{"rewound_count", "turns_undone", "target_text"}`` or ``None`` (no DB / no user
+        turn); ``n`` clamps to the oldest user turn. ``require_retryable_composite`` is the gateway
+        ``/retry`` guard: the selected turn must be a composite carrier whose live payload is
+        losslessly replayable as text before anything changes."""
         db = self._db_for_session_id(session_id)
         if not db:
             return None
         from hermes_state_errors import CompressionSessionClosedError
+        from hermes_state_rewind import RewindTargetUnavailableError
 
         with self._get_transcript_drain_lock():
             if n < 1:

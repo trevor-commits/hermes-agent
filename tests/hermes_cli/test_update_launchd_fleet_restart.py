@@ -40,10 +40,7 @@ from hermes_cli.update_cmd import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="launchd fleet restart is macOS-only; helpers use POSIX os.getuid",
-)
+pytestmark = pytest.mark.macos_only  # launchd fleet restart is macOS-only; helpers use POSIX os.getuid
 
 UID = 501
 
@@ -198,11 +195,12 @@ class TestProbeLaunchdDomainForLabel:
 
 class TestGetServicePidsScoping:
     def _wire(self, monkeypatch):
-        monkeypatch.setattr(gw, "is_macos", lambda: True)
         monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
-        # Hermetic: this Mac HAS the system-domain daemon plist, so the
-        # keeper-carried probe would leak its real PID into exact-set
-        # assertions. Pretend it's absent (upstream's assumption).
+        # The all_profiles branch also runs a real ``launchctl list`` prefix scan; a developer
+        # box with a live ai.hermes.gateway* fleet would leak its PIDs into the assertion.
+        # Hermetic: this Mac HAS the system-domain daemon plist, so the keeper-carried probe
+        # would also leak its real PID into exact-set assertions. Pretend it's absent.
+        monkeypatch.setattr(gw.subprocess, "run", lambda *a, **k: _completed(0, ""))
         monkeypatch.setattr(
             gw,
             "get_system_launchd_gateway_plist_path",
@@ -336,7 +334,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     monkeypatch.setattr(
         gw,
         "_graceful_restart_via_sigusr1",
-        lambda pid, drain_timeout: (rec.drains.append(pid), (drain_results or {}).get(pid, False))[1],
+        lambda pid, drain_timeout, **_: (rec.drains.append(pid), (drain_results or {}).get(pid, False))[1],
     )
 
     def fake_kickstart(label, domain):
@@ -703,16 +701,19 @@ class TestWaitForLaunchdServicePid:
         )
 
 
-class TestIncompleteWarningMentionsLaunchctl:
-    def test_launchd_labels_get_launchctl_hint(self, capsys, monkeypatch):
-        monkeypatch.setattr(gw, "is_macos", lambda: True)
+class TestIncompleteWarningOnMacos:
+    """On the launchd host the hint is bootstrap/list, never the systemd or the
+    ``kickstart`` line — a label in this list is likely deregistered (#88848)."""
+
+    def test_launchd_labels_get_bootstrap_hint(self, capsys):
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
         assert "launchctl bootstrap" in out
+        assert "systemctl" not in out
 
     def test_systemd_units_keep_systemctl_hint(self, capsys, monkeypatch):
-        monkeypatch.setattr(gw, "is_macos", lambda: False)
+        monkeypatch.setattr("hermes_cli.update_cmd_fleet.is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out
@@ -720,7 +721,7 @@ class TestIncompleteWarningMentionsLaunchctl:
 
 
 def test_system_daemon_warning_never_recommends_user_bootstrap(capsys, monkeypatch):
-    monkeypatch.setattr(gw, "is_macos", lambda: True)
+    monkeypatch.setattr("hermes_cli.update_cmd_fleet.is_macos", lambda: True)
     _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway.daemon"])
     out = capsys.readouterr().out
     assert "system/ai.hermes.gateway.daemon" in out

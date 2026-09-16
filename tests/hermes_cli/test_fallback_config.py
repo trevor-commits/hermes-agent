@@ -1,7 +1,11 @@
 """Tests for hermes_cli/fallback_config.py."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import get_fallback_chain, resolve_entry_api_key
+from hermes_cli.fallback_config import (
+    effective_runtime_provider,
+    get_fallback_chain,
+    resolve_entry_api_key,
+)
 
 
 class TestResolveEntryApiKey:
@@ -53,3 +57,30 @@ def test_recovers_legacy_json_encoded_fallback_list():
         "openai-codex",
         "nous",
     ]
+
+class TestEffectiveRuntimeProvider:
+    """Named custom fallback entries must keep their configured identity (#98739)."""
+
+    def test_named_custom_entry_keeps_configured_id(self):
+        entry = {"provider": "my-custom-provider", "model": "some-model"}
+        runtime = {"provider": "custom", "requested_provider": "my-custom-provider"}
+        assert effective_runtime_provider(entry, runtime) == "my-custom-provider"
+
+    def test_requested_provider_missing_falls_back_to_entry(self):
+        entry = {"provider": "my-custom-provider", "model": "some-model"}
+        runtime = {"provider": "custom"}
+        assert effective_runtime_provider(entry, runtime) == "my-custom-provider"
+
+    def test_builtin_provider_untouched(self):
+        entry = {"provider": "openrouter", "model": "glm"}
+        runtime = {"provider": "openrouter", "requested_provider": "openrouter"}
+        assert effective_runtime_provider(entry, runtime) == "openrouter"
+
+    def test_genuinely_bare_custom_stays_custom(self):
+        # Ad-hoc endpoint: user literally configured provider: custom.
+        entry = {"provider": "custom", "model": "some-model"}
+        runtime = {"provider": "custom", "requested_provider": "custom"}
+        assert effective_runtime_provider(entry, runtime) == "custom"
+
+    def test_none_inputs_are_safe(self):
+        assert effective_runtime_provider(None, None) == ""

@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.auxiliary_client import _CodexCompletionsAdapter, _CodexStreamGuard
+from agent.auxiliary_client import _CodexCompletionsAdapter
 
 
 def _adapter_with_recording_client(stream):
@@ -33,8 +33,6 @@ def _adapter_with_recording_client(stream):
     class _Sock:
         def shutdown(self, how):
             events.append(("shutdown", threading.get_ident()))
-            if hasattr(stream, "wake"):
-                stream.wake.set()
 
         def close(self):
             events.append(("sock.close", threading.get_ident()))
@@ -55,21 +53,11 @@ def _adapter_with_recording_client(stream):
                 _pool=SimpleNamespace(_connections=[_Conn()])
             )
 
-    class _Stream:
-        response = SimpleNamespace(extensions={"network_stream": SimpleNamespace(_sock=sock)})
-
-        def __iter__(self):
-            return iter(stream)
-
-        def close(self):
-            events.append(("stream.close", threading.get_ident()))
-            stream.close()
-
     class _LeafClient:
         def __init__(self):
             self._client = _Client()
             self.base_url = "https://chatgpt.com/backend-api/codex"
-            self.responses = SimpleNamespace(create=lambda **kw: _Stream())
+            self.responses = SimpleNamespace(create=lambda **kw: stream)
 
         def close(self):
             events.append(("client.close", threading.get_ident()))
@@ -83,17 +71,15 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         shutdown(); the real close() must land on the owning thread in the
         adapter's ``finally``."""
 
-        class _Stalled:
-            wake = threading.Event()
+        def _one_keepalive_then_block():
+            # Let the owner process one keepalive, then keep it inside the
+            # stream past the watchdog window.  The Timer is consequently
+            # the only deadline observer that can win this timeout.
+            yield SimpleNamespace(type="response.in_progress")
+            time.sleep(1.0)
+            yield SimpleNamespace(type="response.in_progress")
 
-            def __iter__(self):
-                assert self.wake.wait(timeout=5), "watchdog did not wake the reader"
-                raise RuntimeError("socket shut down")
-
-            def close(self):
-                pass
-
-        adapter, events = _adapter_with_recording_client(_Stalled())
+        adapter, events = _adapter_with_recording_client(_one_keepalive_then_block())
         owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):
@@ -123,7 +109,7 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         # close() from a stranger thread is the corruption vector — banned.
         stranger_closes = [
             (a, tid) for a, tid in events
-            if a in {"client.close", "sock.close", "stream.close"} and tid != owner_tid
+            if a in {"client.close", "sock.close"} and tid != owner_tid
         ]
         assert not stranger_closes, f"stranger-thread FD release: {stranger_closes}"
         # The owning thread released the FDs on unwind.
@@ -174,39 +160,3 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         stranger = [(a, t) for a, t in events if t != owner_tid]
         assert not stranger, f"non-owner activity: {stranger}"
         assert ("client.close", owner_tid) in events, events
-
-
-@pytest.mark.parametrize("timeout_won", [True, False])
-def test_real_sdk_response_is_closed_only_by_its_owner(timeout_won):
-    import httpx
-    from openai import OpenAI, Stream
-
-    events = []
-    owner_tid = threading.get_ident()
-
-    class Body(httpx.SyncByteStream):
-        def __iter__(self):
-            return iter(())
-
-        def close(self):
-            events.append(("close", threading.get_ident()))
-
-    sock = SimpleNamespace(shutdown=lambda how: events.append(("shutdown", threading.get_ident())))
-    response = httpx.Response(200, stream=Body(), extensions={
-        "network_stream": SimpleNamespace(_sock=sock),
-    })
-    with OpenAI(api_key="test", base_url="https://example.test") as client:
-        stream = Stream(cast_to=object, response=response, client=client)
-        guard = _CodexStreamGuard(client, 1)
-        guard._protected_cancel_check = SimpleNamespace(begin_timeout_cleanup=lambda: timeout_won)
-        guard.adopt_stream(stream)
-        timer = threading.Thread(target=guard._close_client_on_timeout)
-        timer.start()
-        timer.join(timeout=5)
-        assert not timer.is_alive()
-        assert events == [("shutdown", timer.ident)]
-        assert not response.is_closed
-        guard.release_stream(stream)
-        guard.finish()
-        assert events[-1] == ("close", owner_tid)
-        assert response.is_closed

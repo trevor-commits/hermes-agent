@@ -58,21 +58,23 @@ def test_obsolete_orphan_cannot_replace_new_detachment(monkeypatch, phase):
     server._schedule_ws_orphan_reap(sid)
     old = timers[-1]
     if phase == "cold_resume_claim":
-        # A cold resume must reuse the live turn after an orphan poll.
-        session.update(session_key=sid, history=[], history_lock=threading.Lock(), agent=None)
-        transport = object()
-        monkeypatch.setattr(server, "current_transport", lambda: transport)
-        monkeypatch.setattr(server, "_resolve_model", lambda: "test")
+        # A cold resume missed the live lookup before a concurrent resume won.
+        # Its claim discovers that winner while orphan interrupt I/O is in flight.
+        session["session_key"] = sid
+        monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 0)
+        replies = []
+
+        def resume_during_interrupt(*a, **kw):
+            ctx = server._Resume(1, {}, sid)
+            replies.append(ctx.claim("unused", {}))
+
+        monkeypatch.setattr(server, "_interrupt_session_turn", resume_during_interrupt)
         old.callback()
-        ctx = server._Resume(1, {"omit_messages": True}, sid)
-        response = ctx.claim("unused", {})
-        assert "error" not in response
-        assert response["result"]["session_id"] == sid
-        assert session["transport"] is transport
-        assert session["running"]
-        assert not session.get("_client_gone_interrupt_requested")
-        assert sid not in server._pending_ws_reaps
+        assert replies[0]["error"]["code"] == 4009
+        assert session["transport"] is server._detached_ws_transport
+        assert session["_client_gone_interrupt_requested"]
         assert len(timers) == 2
+        assert server._pending_ws_reaps[sid] is timers[-1]
         return
 
     def redetach():
@@ -84,17 +86,14 @@ def test_obsolete_orphan_cannot_replace_new_detachment(monkeypatch, phase):
     if phase == "before_callback":
         newest = redetach()
     else:
-        # Reconnect/redetach wins after the old poll releases its resume lock,
-        # before that callback registers its continuation.
-        class ResumeLock:
-            def __enter__(self):
-                pass
-
-            def __exit__(self, *args):
-                nonlocal newest
-                newest = redetach()
-
-        monkeypatch.setattr(server, "_session_resume_lock", ResumeLock())
+        # Interrupt I/O runs outside the resume lock. A reconnect/redetach
+        # can win before the old callback registers its next poll.
+        monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 0)
+        def interrupt(*a, **kw):
+            nonlocal newest
+            session.pop("_client_gone_interrupt_requested", None)
+            newest = redetach()
+        monkeypatch.setattr(server, "_interrupt_session_turn", interrupt)
         newest = None
     old.callback()
     assert server._pending_ws_reaps[sid] is newest
@@ -102,7 +101,7 @@ def test_obsolete_orphan_cannot_replace_new_detachment(monkeypatch, phase):
 
 
 @pytest.mark.parametrize("transition", ["retire", "redetach"])
-def test_orphan_poll_preserves_work_and_retires_legacy_interrupt_claim(monkeypatch, transition):
+def test_orphan_interrupt_claim_clears_when_session_leaves_detached_state(monkeypatch, transition):
     timers = []
 
     class Timer:
@@ -128,23 +127,19 @@ def test_orphan_poll_preserves_work_and_retires_legacy_interrupt_claim(monkeypat
 
     server._schedule_ws_orphan_reap(sid)
     timers[0].callback()
-    assert not session.get("_client_gone_interrupt_requested")
-    assert session["running"]
+    assert session["_client_gone_interrupt_requested"]
 
-    session["_client_gone_interrupt_requested"] = True
-    session["_client_gone_interrupt_polls"] = 7
     session["transport"] = object()
     if transition == "redetach":
         # The bypass writer disconnects before the old settlement can retire.
         assert server._close_sessions_for_transport(session["transport"]) == (0, 1)
         timers[2].callback()
-        assert not session.get("_client_gone_interrupt_requested")
-        assert "_client_gone_interrupt_polls" not in session
+        assert session["_client_gone_interrupt_requested"]
+        assert session["_client_gone_interrupt_polls"] == 1
         replacement = server._pending_ws_reaps[sid]
         timers[1].callback()
         assert server._pending_ws_reaps[sid] is replacement
-        assert not session.get("_client_gone_interrupt_requested")
-        assert session["running"]
+        assert session["_client_gone_interrupt_requested"]
         return
     timers[1].callback()
 
@@ -156,7 +151,7 @@ def test_orphan_poll_preserves_work_and_retires_legacy_interrupt_claim(monkeypat
 
 @pytest.mark.parametrize("path", ["unpersisted", "reuse", "eager", "activate", "prompt"])
 @pytest.mark.parametrize("claim", ["already_claimed", "wins_lock", "retired"])
-def test_reconnect_preserves_live_work_and_refuses_retired_records(monkeypatch, path, claim):
+def test_reconnect_cannot_cross_orphan_interrupt_claim(monkeypatch, path, claim):
     sid = "interrupt-race"
     session = dict(transport=server._detached_ws_transport, running=True,
                    history_lock=threading.Lock(), history=[], session_key="stored",
@@ -204,17 +199,11 @@ def test_reconnect_preserves_live_work_and_refuses_retired_records(monkeypatch, 
     elif path == "reuse":
         response = server._resume_reuse_live(ctx, sid, session)
     else:
-        name = {"activate": "session.activate", "prompt": "prompt.submit"}[path]
+        name, extra = {"activate": ("session.activate", {"omit_messages": True}),
+                       "prompt": ("prompt.submit", {"text": "continue"})}[path]
         response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": name,
-                                          "params": {"session_id": sid, "text": "continue", "omit_messages": True}})
-    if claim == "retired":
-        assert response.get("error", {}).get("code") == 4007
-        assert session["transport"] is server._detached_ws_transport
-        assert sid in server._pending_ws_reaps
-    else:
-        assert "error" not in response
-        assert session["transport"] is transport
-        assert sid not in server._pending_ws_reaps
-        assert session["running"]
-        assert not session.get("_turn_cancel_requested")
+                                          "params": {"session_id": sid, **extra}})
+    assert response.get("error", {}).get("code") == (4007 if claim == "retired" else 4009)
+    assert session["transport"] is server._detached_ws_transport
+    assert sid in server._pending_ws_reaps
     assert session["queued_prompt"] is None

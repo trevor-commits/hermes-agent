@@ -1,0 +1,19 @@
+{
+ "base": "upstream/main",
+ "base_tip": "7eb5c2fce7bdc77860d8c1dfbc586aef11c929e3",
+ "conflicts": [
+  "agent/agent_init.py",
+  "agent/credential_pool.py",
+  "agent/models_dev.py",
+  "agent/prompt_builder.py",
+  "agent/title_generator.py",
+  "agent/tool_executor.py",
+  "apps/desktop/src/app/session/hooks/profile-rail-fresh-chat-owner.test.tsx",
+  "apps/desktop/src/app/session/hooks/use-session-actions/index.ts",
+  "apps/desktop/src/components/assistant-ui/thread/system-message.tsx",
+  "apps/desktop/src/lib/chat-runtime.ts"
+ ],
+ "drift": 2280,
+ "state": "conflict",
+ "updated_at": "2026-09-16T15:10:14-0700"
+}

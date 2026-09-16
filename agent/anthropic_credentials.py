@@ -18,7 +18,6 @@ import logging
 import os
 import platform
 import secrets
-import stat
 import subprocess
 import threading
 import time
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 from agent.secret_scope import get_secret as _get_secret
 
 logger = logging.getLogger(__name__)
@@ -82,22 +82,9 @@ def _load_json_if_exists(path: Path, what: str) -> Optional[Any]:
 
 
 def _atomic_write_private_json(path: Path, payload: Any) -> None:
-    """Write *payload* via a 0o600 O_EXCL temp file + fsync + os.replace: the token is never briefly umask-readable
-    (write_text + chmod had a TOCTOU window); the random suffix avoids collisions with concurrent writers and
-    crashed leftovers. The parent dir's mode is left alone (~/.claude/ is owned by Claude Code)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-    try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        raise
+    """0600-from-creation temp file + fsync + atomic replace (the token is never briefly umask-readable).
+    The parent dir's mode is left alone (~/.claude/ is owned by Claude Code)."""
+    atomic_json_write(path, payload, mode=0o600)
 
 
 def _commit_private_json(path: Path, payload: Any, what: str) -> None:
@@ -492,17 +479,6 @@ def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
 
 
-def _root_hermes_oauth_file() -> Optional[Path]:
-    """Global-root ``.anthropic_oauth.json`` inside a named profile (None in classic mode); used to commit a
-    rotation of a grant the profile borrowed via the pool's root fallback."""
-    try:
-        from hermes_constants import get_default_hermes_root
-        root = get_default_hermes_root()
-        return None if root.resolve(strict=False) == get_hermes_home().resolve(strict=False) else root / ".anthropic_oauth.json"
-    except Exception:
-        return None
-
-
 def _generate_pkce() -> tuple:
     """Generate PKCE code_verifier and code_challenge (S256)."""
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
@@ -572,14 +548,13 @@ def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
 
 
 def _write_hermes_oauth_credentials(
-    access_token: str, refresh_token: Optional[str], expires_at_ms: Optional[int], *, target: Optional[Path] = None
+    access_token: str, refresh_token: Optional[str], expires_at_ms: Optional[int],
 ) -> None:
-    """Commit refreshed hermes_pkce tokens to ~/.hermes/.anthropic_oauth.json (``CredentialPersistError`` on failure).
-    ``target`` lets a named profile commit a grant it BORROWED from the global root back to the ROOT singleton
-    instead of forking a copy under its own HERMES_HOME; without this write-through the next ``load_pool()``
-    re-seeds the stale (consumed) pair from the file over the rotated pool entry."""
+    """Commit refreshed hermes_pkce tokens to ``<HERMES_HOME>/.anthropic_oauth.json`` (``CredentialPersistError``
+    on failure); without it the next ``load_pool()`` re-seeds the stale (consumed) pair from the file over the
+    rotated pool entry."""
     _commit_private_json(
-        target if target is not None else _get_hermes_oauth_file(),
+        _get_hermes_oauth_file(),
         {"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at_ms},
         "Hermes OAuth credentials",
     )
