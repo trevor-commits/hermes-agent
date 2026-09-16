@@ -2045,6 +2045,13 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         if err:
             return err
         agent = session.get("agent")
+        # busy_input_mode=queue: the desktop Enter-while-busy path routes through session.redirect, which
+        # historically bypassed display.busy_input_mode and always injected mid-turn. Honor the setting:
+        # queue mode means the user's message must wait for the next turn, never steer the live one.
+        if verb == "redirect" and session.get("running") and _load_busy_input_mode() == "queue":
+            _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+            session["last_active"] = time.time()
+            return _ok(rid, {"status": "queued", "text": text})
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
         # a misleading 4010 the client swallows into a lost follow-up.
         if verb == "redirect" and agent is None and session.get("running"):

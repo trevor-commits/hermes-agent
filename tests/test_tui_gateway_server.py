@@ -12378,6 +12378,38 @@ def test_session_redirect_queues_during_agent_build_window(monkeypatch):
     assert session["queued_prompt"]["text"] == "wait, use SQLite"
 
 
+def test_session_redirect_queues_when_busy_input_mode_is_queue(monkeypatch):
+    # busy_input_mode=queue: the desktop Enter-while-busy path routes through
+    # session.redirect, which historically bypassed display.busy_input_mode
+    # and always injected mid-turn. Queue mode means the user's message must
+    # wait for the next turn — never steer the live one, even for an agent
+    # that fully supports active-turn redirect.
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    injected = []
+    agent = types.SimpleNamespace(
+        model="model-live",
+        _supports_active_turn_redirect=True,
+        redirect=lambda text: injected.append(text),
+    )
+    session = _session(running=True, agent=agent)
+    server._sessions["sid"] = session
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.redirect",
+                "params": {"session_id": "sid", "text": "wait, use SQLite"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"] == {"status": "queued", "text": "wait, use SQLite"}
+    queued = session.get("queued_prompt")
+    assert queued is not None and queued["text"] == "wait, use SQLite"
+    assert injected == []
+
+
 def test_session_redirect_rejects_when_idle_without_agent(monkeypatch):
     # No live turn and no agent: nothing to redirect, and we must not queue a
     # phantom turn — keep the explicit unsupported rejection.
