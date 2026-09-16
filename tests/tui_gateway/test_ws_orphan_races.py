@@ -204,7 +204,8 @@ def test_reconnect_preserves_live_work_and_refuses_retired_records(monkeypatch, 
     elif path == "reuse":
         response = server._resume_reuse_live(ctx, sid, session)
     else:
-        name = {"activate": "session.activate", "prompt": "prompt.submit"}[path]
+        name, extra = {"activate": ("session.activate", {"omit_messages": True}),
+                       "prompt": ("prompt.submit", {"text": "continue"})}[path]
         response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": name,
                                           "params": {"session_id": sid, "text": "continue", "omit_messages": True}})
     if claim == "retired":

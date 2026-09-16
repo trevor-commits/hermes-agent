@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from hermes_state_ids import new_session_id
+
 if TYPE_CHECKING:
     from gateway.session import SessionEntry, SessionSource
 
@@ -24,7 +26,7 @@ def _now() -> datetime:
 
 
 def _new_session_id(now: datetime) -> str:
-    return f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    return new_session_id(now, hex_len=8)
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:

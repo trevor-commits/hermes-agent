@@ -11,7 +11,7 @@ import pytest
 from gateway import run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionEntry
-from tests.gateway.test_42039_duplicate_user_message import (
+from tests.gateway.test_duplicate_user_message import (
     _bootstrap,
     _event,
     _source,

@@ -26,14 +26,6 @@ class TranscriptReadError(RuntimeError):
         super().__init__(f"transcript read failed for session {session_id}")
 
 
-def _plain_text(content) -> str:
-    """Text of a message content (str or text-part list); "" for anything else."""
-    if isinstance(content, list):
-        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-        return "\n".join(t for t in parts if t)
-    return content if isinstance(content, str) else ""
-
-
 def _spool_dropped(session_id: str, message: Dict[str, Any]):
     """Spool one evicted/undeliverable message to disk (same machinery as the shutdown flush, so it
     is replayed after DB recovery); path or None."""
@@ -420,6 +412,19 @@ class SessionTranscriptMixin:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def transcript_tail_role(self, session_id: str) -> Optional[str]:
+        """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
+        when empty, no DB, or the read fails — the boundary write would fail the same way)."""
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return None
+        try:
+            return db.latest_conversation_role(session_id)
+        except Exception:
+            logger.debug("transcript tail lookup failed for %s", session_id, exc_info=True)
+            return None
+
     def rewrite_transcript(
         self,
         session_id: str,
@@ -563,7 +568,7 @@ class SessionTranscriptMixin:
         if not db:
             return None
         from hermes_state_errors import CompressionSessionClosedError
-
+        from hermes_state_rewind import RewindTargetUnavailableError
         with self._get_transcript_drain_lock():
             if n < 1:
                 n = 1

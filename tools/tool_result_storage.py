@@ -37,7 +37,7 @@ _UNTRUSTED_FRAME_OPEN = re.compile(
 _UNTRUSTED_FRAME_CLOSE = "\n</untrusted_tool_result>"
 
 _spillover_prune_lock = threading.Lock()
-_spillover_pruned_once = False
+_spillover_pruned_homes: set = set()  # profile home keys already swept this process
 
 
 def get_spillover_dir():
@@ -66,12 +66,15 @@ def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int
 
 
 def _prune_spillover_once() -> None:
-    """Best-effort prune, at most once per process (CLI-only installs never run housekeeping)."""
-    global _spillover_pruned_once
+    """Best-effort prune, at most once per process PER PROFILE HOME (CLI-only installs never run
+    housekeeping; a multiplexed gateway must sweep every profile's ``cache/spillover``, not just the
+    first one that spilled)."""
+    from hermes_constants import hermes_home_key
+    home_key = hermes_home_key()
     with _spillover_prune_lock:
-        if _spillover_pruned_once:
+        if home_key in _spillover_pruned_homes:
             return
-        _spillover_pruned_once = True
+        _spillover_pruned_homes.add(home_key)
     try:
         if removed := cleanup_spillover_cache():
             logger.debug("Pruned %d expired spillover file(s)", removed)

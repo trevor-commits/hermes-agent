@@ -24,7 +24,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from tests.gateway.test_42039_duplicate_user_message import (
+from tests.gateway.test_duplicate_user_message import (
     _bootstrap,
     _source,
 )
