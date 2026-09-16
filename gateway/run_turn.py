@@ -635,26 +635,32 @@ class GatewayTurnMixin:
         if _lease_token is not None:
             self._session_state(_quick_key).turn.lease_tokens[run_generation] = _lease_token
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens=None):
         """Acquire the final session before flags, context or transcript state is consumed.
 
         A contended alias re-resolves after acquisition because the preceding holder may have
         committed a continuation. The outer handler releases the token by run generation.
+        ``_session_env_tokens`` matches the upstream signature: a lease-wait timeout must
+        restore the task-local env tokens before propagating (the cleanup finally starts later).
         """
         from gateway.run import _float_env
-        registry = getattr(self, "_turn_leases", None)
-        if registry is None:
+        _lease_registry = getattr(self, "_turn_leases", None)
+        if _lease_registry is None:
             return session_entry
-        token = await registry.acquire(
-            session_entry.session_id, owner_key=_quick_key, generation=run_generation,
-            timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
-        )
-        if token is None:
-            return session_entry
-        state = self._session_state(_quick_key).turn
-        state.lease_token, state.lease_generation = token, run_generation
-        if not getattr(token, "contended", False):
-            return session_entry
+        try:
+            _lease_token = await _lease_registry.acquire(
+                session_entry.session_id, owner_key=_quick_key, generation=run_generation,
+                timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+            )
+        except TurnLeaseTimeoutError:
+            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
+            self._clear_session_env(_session_env_tokens)
+            raise
+        if _lease_token is not None:
+            state = self._session_state(_quick_key).turn
+            state.lease_tokens[run_generation] = _lease_token
+            if not getattr(_lease_token, "contended", False):
+                return session_entry
         waited_session_id = session_entry.session_id
         refreshed = await self.async_session_store.resolve_session_after_turn_lease_wait(
             session_entry.session_key, waited_session_id,
