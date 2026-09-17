@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
   return {
     activeProfile: makeAtom('default'),
     gatewayState: makeAtom<'closed' | 'open'>('closed'),
+    dismissNotification: vi.fn(),
     getHermesConfigRecord: vi.fn(),
     notify: vi.fn(),
     setMcpServerEnabled: vi.fn().mockResolvedValue({ ok: true }),
@@ -49,6 +50,7 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@/store/notifications', () => ({
+  dismissNotification: mocks.dismissNotification,
   notify: mocks.notify,
   notifyError: vi.fn()
 }))
@@ -63,6 +65,7 @@ vi.mock('@/store/session', () => ({
 }))
 
 const { shouldNotify, startMcpHealthChecker, stopMcpHealthChecker } = await import('./mcp-health')
+const { probeCache } = await import('@/lib/mcp-probe-cache')
 
 type Status = 'error' | 'needs-auth' | 'ok'
 
@@ -70,8 +73,11 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 
 afterEach(() => {
   stopMcpHealthChecker()
+  probeCache.clear()
+  window.localStorage.clear()
   mocks.gatewayState.set('closed')
   mocks.activeProfile.set('default')
+  mocks.dismissNotification.mockReset()
   mocks.getHermesConfigRecord.mockReset()
   mocks.notify.mockReset()
   mocks.testMcpServer.mockReset()
@@ -156,6 +162,65 @@ it('shows the toast with Sign in + Disable, then stays quiet for a day and re-nu
     toast.secondaryAction.onClick()
     await flush()
     expect(mocks.setMcpServerEnabled).toHaveBeenCalledWith('linear', false)
+  } finally {
+    nowSpy.mockRestore()
+  }
+})
+
+// Keeper port (adapted to the snooze design): a snoozed server is not re-nudged
+// by background sweeps until the snooze lapses; when a later sweep observes
+// recovery, the standing toast is dismissed. A later failure then re-nudges
+// immediately because recovery is a transition from ok.
+it('dismisses the toast without re-nudging when a later sweep observes recovery', async () => {
+  const servers = { mcp_servers: { linear: { url: 'https://mcp.linear.app/mcp', auth: 'oauth' } } }
+  mocks.getHermesConfigRecord.mockResolvedValue(servers)
+  mocks.testMcpServer
+    .mockResolvedValueOnce({ ok: false, error: 'OAuth: authorization required', tools: [] })
+    .mockResolvedValueOnce({ ok: false, error: 'OAuth: authorization required', tools: [] })
+    .mockResolvedValue({ ok: true, tools: [] })
+  window.localStorage.clear()
+
+  let clock = 1_700_000_000_000
+  const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
+
+  try {
+    startMcpHealthChecker()
+    mocks.gatewayState.set('open')
+    await flush()
+    await flush()
+    expect(mocks.notify).toHaveBeenCalledTimes(1)
+
+    // While snoozed, a reconnect sweep still probes (probe-cache economy only)
+    // but must not re-nudge.
+    clock += 60 * 60 * 1000
+    mocks.gatewayState.set('closed')
+    mocks.gatewayState.set('open')
+    await flush()
+    await flush()
+    expect(mocks.notify).toHaveBeenCalledTimes(1)
+    expect(mocks.testMcpServer).toHaveBeenCalledTimes(2)
+    expect(mocks.dismissNotification).not.toHaveBeenCalled()
+
+    // After the snooze lapses, the sweep probes again, sees the server healthy,
+    // and dismisses the standing toast instead of nudging.
+    clock += 24 * 60 * 60 * 1000
+    mocks.gatewayState.set('closed')
+    mocks.gatewayState.set('open')
+    await flush()
+    await flush()
+    expect(mocks.testMcpServer).toHaveBeenCalledTimes(3)
+    expect(mocks.dismissNotification).toHaveBeenCalledWith('mcp-health-default::linear')
+    expect(mocks.notify).toHaveBeenCalledTimes(1)
+
+    // A later failure re-nudges immediately: recovery cleared the standing
+    // bad-state memory, so ok → needs-auth is a fresh transition.
+    clock += 60 * 60 * 1000
+    mocks.testMcpServer.mockResolvedValue({ ok: false, error: 'OAuth: authorization required', tools: [] })
+    mocks.gatewayState.set('closed')
+    mocks.gatewayState.set('open')
+    await flush()
+    await flush()
+    expect(mocks.notify).toHaveBeenCalledTimes(2)
   } finally {
     nowSpy.mockRestore()
   }
