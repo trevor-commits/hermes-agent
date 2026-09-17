@@ -1564,21 +1564,10 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
         _pf_reason = None
     if not _pf_reason:
         return None
-    return _blocked_config_result(job_id, job_name, _pf_reason)
-
-
-def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
-    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job."""
     logger.warning(
         "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
         job_name, job_id, _pf_reason)
-    # Keeper refactored this into the shared (job, reason) helper below (alert-once +
-    # optional preflight-disable); upstream kept the inline body with newer copy. Route
-    # through the shared helper so both wrapper call sites keep one implementation.
-    return _blocked_config_result(
-        {"id": job_id, "name": job_name, "prompt": job_name}, _pf_reason,
-        allow_preflight_disable=True)
-    already_alerted = False
+    return _blocked_config_result(job, _pf_reason, allow_preflight_disable=True)
 
 
 def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[dict, str]:
@@ -2261,7 +2250,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     if _cron_preflight_enabled(_cfg):
         _mcp_reason = _empty_requested_mcp_toolsets(job, _cfg)
         if _mcp_reason:
-            setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
+            setup.blocked = _blocked_config_result(job, _mcp_reason)
     return setup
 
 
