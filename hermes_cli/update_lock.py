@@ -263,7 +263,7 @@ def describe_holder(holder: UpdateHolder | None) -> str:
         started = f"started {elapsed} ago"
     return (
         f"✗ Another Hermes update is already running (PID {holder.pid}, "
-        f"started {elapsed} ago).\n"
+        f"{started}).\n"
         "\n"
         "  Running two at once would corrupt the install. Wait for it to finish\n"
         "  (watch `hermes logs`), or close the Desktop/dashboard window that\n"
