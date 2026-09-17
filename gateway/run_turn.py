@@ -2116,6 +2116,18 @@ class GatewayTurnMixin:
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        # Source-card intake short-circuits BEFORE the turn lease (keeper feature, not upstream):
+        # it never runs an agent turn, and tests drive _handle_message_with_agent directly, so a
+        # lease taken here would only be released by _handle_message's finally (bypassed in tests).
+        from gateway.run_source_card import _is_source_card_intake_event
+        if _is_source_card_intake_event(event, source):
+            _active_turn_marked = await self._mark_durable_active_turn(event, session_entry.session_key)
+            return (
+                await self._handle_source_card_intake_event(
+                    event, source, session_entry, _active_turn_marked,
+                ),
+                _session_env_tokens,
+            )
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
