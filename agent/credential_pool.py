@@ -2328,7 +2328,19 @@ def get_env_credential(key: str, *, provider: Optional[str] = None) -> Tuple[str
 
     # Native profile auth already borrows root pool rows. Env-backed rows only
     # persist references, so hydrate those references from their owning .env.
-    root_path = _global_auth_file_path()
+    #
+    # UNRESOLVED KEEPER/UPSTREAM DIVERGENCE — fail closed, do not crash.
+    # The root resolver (`_global_auth_file_path`) and its store loader
+    # (`auth._load_global_auth_store`) were deleted upstream by the #111724
+    # ruling that profiles are credential islands, while keeper still carries
+    # this shared-access path and its tests. Until that is reconciled, degrade
+    # to the scoped value instead of raising NameError — which took the whole
+    # model picker (`GET /api/model/options`) down with it. Restoring the two
+    # helpers in `hermes_cli/auth.py` re-enables borrowing here with no edit.
+    root_resolver = getattr(auth_mod, "_global_auth_file_path", None)
+    if root_resolver is None or getattr(auth_mod, "_load_global_auth_store", None) is None:
+        return scoped_value, ""
+    root_path = root_resolver()
     if root_path is None:
         return scoped_value, ""
     pconfig = PROVIDER_REGISTRY.get(provider)
