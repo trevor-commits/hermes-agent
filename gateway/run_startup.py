@@ -239,7 +239,10 @@ class GatewayStartupMixin:
         ``_send_restart_notification`` and ``_redeliver_pending_obligations`` used to be awaited inline
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
-        from gateway.run import _startup_restore_drain_timeout_secs
+        from gateway.run import (
+            _clear_planned_restart_notification,
+            _startup_restore_drain_timeout_secs,
+        )
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:

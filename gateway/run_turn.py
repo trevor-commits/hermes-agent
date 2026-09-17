@@ -628,12 +628,7 @@ class GatewayTurnMixin:
                 skill_names,
                 exc,
             )
-        except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
-            self._clear_session_env(_session_env_tokens)
-            raise
-        if _lease_token is not None:
-            self._session_state(_quick_key).turn.lease_tokens[run_generation] = _lease_token
+            return False
 
     async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens=None):
         """Acquire the final session before flags, context or transcript state is consumed.

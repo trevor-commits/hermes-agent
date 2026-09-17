@@ -480,6 +480,60 @@ def _auth_file_path() -> Path:
     return path
 
 
+def _global_auth_file_path() -> Optional[Path]:
+    """Global-root auth.json in profile mode; None when profile and global root are the same dir.
+
+    Read-only fallback path, so no pytest seat belt here (it lives on ``_auth_file_path()``).
+    Keeper shared-profile access (e038df38e2 / runbook) hydrates env-backed pool
+    references from this root store. Upstream #111724 removed the write-through
+    inheritance path; this helper is read-only and never copies secrets.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        global_root = get_default_hermes_root()
+    except Exception:
+        return None
+    return None if _same_path(get_hermes_home(), global_root) else global_root / "auth.json"
+
+
+# mtime-keyed memo for _load_global_auth_store(): (path, mtime_ns, store)
+_global_auth_store_cache: Optional[Tuple[str, int, Dict[str, Any]]] = None
+
+
+def _load_global_auth_store() -> Dict[str, Any]:
+    """Load the global-root auth store (read-only fallback, mtime-memoised); ``{}`` when absent or
+    unreadable — a malformed global store must never break profile reads."""
+    global _global_auth_store_cache
+    global_path = _global_auth_file_path()
+    if global_path is None or not global_path.exists():
+        _global_auth_store_cache = None
+        return {}
+    try:
+        cache_key: Optional[Tuple[str, int]] = (
+            str(global_path.resolve(strict=False)), global_path.stat().st_mtime_ns)
+    except Exception:
+        cache_key = None
+    cached = _global_auth_store_cache
+    if cache_key is not None and cached is not None and cached[:2] == cache_key:
+        return cached[2]
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("HOME"):
+        real_root = Path(os.environ["HOME"]) / ".hermes" / "auth.json"
+        try:
+            if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                _global_auth_store_cache = None
+                return {}
+        except Exception:
+            pass
+    try:
+        store = _load_auth_store(global_path)
+    except Exception:
+        _global_auth_store_cache = None
+        return {}
+    if cache_key is not None:
+        _global_auth_store_cache = (*cache_key, store)
+    return store
+
+
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
 
@@ -766,16 +820,34 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 
 
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
-    """Return the persisted credential pool of the ACTIVE store, or one provider slice.
+    """Return the persisted credential pool, or one provider slice.
 
-    A named profile reads only its own ``auth.json``: credentials authenticated at the root are
-    not inherited (#111724) — ``hermes -p <name> auth add <provider>`` gives the profile its own."""
+    In profile mode the global-root ``auth.json`` is a read-only fallback applied per
+    provider ONLY when the profile has zero entries for it (``hermes auth add`` in the
+    profile shadows global). This is keeper shared-model-access, not write-through:
+    callers never persist into the root store from this path. Upstream #111724 removed
+    write-through inheritance; read-only borrowing remains the runbook contract.
+    """
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
+    global_pool = _load_global_auth_store().get("credential_pool")
+    global_pool = global_pool if isinstance(global_pool, dict) else {}
+
     if provider_id is None:
-        return dict(pool)
-    entries = pool.get(provider_id)
-    return list(entries) if isinstance(entries, list) else []
+        merged = dict(pool)
+        for gp_key, gp_entries in global_pool.items():
+            existing = merged.get(gp_key)
+            if not (isinstance(gp_entries, list) and gp_entries):
+                continue
+            if not (isinstance(existing, list) and existing):
+                merged[gp_key] = list(gp_entries)
+        return merged
+
+    provider_entries = pool.get(provider_id)
+    if isinstance(provider_entries, list) and provider_entries:
+        return list(provider_entries)
+    global_entries = global_pool.get(provider_id)
+    return list(global_entries) if isinstance(global_entries, list) else []
 
 
 _POOL_STATUS_FIELDS = (
