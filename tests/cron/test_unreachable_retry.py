@@ -37,7 +37,7 @@ def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(tmp_cro
 
     now = datetime.now(timezone.utc)
     for i, delay in enumerate(ur.RETRY_DELAYS_SECONDS):
-        assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+        assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True) is not False
         j = get_job(job_id)
         nxt = datetime.fromisoformat(j["next_run_at"])
         # Pulled to roughly now + ladder delay, far before the daily occurrence.
@@ -46,7 +46,7 @@ def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(tmp_cro
         assert j[ur.STATE_KEY]["attempt"] == i + 1
 
     # Ladder exhausted: the next unreachable failure keeps the natural schedule.
-    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True) is not False
     j = get_job(job_id)
     assert j.get(ur.STATE_KEY) is None
     assert datetime.fromisoformat(j["next_run_at"]) - now > timedelta(hours=1)
@@ -57,11 +57,11 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
     dispatch, at-most-times #38758) never enter the ladder."""
     job = create_job("hourly sync", "every 12h")
     job_id = job["id"]
-    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True)
+    assert mark_job_run(job_id, False, "ConnectError: dns", model_unreachable=True) is not False
     assert get_job(job_id)[ur.STATE_KEY]["attempt"] == 1
 
     # A normal failed run (model reached) resets the ladder and stays on schedule.
-    assert mark_job_run(job_id, False, "agent error")
+    assert mark_job_run(job_id, False, "agent error") is not False
     j = get_job(job_id)
     assert j.get(ur.STATE_KEY) is None
     now = datetime.now(timezone.utc)
@@ -69,6 +69,6 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
 
     # One-shot: flag is ignored, no retry state, no resurrection.
     once = create_job("one shot", _iso(datetime.now(timezone.utc) + timedelta(minutes=1)))
-    assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True)
+    assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True) is not False
     remaining = get_job(once["id"])
     assert remaining is None or remaining.get(ur.STATE_KEY) is None

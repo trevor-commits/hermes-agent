@@ -713,7 +713,7 @@ class TestIncompleteWarningOnMacos:
         assert "systemctl" not in out
 
     def test_systemd_units_keep_systemctl_hint(self, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.update_cmd_fleet.is_macos", lambda: False)
+        monkeypatch.setattr(gw, "is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out
@@ -721,7 +721,7 @@ class TestIncompleteWarningOnMacos:
 
 
 def test_system_daemon_warning_never_recommends_user_bootstrap(capsys, monkeypatch):
-    monkeypatch.setattr("hermes_cli.update_cmd_fleet.is_macos", lambda: True)
+    monkeypatch.setattr(gw, "is_macos", lambda: True)
     _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway.daemon"])
     out = capsys.readouterr().out
     assert "system/ai.hermes.gateway.daemon" in out
