@@ -642,6 +642,9 @@ class GatewayTurnMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return session_entry
+        existing = self._session_state(_quick_key).turn.lease_tokens.get(run_generation)
+        if existing is not None and not getattr(existing, "released", False):
+            return session_entry
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
@@ -2111,13 +2114,12 @@ class GatewayTurnMixin:
         from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
-        # Session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
         # Source-card intake short-circuits BEFORE the turn lease (keeper feature, not upstream):
         # it never runs an agent turn, and tests drive _handle_message_with_agent directly, so a
         # lease taken here would only be released by _handle_message's finally (bypassed in tests).
         from gateway.run_source_card import _is_source_card_intake_event
         if _is_source_card_intake_event(event, source):
+            _session_env_tokens = self._set_session_env(context)
             _active_turn_marked = await self._mark_durable_active_turn(event, session_entry.session_key)
             return (
                 await self._handle_source_card_intake_event(
@@ -2125,6 +2127,12 @@ class GatewayTurnMixin:
                 ),
                 _session_env_tokens,
             )
+        # Lease precedes session-context installation so a rejected waiter
+        # has no task-local environment to unwind.
+        session_entry = await self._hmwa_acquire_turn_lease(
+            _quick_key, run_generation, session_entry, None,
+        )
+        _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
@@ -2146,8 +2154,6 @@ class GatewayTurnMixin:
         _auto = getattr(event, "auto_skill", None)
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
-
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
@@ -2289,7 +2295,9 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
-        session_entry = await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry)
+        # Lease is taken inside `_hmwa_prepare_turn` (after source-card
+        # short-circuit, before transcript load). A second acquire here
+        # deadlocks the same generation against its own lock.
         session_key = session_entry.session_key
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
