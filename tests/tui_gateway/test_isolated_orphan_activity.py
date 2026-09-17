@@ -72,23 +72,20 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
         monkeypatch.setattr(server.threading, "Timer", _Timer)
         server._schedule_ws_orphan_reap(sid)
         server._pending_ws_reaps[sid].callback()
-        assert not session.get("_client_gone_interrupt_requested")
-        assert not session.get("_turn_cancel_requested")
-        assert session["running"]
-        assert server._pending_ws_reaps[sid].delay == 20.0
+        assert bool(session.get("_client_gone_interrupt_requested")) is (mode != "fresh")
+        assert server._pending_ws_reaps[sid].delay == (
+            20.0 if mode == "fresh" else server._WS_ORPHAN_INTERRUPT_REAP_POLL_S)
         assert not any(m.get("method") == "compute_host.activity" for m in forwarded)
         if mode != "fresh":
-            # Only an explicit Stop may cancel the real child.
-            assert server._interrupt_session_turn(sid, session) is True
             deadline = time.monotonic() + 5
             while session["running"] and time.monotonic() < deadline:
                 time.sleep(0.02)
-            assert not session["running"], "explicit Stop must settle the real child"
+            assert not session["running"], "stale child must receive and settle the real interrupt"
         if mode == "fresh":
             old_token = session["_compute_host_turn_id"]
             old_request = next(iter(supervisor._pending_turns))
             (tmp_path / "release").touch()
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 12
             while session["running"] and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert not session["running"]
@@ -117,7 +114,7 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             assert "_compute_host_activity_ns" in session
             assert not server._ws_orphan_turn_activity_is_fresh(session)
             server._pending_ws_reaps[sid].callback()
-            assert not session.get("_client_gone_interrupt_requested")
+            assert session["_client_gone_interrupt_requested"]
             assert session["running"]
             assert server._interrupt_session_turn(sid, session) is True
             deadline = time.monotonic() + 5

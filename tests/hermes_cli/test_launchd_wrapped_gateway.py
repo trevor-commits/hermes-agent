@@ -51,7 +51,7 @@ def wrapped_gateway(monkeypatch):
 def test_wrapped_gateway_drains_child_and_waits_for_wrapper_exit(wrapped_gateway, monkeypatch):
     signals, waits = [], []
     monkeypatch.setattr(gw.os, "kill", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda pid, timeout: waits.append((pid, timeout)) or True)
+    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda pid, timeout, **kw: waits.append((pid, timeout)) or True)
 
     assert gw._graceful_restart_via_sigusr1(200, 17.0)
     assert signals == [(202, signal.SIGUSR1)]
@@ -78,7 +78,7 @@ def test_wrapper_restart_requires_one_gateway_child(wrapped_gateway, monkeypatch
     wrapped_gateway.child_pids = children
     signals = []
     monkeypatch.setattr(gw.os, "kill", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda *a: True)
+    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda *a, **k: True)
 
     result = gw._graceful_restart_via_sigusr1(200, 1.0)
     assert result is expected
@@ -88,7 +88,7 @@ def test_wrapper_restart_requires_one_gateway_child(wrapped_gateway, monkeypatch
 def test_direct_gateway_still_receives_restart(wrapped_gateway, monkeypatch):
     signals = []
     monkeypatch.setattr(gw.os, "kill", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda *a: True)
+    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda *a, **k: True)
     assert gw._graceful_restart_via_sigusr1(202, 1.0)
     assert signals == [(202, signal.SIGUSR1)]
 
@@ -102,7 +102,7 @@ def test_current_profile_restart_compares_wrapper_generation(wrapped_gateway, mo
     monkeypatch.setattr(gw, "probe_gateway_loop_liveness", lambda pid: gw.GATEWAY_LOOP_ALIVE)
     monkeypatch.setattr(gw, "_get_restart_exit_wait_budget", lambda: 17.0)
     monkeypatch.setattr(gw.os, "kill", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda pid, timeout: waits.append(pid) or True)
+    monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda pid, timeout, **kw: waits.append(pid) or True)
     monkeypatch.setattr(gw, "_wait_for_launchd_service_pid", lambda label, old_pid, **kw: verified.append(old_pid) or True)
     monkeypatch.setattr(gw, "_clear_launchd_unsupported_marker", lambda: None)
 

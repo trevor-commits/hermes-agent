@@ -247,7 +247,7 @@ class ComputeHost:
             while run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
                     run_thread.join(timeout=1.0)
-                    while run_thread.is_alive() and frame.get("turn_id"):
+                    if run_thread.is_alive() and frame.get("turn_id"):
                         self._emit_turn_activity(sid, session, frame["turn_id"], turn_started_at)
                 next_thread = session.get("_run_thread")
                 if next_thread is run_thread:

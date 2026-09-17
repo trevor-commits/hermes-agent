@@ -166,7 +166,7 @@ def test_reconnect_cannot_cross_orphan_interrupt_claim(monkeypatch, path, claim)
     monkeypatch.setattr(server, "_legacy_group_fence_error", lambda *a: None)
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a: False)
     monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
-    monkeypatch.setattr(server, "_handle_busy_submit", lambda *a, **kw: {"result": {"queued": True}})
+    monkeypatch.setattr(server, "_handle_busy_submit", lambda *a, **kw: {"result": {"status": "queued"}})
     monkeypatch.setattr(server, "_sess", lambda *a: (session, None))
 
     class ResumeLock:

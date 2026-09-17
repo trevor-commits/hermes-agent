@@ -819,14 +819,34 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
+def _is_oauth_pool_entry(entry: Any) -> bool:
+    """True when a pool row is an OAuth / single-use grant, not a shareable API key."""
+    return isinstance(entry, dict) and str(entry.get("auth_type") or "").strip().lower() == "oauth"
+
+
+def _borrowable_root_pool_entries(entries: Any) -> List[Dict[str, Any]]:
+    """Root-store rows a named profile may read: API keys and env refs, never OAuth grants."""
+    if not isinstance(entries, list):
+        return []
+    return [dict(e) for e in entries if isinstance(e, dict) and not _is_oauth_pool_entry(e)]
+
+
+def _root_oauth_entry_ids(entries: Any) -> set:
+    return {
+        e.get("id")
+        for e in (entries if isinstance(entries, list) else [])
+        if _is_oauth_pool_entry(e) and e.get("id")
+    }
+
+
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode the global-root ``auth.json`` is a read-only fallback applied per
     provider ONLY when the profile has zero entries for it (``hermes auth add`` in the
-    profile shadows global). This is keeper shared-model-access, not write-through:
-    callers never persist into the root store from this path. Upstream #111724 removed
-    write-through inheritance; read-only borrowing remains the runbook contract.
+    profile shadows global). Keeper shared-model-access borrows API keys and env-backed
+    refs. It never inherits OAuth / single-use grants (#111724) and never writes through
+    to the root store.
     """
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
@@ -837,17 +857,17 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         merged = dict(pool)
         for gp_key, gp_entries in global_pool.items():
             existing = merged.get(gp_key)
-            if not (isinstance(gp_entries, list) and gp_entries):
+            borrowable = _borrowable_root_pool_entries(gp_entries)
+            if not borrowable:
                 continue
             if not (isinstance(existing, list) and existing):
-                merged[gp_key] = list(gp_entries)
+                merged[gp_key] = borrowable
         return merged
 
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
         return list(provider_entries)
-    global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    return _borrowable_root_pool_entries(global_pool.get(provider_id))
 
 
 _POOL_STATUS_FIELDS = (
@@ -931,6 +951,19 @@ def write_credential_pool(
             disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
             if disk_id and disk_id not in new_ids and disk_id not in removed:
                 merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+        if _global_auth_file_path() is not None:
+            global_pool = _load_global_auth_store().get("credential_pool")
+            global_pool = global_pool if isinstance(global_pool, dict) else {}
+            borrowed_oauth_ids = _root_oauth_entry_ids(global_pool.get(provider_id))
+            local_oauth_ids = _root_oauth_entry_ids(existing_list)
+            merged = [
+                e for e in merged
+                if not (
+                    _is_oauth_pool_entry(e)
+                    and e.get("id") in borrowed_oauth_ids
+                    and e.get("id") not in local_oauth_ids
+                )
+            ]
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
 

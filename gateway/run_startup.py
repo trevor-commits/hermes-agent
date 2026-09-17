@@ -239,19 +239,13 @@ class GatewayStartupMixin:
         ``_send_restart_notification`` and ``_redeliver_pending_obligations`` used to be awaited inline
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
-        from gateway.run import (
-            _clear_planned_restart_notification,
-            _startup_restore_drain_timeout_secs,
-        )
+        from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
             if planned_restart_notification_pending:
-                try:
-                    await self._replay_pending_planned_restart_notification()
-                finally:
-                    _clear_planned_restart_notification()
+                await self._replay_pending_planned_restart_notification()
             elif unclean_startup and not chat_restart_notification_pending:
                 # Previous gateway was killed (SIGTERM/OOM/crash), not restarted
                 # cleanly. Keeper behavior (2026-07-30): keep the recovery

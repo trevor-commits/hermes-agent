@@ -722,6 +722,9 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float, *, on_progress
     except (PermissionError, OSError):
         return False
 
+    # Keep waiting for the service wrapper too: launchd cannot respawn it
+    # until the child has drained and the logger has flushed and exited.
+    return _wait_for_pid_exit(pid, max(drain_timeout, 1.0), on_progress=on_progress)
 
 
 def _wait_for_pid_exit(pid: int, timeout: float, *, on_progress=None) -> bool:

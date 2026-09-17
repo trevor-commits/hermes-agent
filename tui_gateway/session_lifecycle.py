@@ -503,9 +503,11 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
 
 
 def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
-    """Under the resume lock, refuse a stale record; live work may always reattach."""
+    """Under the resume lock, refuse a stale record or a still-settling client-gone interrupt."""
     if _sessions.get(sid) is not session:
         return _err(rid, 4007, "session no longer live; retry resume")
+    if session.get("_client_gone_interrupt_requested"):
+        return _err(rid, 4009, "session disconnect interrupt settling")
     return None
 
 
@@ -560,7 +562,7 @@ def _schedule_ws_orphan_reap(
     def _reap() -> None:
         # Serialize the re-check against session.resume (rebinds under _session_resume_lock). Claim teardown by popping
         # under both locks, then release the resume lock before slow finalization. Order: resume_lock -> sessions_lock.
-        reschedule_delay = session = None
+        reschedule_delay = interrupt_session = session = None
         with _session_resume_lock, _sessions_lock:
             # Keep ownership through interrupt I/O and continuation registration. A cancelled
             # callback may already be dispatched, but cannot act on a later detachment.
@@ -579,16 +581,51 @@ def _schedule_ws_orphan_reap(
                 current.pop("_client_gone_interrupt_polls", None)
                 _pending_ws_reaps.pop(sid, None)
                 return
-            session = _pop_session_by_id(sid, predicate=lambda s: _session_is_lru_evictable(sid, s))
-            if session is None:
-                # Transport loss never cancels work. Retain one timer until
-                # completion makes the detached session eligible for cleanup.
+            if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            elif not current.get("running"):
+                if current.get("_client_gone_interrupt_requested"):
+                    session = _pop_session_by_id(sid)
+                else:
+                    session = _pop_session_by_id(
+                        sid, predicate=lambda s: _session_is_lru_evictable(sid, s))
+                    if session is None:
+                        reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            elif not current.get("_client_gone_interrupt_requested") and _ws_orphan_turn_activity_is_fresh(current):
+                logger.debug(
+                    "client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",
+                    sid, _WS_ORPHAN_ACTIVITY_STALE_S)
+                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            else:
+                polls = current["_client_gone_interrupt_polls"] = int(
+                    current.get("_client_gone_interrupt_polls") or 0) + 1
+                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                    logger.error(
+                        "client_gone sid=%s: turn did not settle after %d interrupt polls (%.0fs) — force-reaping detached session",
+                        sid, polls - 1, (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S)
+                    session = _pop_session_by_id(sid)
+                else:
+                    if not current.get("_client_gone_interrupt_requested"):
+                        current["_client_gone_interrupt_requested"] = True
+                        interrupt_session = current
+                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             if reschedule_delay is None:
                 _pending_ws_reaps.pop(sid, None)
+        if interrupt_session is not None:
+            try:
+                isolated = _interrupt_session_turn(sid, interrupt_session, request_id=f"client-gone-{sid}")
+                logger.info("client_gone sid=%s action=interrupt turn_isolation=%s", sid, isolated)
+            except Exception:
+                logger.exception("client_gone interrupt failed sid=%s", sid)
+                with _sessions_lock:
+                    if (_sessions.get(sid) is interrupt_session
+                            and _pending_ws_reaps.get(sid) is timer):
+                        interrupt_session.pop("_client_gone_interrupt_requested", None)
         if reschedule_delay is not None:
             _schedule_ws_orphan_reap(sid, delay_s=reschedule_delay, _expected_timer=timer)
             return
+        if session is not None and session.get("_client_gone_interrupt_requested"):
+            logger.info("client_gone sid=%s action=reap", sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
     with _sessions_lock:

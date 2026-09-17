@@ -243,3 +243,23 @@ def test_explicit_runtime_endpoint_requires_its_own_key(shared_profile):
         explicit_api_key="fixture-explicit",
     )
     assert (resolved["api_key"], resolved["base_url"]) == ("fixture-explicit", "https://other.example/v1")
+
+def test_empty_profile_borrows_root_api_keys_not_oauth(shared_profile):
+    """Shared access is API keys / env refs only. Root OAuth grants stay on the root store."""
+    root, profile = shared_profile
+    store = json.loads((root / "auth.json").read_text())
+    store["credential_pool"]["anthropic"] = [{
+        "id": "root-oat", "source": "manual:hermes_pkce", "auth_type": "oauth",
+        "access_token": "sk-ant-oat01-ROOT", "refresh_token": "sk-ant-ort-ROOT",
+        "priority": 0,
+    }]
+    (root / "auth.json").write_text(json.dumps(store))
+    assert auth.read_credential_pool("anthropic") == []
+    assert cp.load_pool("anthropic").select() is None
+    selected = cp.load_pool("deepseek").peek()
+    assert selected is not None
+    assert selected.runtime_api_key == "fixture-alpha"
+    if (profile / "auth.json").exists():
+        payload = (profile / "auth.json").read_text()
+        assert "sk-ant-oat01-ROOT" not in payload
+        assert "sk-ant-ort-ROOT" not in payload

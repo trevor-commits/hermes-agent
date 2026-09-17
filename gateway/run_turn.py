@@ -648,8 +648,10 @@ class GatewayTurnMixin:
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
             )
         except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
-            self._clear_session_env(_session_env_tokens)
+            # Restore only when this waiter installed task-local env. Lease-first
+            # dispatch has nothing to unwind.
+            if _session_env_tokens is not None:
+                self._clear_session_env(_session_env_tokens)
             raise
         if _lease_token is not None:
             state = self._session_state(_quick_key).turn
