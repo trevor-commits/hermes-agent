@@ -5016,7 +5016,11 @@ def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
 
 
 def test_session_resume_rebinds_running_turn_after_disconnect_grace(monkeypatch):
+    """Restored disconnect-interrupt contract: a detached RUNNING turn gets a
+    client-gone interrupt at grace; while it settles, resume is fenced with a
+    bounded 4009; once the turn stops, the reaper reaps and the flag goes with it."""
     callbacks = []
+    torn_down = []
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -5028,14 +5032,6 @@ def test_session_resume_rebinds_running_turn_after_disconnect_grace(monkeypatch)
         def cancel(self):
             return None
 
-    class _DB:
-        def get_session(self, session_id):
-            assert session_id == "stored-sid"
-            return {"id": session_id, "cwd": "/tmp"}
-
-        def resolve_resume_session_id(self, session_id):
-            return session_id
-
     live_transport = object()
     session = _session(
         session_key="stored-sid",
@@ -5044,32 +5040,35 @@ def test_session_resume_rebinds_running_turn_after_disconnect_grace(monkeypatch)
         history=[{"role": "assistant", "content": "still working"}],
     )
     server._sessions["live-sid"] = session
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "current_transport", lambda: live_transport)
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server, "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
 
     try:
         server._schedule_ws_orphan_reap("live-sid")
+        # First reap pass: opaque agent (no readable activity) is not fresh, so the
+        # restored contract requests the client-gone interrupt and polls for settling.
         callbacks.pop(0)()
-        response = server.handle_request(
-            {
-                "id": "resume-after-grace",
-                "method": "session.resume",
-                "params": {"session_id": "stored-sid"},
-            }
-        )
-
-        assert response is not None
-        assert "error" not in response
-        assert response["result"]["session_id"] == "live-sid"
-        assert session["transport"] is live_transport
-        assert session["running"] is True
-        assert session["history"] == [{"role": "assistant", "content": "still working"}]
+        assert session.get("_client_gone_interrupt_requested") is True
+        # Still settling: the fence answers 4009 — the reaper owns the session.
+        with server._session_resume_lock:
+            refusal = server._reattach_refusal("rid", "live-sid", session)
+        assert refusal is not None and refusal["error"]["code"] == 4009
+        assert server._sessions.get("live-sid") is session
+        # Settlement poll observes the turn stopped: the session is reaped
+        # (flag is not cleared in place — the record leaves the registry).
+        session["running"] = False
+        callbacks.pop(0)()
+        assert "live-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
         assert "live-sid" not in server._pending_ws_reaps
     finally:
         server._sessions.pop("live-sid", None)
-
+        server._pending_ws_reaps.pop("live-sid", None)
 
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
@@ -5170,15 +5169,22 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
 @pytest.mark.parametrize("unfinished", ["building", "approval", "queued", "queued_tail"])
 def test_passive_reapers_preserve_unfinished_session(monkeypatch, unfinished):
     """Disconnect, TTL and capacity cleanup share the same work protections."""
+    from tui_gateway import server_requests
+
     sid = "unfinished-session"
     callbacks = []
     torn_down = []
     session = _session(transport=server._detached_ws_transport)
     ready = threading.Event()
+    open_req = None
     if unfinished == "building":
         session.update(agent_ready=ready, agent_build_started=True)
     elif unfinished == "approval":
-        server._pending["unfinished-approval"] = (sid, threading.Event())
+        # Upstream split the server→client request registry out of server.py
+        # (99433742dc): an unanswered clarify is seeded in server_requests.
+        open_req = server_requests.ServerRequest(sid, "clarify", {})
+        with server_requests._lock:
+            server_requests._open[open_req.id] = open_req
     elif unfinished == "queued":
         session["queued_prompt"] = {"text": "run the next step"}
     else:
@@ -5208,7 +5214,9 @@ def test_passive_reapers_preserve_unfinished_session(monkeypatch, unfinished):
         assert torn_down == []
 
         ready.set()
-        server._pending.pop("unfinished-approval", None)
+        if open_req is not None:
+            with server_requests._lock:
+                server_requests._open.pop(open_req.id, None)
         session.pop("queued_prompt", None)
         session.pop("queued_prompts", None)
         callbacks.pop(0)()
@@ -5216,7 +5224,9 @@ def test_passive_reapers_preserve_unfinished_session(monkeypatch, unfinished):
         assert torn_down == [session]
     finally:
         server._sessions.pop(sid, None)
-        server._pending.pop("unfinished-approval", None)
+        if open_req is not None:
+            with server_requests._lock:
+                server_requests._open.pop(open_req.id, None)
         server._pending_ws_reaps.pop(sid, None)
 
 

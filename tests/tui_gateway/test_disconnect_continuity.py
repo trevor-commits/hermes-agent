@@ -73,8 +73,15 @@ def test_websocket_reconnect_preserves_live_session_and_explicit_stop(tmp_path, 
             interrupt=lambda: interrupted.append(True), model="gpt-6-astra",
             provider="openai-codex", reasoning_config={"effort": "ultra"},
             service_tier="priority",
+            # Healthy detached work: a fresh activity clock defers the
+            # client-gone interrupt (restored #98028 contract).
+            get_activity_summary=lambda: {"seconds_since_activity": 0.5},
         ),
         "_compute_host_active": hosted,
+        # Hosted mirrors the child's activity clock under its dispatch token; a
+        # fresh sample defers the interrupt there too.
+        "_compute_host_turn_id": "reconnect-dispatch" if hosted else None,
+        "_compute_host_activity_ns": time.perf_counter_ns() if hosted else None,
         "model_override": {"model": "gpt-6-astra", "provider": "openai-codex"} if hosted else None,
         "create_reasoning_override": {"effort": "low" if mirrored else "ultra"},
         "create_service_tier_override": "priority",

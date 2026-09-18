@@ -215,10 +215,14 @@ def test_reattach_does_not_adopt_foreign_or_retired_generations(runtime):
     with server._session_resume_lock:
         assert server._reattach_refusal(1, "ui-owner", {**owner})["error"]["code"] == 4007
         owner["_client_gone_interrupt_requested"] = True
-        # Transport loss no longer interrupts live work. A legacy flag cannot
-        # fence the current owner; the foreign-record assertion above still rejects.
-        assert server._reattach_refusal(1, "ui-owner", owner) is None
+        # A still-settling client-gone interrupt fences reattach with a bounded 4009
+        # (restored disconnect-interrupt contract, 81039e1d8e): the reaper owns the
+        # session until its polls observe the turn settled (or force-reap past the cap).
+        refusal = server._reattach_refusal(1, "ui-owner", owner)
+        assert refusal is not None and refusal["error"]["code"] == 4009
+        # Settlement clears the claim; the same owner may then reattach freely.
         del owner["_client_gone_interrupt_requested"]
+        assert server._reattach_refusal(1, "ui-owner", owner) is None
         server._rebind_live_transport("ui-owner", owner, new)
     assert call("subagent.list", via=new)["result"]["subagents"] == []
     for sid in ("foreign", "retired"):
