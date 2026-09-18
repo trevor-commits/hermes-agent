@@ -590,8 +590,7 @@ def _schedule_ws_orphan_reap(
                     # background work that must outlive the request (#100325 retention). Blocked means
                     # keep polling until the exemption lifts.
                     session = _pop_session_by_id(
-                        sid, predicate=lambda s: not s.get("_compute_host_active")
-                        and not _session_has_active_delegations(sid, s))
+                        sid, predicate=lambda s: not s.get("_compute_host_active"))
                     if session is None:
                         reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
                 else:

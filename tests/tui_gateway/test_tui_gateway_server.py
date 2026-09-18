@@ -4962,8 +4962,13 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         session["running"] = False
         callbacks.pop(0)()
 
+        # Retention (#100325): a settled client-gone turn never auto-reaps a hosted
+        # return route; the reaper keeps polling until the explicit close lifts it.
+        assert server._sessions.get("isolated-sid") is session
+        assert torn_down == []
+        server._close_session_by_id("isolated-sid", end_reason="tui_close")
         assert "isolated-sid" not in server._sessions
-        assert torn_down == [(session, "ws_orphan_reap")]
+        assert torn_down == [(session, "tui_close")]
     finally:
         server._sessions.pop("isolated-sid", None)
 
