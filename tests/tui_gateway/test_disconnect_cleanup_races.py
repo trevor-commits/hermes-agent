@@ -73,9 +73,11 @@ class _PausedQueueClaim(dict):
 @pytest.fixture
 def cleanup_env(monkeypatch):
     closed = []
+    from tui_gateway import server_requests
     monkeypatch.setattr(server, "_sessions", {})
     monkeypatch.setattr(server, "_pending_ws_reaps", {})
-    monkeypatch.setattr(server, "_pending", {})
+    # The server→client request registry lives in server_requests since 99433742dc.
+    monkeypatch.setattr(server_requests, "_open", {})
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_a: False)
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 1)

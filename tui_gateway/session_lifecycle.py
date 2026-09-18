@@ -585,7 +585,15 @@ def _schedule_ws_orphan_reap(
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("running"):
                 if current.get("_client_gone_interrupt_requested"):
-                    session = _pop_session_by_id(sid)
+                    # Settled client-gone turn: reclaim unconditionally EXCEPT the hard work exemptions
+                    # (hosted return route, active delegations) — a settled interrupt never retires
+                    # background work that must outlive the request (#100325 retention). Blocked means
+                    # keep polling until the exemption lifts.
+                    session = _pop_session_by_id(
+                        sid, predicate=lambda s: not s.get("_compute_host_active")
+                        and not _session_has_active_delegations(sid, s))
+                    if session is None:
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
                 else:
                     session = _pop_session_by_id(
                         sid, predicate=lambda s: _session_is_lru_evictable(sid, s))

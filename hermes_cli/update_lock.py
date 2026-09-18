@@ -262,7 +262,7 @@ def describe_holder(holder: UpdateHolder | None) -> str:
         elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
         started = f"started {elapsed} ago"
     return (
-        f"✗ Another Hermes update is already running (PID {holder.pid}, "
+        f"✗ Another Hermes update is already running (process {holder.pid}, "
         f"{started}).\n"
         "\n"
         "  Running two at once would corrupt the install. Wait for it to finish\n"

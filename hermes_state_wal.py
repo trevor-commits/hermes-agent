@@ -214,7 +214,10 @@ def _mountinfo_fstype(directory: str, mountinfo_path: str = "/proc/self/mountinf
 
 def _detect_cross_vm_fs(directory: str, mountinfo_path: str = "/proc/self/mountinfo") -> bool:
     """True only when ``directory`` sits on a virtiofs/9p mount per ``mountinfo_path``."""
-    if sys.platform != "linux":
+    if sys.platform != "linux" and mountinfo_path == "/proc/self/mountinfo":
+        # No /proc on macOS/BSD: the real probe cannot run there. An explicit
+        # mountinfo_path (tests, containerized callers pointing at a captured
+        # /proc mountinfo) still exercises the pure parser below.
         return False
     return _mountinfo_fstype(directory, mountinfo_path) in _CROSS_VM_FSTYPES
 

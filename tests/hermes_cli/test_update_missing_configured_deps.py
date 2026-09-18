@@ -55,8 +55,10 @@ def test_configured_features_probe_reads_the_fresh_target_interpreter(tmp_path, 
     def probe(python, script, *args, env=None, prelude=""):
         return real_probe(python, prelude + script, *args, env=env)
 
+    # The registry check_fn is metadata-based (passive contract, #79812): poison the
+    # lazy-deps satisfaction verdict instead of sys.modules, which no longer bites.
     monkeypatch.setattr(main_install_repair, "_venv_probe",
-                        lambda p, s, *a, env=None: probe(p, s, *a, env=env, prelude="import sys; sys.modules['lark_oapi'] = None\n"))
+                        lambda p, s, *a, env=None: probe(p, s, *a, env=env, prelude="import tools.lazy_deps as ld; ld._is_satisfied = lambda spec: False\n"))
     missing = main_install_repair._configured_features_missing_deps(["uv", "pip"], env=env)
     assert [feature for feature, _hint in missing] == ["Feishu / Lark"]
 
