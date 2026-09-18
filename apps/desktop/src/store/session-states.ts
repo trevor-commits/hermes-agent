@@ -777,14 +777,11 @@ export interface SessionTile {
   ownerProfile?: string
   /** Credential-free exact route used to resume this tab after relaunch. */
   ownerRoute?: SessionOwnerRoute
-  /** Profile-pool owner captured at creation, when no registry route was used. */
-  ownerProfile?: string
   /** Stable title for hidden relationship chats absent from the Sessions list. */
   workspaceTabTitle?: string
 }
 
 export interface SessionTileWorkspaceScope {
-  ownerProfile?: string
   ownerRoute?: SessionOwnerRoute
   /** Profile-pool owner captured at creation, when no registry route was used. */
   ownerProfile?: string
@@ -814,7 +811,6 @@ type StoredTile = Pick<
   | 'dir'
   | 'ownerProfile'
   | 'ownerRoute'
-  | 'ownerProfile'
   | 'storedSessionId'
   | 'workspaceMode'
   | 'workspaceOwnerKey'
@@ -827,7 +823,6 @@ const toStored = (t: SessionTile): StoredTile => ({
   dir: t.dir,
   ...(t.ownerProfile ? { ownerProfile: t.ownerProfile } : {}),
   ...(t.ownerRoute ? { ownerRoute: t.ownerRoute } : {}),
-  ...(t.ownerProfile ? { ownerProfile: t.ownerProfile } : {}),
   storedSessionId: t.storedSessionId,
   ...(t.workspaceMode ? { workspaceMode: t.workspaceMode } : {}),
   ...(t.workspaceOwnerKey ? { workspaceOwnerKey: t.workspaceOwnerKey } : {}),
@@ -845,7 +840,6 @@ function parseTileList(value: unknown): StoredTile[] {
             anchor: typeof raw.anchor === 'string' ? raw.anchor : undefined,
             before: typeof raw.before === 'string' || raw.before === null ? raw.before : undefined,
             dir: raw.dir,
-            ownerProfile: typeof raw.ownerProfile === 'string' ? normalizeProfileKey(raw.ownerProfile) : undefined,
             ownerRoute:
               raw.ownerRoute &&
               typeof raw.ownerRoute.connectionId === 'string' &&
@@ -1529,7 +1523,6 @@ export function openSessionTile(
         // #93892 shape).
         ownerProfile: workspaceScope.ownerProfile,
         ownerRoute: workspaceScope.ownerRoute,
-        ownerProfile: workspaceScope.ownerProfile,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
