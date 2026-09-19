@@ -52,7 +52,6 @@ import {
   openTileGatewayScopes,
   requestForOwnedSession
 } from '@/store/session-states'
-import { foregroundSessionScopes } from '@/store/session-states'
 import { deferred } from '@/test/deferred'
 import type { SessionInfo } from '@/types/hermes'
 

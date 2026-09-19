@@ -773,8 +773,6 @@ export interface SessionTile {
   workspaceMode?: WorkspaceMode
   /** Exact opaque owner key for Bot Mode tabs. */
   workspaceOwnerKey?: string
-  /** Legacy profile-pool owner when no registry connection identifies the route. */
-  ownerProfile?: string
   /** Credential-free exact route used to resume this tab after relaunch. */
   ownerRoute?: SessionOwnerRoute
   /** Profile-pool owner captured at creation, when no registry route was used. */
@@ -784,7 +782,6 @@ export interface SessionTile {
 }
 
 export interface SessionTileWorkspaceScope {
-  ownerProfile?: string
   ownerRoute?: SessionOwnerRoute
   /** Profile-pool owner captured at creation, when no registry route was used. */
   ownerProfile?: string
@@ -814,7 +811,6 @@ type StoredTile = Pick<
   | 'dir'
   | 'ownerProfile'
   | 'ownerRoute'
-  | 'ownerProfile'
   | 'storedSessionId'
   | 'workspaceMode'
   | 'workspaceOwnerKey'
@@ -827,7 +823,6 @@ const toStored = (t: SessionTile): StoredTile => ({
   dir: t.dir,
   ...(t.ownerProfile ? { ownerProfile: t.ownerProfile } : {}),
   ...(t.ownerRoute ? { ownerRoute: t.ownerRoute } : {}),
-  ...(t.ownerProfile ? { ownerProfile: t.ownerProfile } : {}),
   storedSessionId: t.storedSessionId,
   ...(t.workspaceMode ? { workspaceMode: t.workspaceMode } : {}),
   ...(t.workspaceOwnerKey ? { workspaceOwnerKey: t.workspaceOwnerKey } : {}),
@@ -859,7 +854,6 @@ function parseTileList(value: unknown): StoredTile[] {
                       : {})
                   }
                 : undefined,
-            ownerProfile: typeof raw.ownerProfile === 'string' ? raw.ownerProfile.trim() || undefined : undefined,
             storedSessionId: raw.storedSessionId,
             workspaceMode: raw.workspaceMode === 'bots' ? 'bots' : 'sessions',
             workspaceOwnerKey:
@@ -1529,7 +1523,6 @@ export function openSessionTile(
         // #93892 shape).
         ownerProfile: workspaceScope.ownerProfile,
         ownerRoute: workspaceScope.ownerRoute,
-        ownerProfile: workspaceScope.ownerProfile,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
