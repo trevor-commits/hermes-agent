@@ -2604,6 +2604,9 @@ def _cache_entry_valid(
         and not isinstance(entry.get("at"), bool))
 
 
+_custom_models_fetch_inflight: dict[str, threading.Lock] = {}
+_custom_models_fetch_inflight_guard = threading.Lock()
+
 def cached_fetch_api_models(
     api_key: Any, base_url: Optional[str], *, timeout: float = 5.0,
     api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
@@ -2662,11 +2665,22 @@ def cached_fetch_api_models(
     if cache_only:
         return None
 
-    live = _live()
-    if live or isinstance(live, _NativePickerModelList):
-        stored = _entry(live, now)
-        _store_cache_entry(cache_key, stored, cache)
-        return _catalog(stored)
+    # Singleflight: a prewarm thread and a picker open racing on the same
+    # endpoint+credential must share one live probe instead of doubling it
+    # (the #72762 follow-up race the picker test pins).
+    with _custom_models_fetch_inflight_guard:
+        inflight = _custom_models_fetch_inflight.setdefault(cache_key, threading.Lock())
+    with inflight:
+        cache = _load_provider_models_cache()  # re-read: the winner may have stored while we waited
+        entry = cache.get(cache_key)
+        if (not force_refresh and _cache_entry_valid(entry, fp, allow_empty=isinstance(entry, dict) and entry.get("native_catalog") is True)
+                and time.time() - entry["at"] < ttl_seconds):
+            return _catalog(entry)
+        live = _live()
+        if live or isinstance(live, _NativePickerModelList):
+            stored = _entry(live, now)
+            _store_cache_entry(cache_key, stored, cache)
+            return _catalog(stored)
     # Live returned nothing (offline, timeout, auth hiccup): a stale same-fingerprint entry beats it.
     if _cache_entry_valid(entry, fp, allow_empty=isinstance(entry, dict) and entry.get("native_catalog") is True):
         return _catalog(entry)

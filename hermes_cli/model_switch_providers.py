@@ -171,7 +171,19 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
         return None
     _picker_prewarm_done.set()
 
+    # ContextVars do not cross thread boundaries by default: a context-local
+    # Hermes-home override (sudo, profile pinning, tests) would leave this
+    # thread writing its warm cache to a different home than the foreground
+    # picker reads (#72762 follow-up). Propagate it explicitly.
+    from hermes_constants import (
+        get_hermes_home_override as _ghho,
+        set_hermes_home_override as _shho,
+        reset_hermes_home_override as _rhho,
+    )
+    _home_override = _ghho()
+
     def _warm() -> None:
+        _token = _shho(_home_override) if _home_override else None
         try:
             from hermes_cli.inventory import load_picker_context
             ctx = load_picker_context()
@@ -183,6 +195,9 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
                 excluded_providers=ctx.excluded_providers or [])
         except Exception:
             logger.debug("picker cache prewarm failed", exc_info=True)
+        finally:
+            if _token is not None:
+                _rhho(_token)
 
     t = _threading.Thread(target=_warm, daemon=True, name="picker-cache-prewarm")
     t.start()
