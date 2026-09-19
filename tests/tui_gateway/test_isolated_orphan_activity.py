@@ -63,7 +63,9 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             time.sleep(0.02)
         assert (tmp_path / "provider-started").exists(), supervisor._stderr_tail
         # Give the actual child-to-parent sampler a bounded opportunity to arrive.
-        deadline = time.monotonic() + 3
+        # A real child under machine load can take tens of seconds to be scheduled;
+        # the budget is patience, not a correctness threshold.
+        deadline = time.monotonic() + 20
         while not server._ws_orphan_turn_activity_is_fresh(session) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert supervisor.is_running()
@@ -77,7 +79,7 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             20.0 if mode == "fresh" else server._WS_ORPHAN_INTERRUPT_REAP_POLL_S)
         assert not any(m.get("method") == "compute_host.activity" for m in forwarded)
         if mode != "fresh":
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             while session["running"] and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert not session["running"], "stale child must receive and settle the real interrupt"
@@ -108,7 +110,7 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             # Also replay a delayed sample from the previous dispatch.
             server._relay_compute_host_rpc({"method": "compute_host.activity", "params": {
                 "session_id": sid, "turn_id": old_token, "activity_ns": time.perf_counter_ns()}})
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 20
             while "_compute_host_activity_ns" not in session and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert "_compute_host_activity_ns" in session

@@ -63,6 +63,9 @@ def test_pending_launchd_requires_complete_supervision(monkeypatch, tmp_path, fa
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: current)
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / f"{current}.plist")
     monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [current, sibling])
+    # Host-independent scope: pretend no system-domain daemon is installed so the
+    # run never probes a real launchd gateway on the test machine.
+    monkeypatch.setattr(gateway, "get_system_launchd_gateway_plist_path", lambda: tmp_path / "no-system-daemon.plist")
     monkeypatch.setattr(fleet, "_restart_launchd_gateway_after_update", lambda **kw: ([], []))
     monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda _: (None, None) if failure == "unloaded" else ("gui/501", None))
     monkeypatch.setattr(gateway, "_wait_for_launchd_service_pid", lambda *a, **kw: None if failure == "inactive" else 42)

@@ -178,6 +178,15 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
     )
+    # Scope: the invoking profile only. The separate system-daemon drain seam
+    # must report "no system daemon installed" so these tests do not touch a
+    # real launchd gateway that happens to run on the test machine (live-system
+    # guard fires otherwise).
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_system_launchd_gateway_plist_path",
+        lambda: gateway_cli.Path("/nonexistent/ai.hermes.gateway.daemon.plist"),
+    )
 
     calls = {"restart": 0, "verify": 0, "label": None}
 
