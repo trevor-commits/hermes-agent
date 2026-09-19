@@ -24,6 +24,8 @@ function contextHandoffMetadata(value: unknown): null | { detail: string; taskCo
   const taskCount = (value as { taskCount?: unknown }).taskCount
 
   return typeof detail === 'string' && typeof taskCount === 'number' ? { detail, taskCount } : null
+}
+
 interface BackgroundResultProps {
   text: string
   report: string
@@ -112,7 +114,6 @@ export const SystemMessage: FC = () => {
     )
   }
 
-  if (typeof asyncResult === 'string' && asyncResult) {
   if (processResult || (typeof asyncResult === 'string' && asyncResult)) {
     return (
       <MessagePrimitive.Root className="w-full min-w-0 self-start" data-role="system" data-slot="aui_system-message-root">
