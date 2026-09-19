@@ -53,6 +53,11 @@ def wedge_env(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs_mod, "CRON_DIR", hermes_home / "cron")
     monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
     monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", hermes_home / "cron" / "output")
+    # The tick fires a throttled daemon worktree-prune thread whose git subprocesses race the
+    # scripted script-Popen EAGAIN injection (they can consume the injected first-Popen slot).
+    # Disable it: this test owns the Popen sequence end-to-end.
+    import cron.scheduler as _sched_for_wedge
+    monkeypatch.setattr(_sched_for_wedge, "_maybe_run_worktree_maintenance", lambda: None)
 
     # Create a recurring no_agent interval job.
     job = jobs_mod.create_job(
