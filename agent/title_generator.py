@@ -713,6 +713,9 @@ def maybe_auto_title(
         or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id))
     ):
         return None
+    if not _auto_title_enabled():
+        logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+        return None
     kanban_title = _kanban_task_title()
     if kanban_title:
         # The card already carries a human-written name; an auxiliary model call per spawned worker
@@ -724,9 +727,6 @@ def maybe_auto_title(
                 _notify_title(title_callback, persisted, "llm", "Kanban task title")
         return None
     if not is_titleable_user_message(user_message):
-        return None
-    if not _auto_title_enabled():  # config read after the cheap guards so the file isn't touched every turn
-        logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return None
     apply_instant_title(session_db, session_id, user_message, title_callback, title_preview=title_preview)
     if not _model_title_upgrade_enabled():

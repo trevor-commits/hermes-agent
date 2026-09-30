@@ -569,6 +569,28 @@ class TestMaybeAutoTitle:
         thread.assert_not_called()
         call_llm.assert_not_called()
 
+    @pytest.mark.parametrize("previous_title", [None, "Existing automatic title"])
+    def test_enabled_false_disables_kanban_titles(self, tmp_path, monkeypatch, previous_title):
+        """The automatic-title switch also prevents Kanban assignment and upgrades."""
+        from hermes_cli.config import atomic_config_write
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        atomic_config_write(tmp_path / "config.yaml", {
+            "auxiliary": {"title_generation": {"enabled": False}},
+        })
+        with SessionDB(tmp_path / "state.db") as db:
+            db.create_session(session_id="sess-1", source="kanban")
+            if previous_title:
+                db.set_auto_title("sess-1", previous_title, source="derived")
+            with patch("agent.title_generator._kanban_task_title", return_value="Kanban card title") as card, \
+                 patch("agent.memory_provider.spawn_context_thread") as thread, \
+                 patch("agent.title_generator.call_llm") as call_llm:
+                maybe_auto_title(db, "sess-1", "work kanban task t_test", [])
+            assert db.get_session_title("sess-1") == previous_title
+            card.assert_not_called()
+            thread.assert_not_called()
+            call_llm.assert_not_called()
+
 
     @pytest.mark.parametrize(
         "opener",
