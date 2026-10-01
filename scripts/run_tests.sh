@@ -13,6 +13,7 @@
 #     conftest path — e.g. on a single file)
 #   * The activated checkout's test environment (activates when needed)
 #
+# For fast offline static checks (no pytest), use scripts/verify_local.sh first.
 # Usage:
 #   scripts/run_tests.sh                            # full suite
 #   scripts/run_tests.sh -j 4                       # cap parallelism
