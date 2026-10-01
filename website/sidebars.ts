@@ -784,6 +784,7 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'developer-guide/contributing',
+        'developer-guide/local-ci-parity',
         'developer-guide/worktree-ui-dev',
         {
           type: 'category',

@@ -453,8 +453,9 @@ merge (no activation):
 scripts/verify_local.sh
 ```
 
-See [Contributing](../developer-guide/contributing.md#local-verification-offline) for
-details and the optional `--ruff` flag.
+See [Contributing](../developer-guide/contributing.md#local-verification-offline) and
+[Local CI parity](../developer-guide/local-ci-parity.md) for the gate matrix,
+`--ruff`, and `--advisory`.
 
 `source ./activate` (or `. .\activate.ps1` in PowerShell) and both direct
 `setup-hermes` scripts prepare an isolated test interpreter from the locked

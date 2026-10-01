@@ -210,8 +210,9 @@ scripts/verify_local.sh
 scripts/verify_local.sh --ruff     # optional; same blocking ruff job as CI
 ```
 
-CI-only advisory steps (profile-scope patterns, public-surface diff) need a PR
-merge-base and are omitted here.
+Optional advisory steps (profile-scope patterns, public-surface diff):
+`scripts/verify_local.sh --advisory` after `git fetch origin main`. Full parity
+table: [Local CI parity](website/docs/developer-guide/local-ci-parity.md).
 
 ### Run tests
 

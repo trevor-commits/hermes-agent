@@ -133,8 +133,9 @@ scripts/verify_local.sh
 scripts/verify_local.sh --ruff   # optional; needs ruff on PATH
 ```
 
-Profile-scope and public-surface diffs in CI are PR-only and need a merge-base
-fetch; run those locally only when debugging a large refactor.
+See [Local CI parity](./local-ci-parity.md) for the blocking-gate matrix and what
+still needs `run_tests.sh`. For advisory PR diffs after `git fetch origin main`:
+`scripts/verify_local.sh --advisory`.
 
 ### Run tests
 
