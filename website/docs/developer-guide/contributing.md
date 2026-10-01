@@ -120,7 +120,22 @@ Native desktop dependencies can also require the platform build toolchain.
 Logos and icons are generated from `assets/nous-girl-*.svg` and
 `assets/backgrounds/`. `node scripts/generate-icons.mjs` renders them with the
 Hermes runtime Python (`HERMES_PYTHON`, else `python` on PATH): Pillow and
-resvg-py are core dependencies. Do not commit generated PNG/ICO/ICNS outputs.
+resvg-py are core dependencies. Generated outputs are committed; CI fails if they
+are stale — rerun the generator and commit after changing any source SVG.
+
+### Local verification (offline)
+
+Before pushing Python changes, run the static gates that block CI merge (no
+activate, no network):
+
+```bash
+scripts/verify_local.sh
+scripts/verify_local.sh --ruff   # optional; needs ruff on PATH
+```
+
+See [Local CI parity](./local-ci-parity.md) for the blocking-gate matrix and what
+still needs `run_tests.sh`. For advisory PR diffs after `git fetch origin main`:
+`scripts/verify_local.sh --advisory`.
 
 ### Run tests
 
@@ -230,10 +245,11 @@ refactor/description   # Code restructuring
 
 ### Before Submitting
 
-1. **Run tests**: `scripts/run_tests.sh` for CI-parity. Use direct `python -m pytest ...` only when the wrapper is unavailable or you are intentionally debugging outside the wrapper.
-2. **Test manually**: Run `hermes` and exercise the code path you changed
-3. **Check cross-platform impact**: Consider macOS, Linux, WSL2, and native Windows. If you touch file I/O, process management, terminal handling, subprocesses, or signals, run `scripts/check-windows-footguns.py`.
-4. **Keep PRs focused**: One logical change per PR
+1. **Run offline checks**: `scripts/verify_local.sh` (add `--ruff` when ruff is installed)
+2. **Run tests**: `scripts/run_tests.sh` for CI-parity. Use direct `python -m pytest ...` only when the wrapper is unavailable or you are intentionally debugging outside the wrapper.
+3. **Test manually**: Run `hermes` and exercise the code path you changed
+4. **Check cross-platform impact**: Consider macOS, Linux, WSL2, and native Windows. If you touch file I/O, process management, terminal handling, subprocesses, or signals, run `scripts/check-windows-footguns.py` (included in `verify_local.sh`).
+5. **Keep PRs focused**: One logical change per PR
 
 ### PR Description
 

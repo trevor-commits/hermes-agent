@@ -217,7 +217,7 @@ hermes-agent/
 ├── acp_adapter/          # ACP server (VS Code / Zed / JetBrains)
 ├── cron/                 # jobs.py + scheduler.py (+ scheduler_*.py)
 ├── evals/                # Offline benchmarks (codebase_navigability/, compaction/, ...)
-├── scripts/              # run_tests.sh, release.py, check_compat_pointers.py, ci/
+├── scripts/              # run_tests.sh, verify_local.sh, release.py, check_compat_pointers.py, ci/
 ├── website/              # Docusaurus docs (developer-guide/ holds the long-form area docs)
 └── tests/                # Pytest suite (~39k tests / ~3.7k files, Sep 2026)
 ```
@@ -357,6 +357,9 @@ that guidance.
   appendages to facades, new god helpers, compat aliases, wrappers.
 
 ## Testing (applies everywhere)
+
+Before pytest, run **`scripts/verify_local.sh`** for offline static gates that block merge in
+CI (no activation). See `website/docs/developer-guide/local-ci-parity.md`.
 
 **ALWAYS use `scripts/run_tests.sh`**, never bare `pytest`. It enforces CI parity: credential
 vars unset, `TZ=UTC`, `LANG=C.UTF-8`, `HERMES_HOME` → temp dir, and per-file subprocess

@@ -53,7 +53,6 @@ run_datagen_kimik2-thinking.sh
 run_datagen_megascience_glm4-6.sh
 run_datagen_sonnet.sh
 source-data/*
-run_datagen_megascience_glm4-6.sh
 data/*
 MagicMock/
 # No trailing slash: also matches node_modules SYMLINKS (worktrees often

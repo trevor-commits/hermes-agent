@@ -222,7 +222,7 @@ We welcome contributions! See the [Contributing Guide](https://hermes-agent.nous
 
 Start with the [PM developer workflow](website/docs/reference/package-management.md#developer-workflow)
 for activation, daily use, dependency changes, and leaving the environment.
-[Development Setup](CONTRIBUTING.md#development-setup) covers the separate test environment and verification commands.
+[Development Setup](CONTRIBUTING.md#development-setup) covers the separate test environment and verification commands. After cloning, run `scripts/verify_local.sh` for fast offline CI gates (see [local CI parity](website/docs/developer-guide/local-ci-parity.md)) before `source ./activate` and `scripts/run_tests.sh`.
 
 ---
 
