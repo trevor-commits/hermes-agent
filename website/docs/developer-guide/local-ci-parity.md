@@ -10,6 +10,9 @@ that **block merge** on every PR — the same checks wired in
 No `source ./activate`, no API keys, no PyPI. Only **git** and **system `python3`**
 (Python **≥ 3.11**, matching `pyproject.toml`; override with `PYTHON=...`).
 
+The wrapper preflights that every bundled checker script exists (fail-fast on a sparse
+checkout), prints per-step wall time, and never treats advisory failures as a non-zero exit.
+
 ## Quick start
 
 ```bash
@@ -106,6 +109,21 @@ scripts/verify_local.sh --advisory
 
 Expect ~1 minute on a full tree for blocking steps (file scans). The script prints
 `python=…` and `head=<short-sha>` at start so logs are attributable to a revision.
+Per-step timings appear on the `✓` lines (Windows footguns and compat-pointer scans are
+usually the slowest).
+
+### Usage-burn draft survey (fork maintenance)
+
+When several cloud-agent drafts touch offline verification, prefer **one canonical PR**
+and close superseded siblings. On `trevor-commits/hermes-agent` (Oct 2026 usage-burn lane):
+
+| PR | Branch | Scope |
+| --- | --- | --- |
+| **#10** | `cursor/usage-burn-deeper-reliability-1458` | **Canonical** — `verify_local.sh` + this doc |
+| **#9** | `cursor/usage-burn-verify-local-d116` | Superseded by #10 |
+| **#8** | `cursor/agents-harness-hygiene-6fd8` | Orthogonal harness docs (`CLAUDE.md`, `hermes-agent-dev` skill) |
+
+List open drafts: `gh pr list --repo trevor-commits/hermes-agent --draft --state open`.
 
 ## Not covered by `verify_local.sh`
 
@@ -135,6 +153,7 @@ never skipped in CI).
 | `SyntaxWarning: invalid escape sequence` during a step | CPython 3.12+ warns while compiling tracked files | Benign noise; the check still passes. Warnings are suppressed in `verify_local.sh` for readability. |
 | `--ruff` errors: ruff not found | Ruff not on PATH / not installed | `python -m scripts.ci.python_packages ruff==0.15.10` or `scripts/verify_local.sh` without `--ruff` |
 | Advisory skips: no merge-base | Shallow clone or branch diverged | `git fetch --deepen=200 origin main` |
+| `error: missing checker script` at start | Sparse checkout or wrong branch | `git checkout` the feature branch; confirm `scripts/check_*.py` exist |
 | Case collision / compat failures | New import path or filename clash | Read the checker stdout; fix the reported path |
 | Tests pass locally but fail in CI | Bare `pytest`, credentials set, or shared `HERMES_HOME` | Always use `scripts/run_tests.sh` |
 | `--advisory` fails the script | Older `verify_local.sh` treated advisory like blocking | Upgrade: advisory steps must not fail the wrapper (see above) |

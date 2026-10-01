@@ -27,6 +27,19 @@ PYTHON="${PYTHON:-python3}"
 VERIFY_BASE="${VERIFY_BASE:-origin/main}"
 RUN_RUFF=0
 RUN_ADVISORY=0
+ADVISORY_ISSUES=0
+
+# Blocking check scripts (must exist before we start; fail fast with a clear path).
+BLOCKING_SCRIPTS=(
+  scripts/check_compat_pointers.py
+  scripts/ci/check_lazy_deps_imports.py
+  scripts/check-case-collisions.py
+  scripts/check_bash_shebangs.py
+  scripts/check-windows-footguns.py
+  scripts/check_no_tmp_literals.py
+  scripts/check_config_yaml_writers.py
+  scripts/ci/check_os_marker_fakes.py
+)
 
 # Compiling some tracked modules emits SyntaxWarning on escape sequences in docstrings;
 # CI uses the same sources — suppress noise so failures stand out.
@@ -93,17 +106,31 @@ STARTED_AT=$SECONDS
 HEAD_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "verify_local: python=$("$PYTHON" -V 2>&1 | tr -d '\n') head=${HEAD_SHORT}"
 
+missing=0
+for rel in "${BLOCKING_SCRIPTS[@]}"; do
+  if [[ ! -f "$REPO_ROOT/$rel" ]]; then
+    echo "error: missing checker script: $rel" >&2
+    missing=1
+  fi
+done
+if [[ "$missing" -ne 0 ]]; then
+  echo "error: incomplete checkout — re-clone or git checkout the branch you intend to verify" >&2
+  exit 1
+fi
+
 run_step() {
   local title="$1"
   shift
   local ec=0
+  local step_start=$SECONDS
   echo ""
   echo "▶ ${title}"
   if "$@"; then
-    echo "  ✓ ${title}"
+    echo "  ✓ ${title} ($((SECONDS - step_start))s)"
   else
     ec=$?
     echo "  ✗ ${title} failed (exit ${ec})" >&2
+    echo "  hint: website/docs/developer-guide/local-ci-parity.md § Troubleshooting" >&2
     exit "${ec}"
   fi
 }
@@ -119,6 +146,7 @@ run_advisory_step() {
     echo "  ✓ ${title}"
   else
     ec=$?
+    ADVISORY_ISSUES=$((ADVISORY_ISSUES + 1))
     echo "  ⚠ ${title} exited ${ec} (advisory — read output; job continues)" >&2
   fi
 }
@@ -189,4 +217,8 @@ fi
 
 elapsed=$((SECONDS - STARTED_AT))
 echo ""
-echo "✓ verify_local: all checks passed (${elapsed}s)"
+if [[ "$ADVISORY_ISSUES" -gt 0 ]]; then
+  echo "✓ verify_local: blocking passed; ${ADVISORY_ISSUES} advisory step(s) reported issues (${elapsed}s)"
+else
+  echo "✓ verify_local: all checks passed (${elapsed}s)"
+fi

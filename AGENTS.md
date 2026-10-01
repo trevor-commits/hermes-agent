@@ -358,6 +358,9 @@ that guidance.
 
 ## Testing (applies everywhere)
 
+Before pytest, run **`scripts/verify_local.sh`** for offline static gates that block merge in
+CI (no activation). See `website/docs/developer-guide/local-ci-parity.md`.
+
 **ALWAYS use `scripts/run_tests.sh`**, never bare `pytest`. It enforces CI parity: credential
 vars unset, `TZ=UTC`, `LANG=C.UTF-8`, `HERMES_HOME` → temp dir, and per-file subprocess
 isolation via `scripts/run_tests_parallel.py` (no xdist; workers scale with CPU count) so
