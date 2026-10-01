@@ -418,8 +418,7 @@ You must still add the tool name to the appropriate list in `toolsets.py`
 registers but is never exposed to the agent. If you introduce a new toolset,
 add it in `toolsets.py` and wire it into the relevant platform presets.
 
-See `AGENTS.md` (section **Adding New Tools**) for profile-aware paths and
-plugin vs core guidance.
+See `tools/AGENTS.md` for profile-aware paths, registry wiring, and plugin vs core guidance.
 
 ---
 
