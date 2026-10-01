@@ -15,8 +15,9 @@
 #   scripts/verify_local.sh -h|--help
 #
 # Optional env:
-#   PYTHON        interpreter for check scripts (default: python3)
-#   VERIFY_BASE   base ref for --advisory (default: origin/main)
+#   PYTHON                 interpreter for check scripts (default: python3)
+#   VERIFY_BASE            base ref for --advisory (default: origin/main)
+#   VERIFY_FETCH_ADVISORY  set to 1 to run CI-style deepen fetches when merge-base is missing (needs network)
 
 set -euo pipefail
 
@@ -51,6 +52,9 @@ Options:
 
 Install ruff: python -m scripts.ci.python_packages ruff==0.15.10
 
+Advisory steps never fail this script (same as lint.yml continue-on-error).
+Set VERIFY_FETCH_ADVISORY=1 to deepen-fetch when merge-base is missing (network).
+
 Tests and typecheck are out of scope; use scripts/run_tests.sh after
 source ./activate (or set HERMES_PYTHON to a PM-built test interpreter).
 EOF
@@ -74,6 +78,11 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  echo "error: Hermes requires Python >= 3.11 (got: $("$PYTHON" -V 2>&1))" >&2
+  exit 1
+fi
+
 if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: not a git work tree: $REPO_ROOT" >&2
   exit 1
@@ -81,18 +90,63 @@ fi
 
 cd "$REPO_ROOT"
 STARTED_AT=$SECONDS
+HEAD_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "verify_local: python=$("$PYTHON" -V 2>&1 | tr -d '\n') head=${HEAD_SHORT}"
 
 run_step() {
   local title="$1"
   shift
+  local ec=0
   echo ""
   echo "▶ ${title}"
   if "$@"; then
     echo "  ✓ ${title}"
   else
-    echo "  ✗ ${title} failed (exit $?)" >&2
-    exit 1
+    ec=$?
+    echo "  ✗ ${title} failed (exit ${ec})" >&2
+    exit "${ec}"
   fi
+}
+
+# Advisory steps mirror lint.yml continue-on-error: never fail verify_local.
+run_advisory_step() {
+  local title="$1"
+  shift
+  local ec=0
+  echo ""
+  echo "▶ ${title}"
+  if "$@"; then
+    echo "  ✓ ${title}"
+  else
+    ec=$?
+    echo "  ⚠ ${title} exited ${ec} (advisory — read output; job continues)" >&2
+  fi
+}
+
+ensure_advisory_merge_base() {
+  local base="$VERIFY_BASE"
+  if git merge-base "$base" HEAD >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "${VERIFY_FETCH_ADVISORY:-0}" != "1" ]]; then
+    return 1
+  fi
+  local branch="${base#origin/}"
+  if [[ "$branch" == "$base" ]]; then
+    echo "▶ advisory fetch (VERIFY_FETCH_ADVISORY=1): deepen ${base} (non-origin ref)"
+    git fetch --no-tags --deepen=200 "$base" 2>/dev/null || true
+  else
+    echo "▶ advisory fetch (VERIFY_FETCH_ADVISORY=1): deepen origin ${branch}"
+    git fetch --no-tags --deepen=200 origin "$branch" 2>/dev/null || true
+  fi
+  local i
+  for i in 1 2 3; do
+    git merge-base "$base" HEAD >/dev/null 2>&1 && return 0
+    if [[ "$branch" != "$base" ]]; then
+      git fetch --no-tags --deepen=1000 origin "$branch" 2>/dev/null || true
+    fi
+  done
+  return 1
 }
 
 run_step "plugin-compat pointers" "$PYTHON" scripts/check_compat_pointers.py
@@ -117,14 +171,19 @@ if [[ "$RUN_RUFF" -eq 1 ]]; then
 fi
 
 if [[ "$RUN_ADVISORY" -eq 1 ]]; then
-  echo ""
   if ! git rev-parse --verify "$VERIFY_BASE" >/dev/null 2>&1; then
+    echo ""
     echo "▶ advisory checks (skipped: ${VERIFY_BASE} not found — run: git fetch origin main)"
-  elif ! git merge-base "$VERIFY_BASE" HEAD >/dev/null 2>&1; then
-    echo "▶ advisory checks (skipped: no merge-base with ${VERIFY_BASE} — try: git fetch --deepen=200 origin main)"
+  elif ! ensure_advisory_merge_base; then
+    echo ""
+    echo "▶ advisory checks (skipped: no merge-base with ${VERIFY_BASE})"
+    echo "  hint: git fetch --deepen=200 origin main"
+    echo "  or:  VERIFY_FETCH_ADVISORY=1 scripts/verify_local.sh --advisory  # CI-style deepen (network)"
   else
-    run_step "profile-scope patterns (advisory)" "$PYTHON" scripts/check_profile_scope_patterns.py --base "$VERIFY_BASE" --head HEAD
-    run_step "public-surface diff (advisory)" "$PYTHON" scripts/ci/check_public_surface.py --base "$VERIFY_BASE" --head HEAD
+    run_advisory_step "profile-scope patterns (advisory)" \
+      "$PYTHON" scripts/check_profile_scope_patterns.py --base "$VERIFY_BASE" --head HEAD
+    run_advisory_step "public-surface diff (advisory)" \
+      "$PYTHON" scripts/ci/check_public_surface.py --base "$VERIFY_BASE" --head HEAD
   fi
 fi
 

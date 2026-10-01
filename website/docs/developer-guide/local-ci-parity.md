@@ -7,7 +7,8 @@ that **block merge** on every PR — the same checks wired in
 (`windows-footguns` job) and
 [`.github/workflows/lazy-deps-guard.yml`](https://github.com/NousResearch/hermes-agent/blob/main/.github/workflows/lazy-deps-guard.yml).
 
-No `source ./activate`, no API keys, no PyPI. Only **git** and **system `python3`** (override with `PYTHON=...`).
+No `source ./activate`, no API keys, no PyPI. Only **git** and **system `python3`**
+(Python **≥ 3.11**, matching `pyproject.toml`; override with `PYTHON=...`).
 
 ## Quick start
 
@@ -61,8 +62,50 @@ VERIFY_BASE=origin/main scripts/verify_local.sh --advisory
 ```
 
 If `origin/main` is missing or there is no merge-base yet, the script prints a skip hint
-(`git fetch --deepen=200 origin main`) and continues. Advisory scripts always exit 0;
-read their output like a reviewer would in the Actions log.
+(`git fetch --deepen=200 origin main`) and continues.
+
+Advisory steps use **`continue-on-error` parity**: they never fail `verify_local.sh`, even when
+`check_public_surface.py` exits `2` (unresolved ref / no merge-base) or prints findings.
+Read stdout/stderr like the `windows-footguns` job log in Actions.
+
+Optional CI-style deepen (read-only `git fetch`, needs network):
+
+```bash
+VERIFY_FETCH_ADVISORY=1 scripts/verify_local.sh --advisory
+```
+
+This mirrors the `for i in 1 2 3` deepen loop in `lint.yml` for PR advisory steps.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PYTHON` | `python3` | Interpreter for check scripts |
+| `VERIFY_BASE` | `origin/main` | Base ref for `--advisory` diffs |
+| `VERIFY_FETCH_ADVISORY` | unset | Set to `1` to deepen-fetch when merge-base is missing |
+| `PYTHONWARNINGS` | `ignore::SyntaxWarning` | Quiets docstring escape noise during compiles |
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | All **blocking** steps passed (advisory may have printed warnings) |
+| `1` | A blocking checker failed, or Python before 3.11 / missing interpreter |
+| `2` | Unknown CLI flag (`scripts/verify_local.sh -h` for usage) |
+
+## Offline verify recipe (cloud agent / shallow clone)
+
+No secrets, no merges, no live writes to external services:
+
+```bash
+git fetch origin main --depth=50    # read-only; enough for many advisory runs
+chmod +x scripts/verify_local.sh
+scripts/verify_local.sh
+scripts/verify_local.sh --advisory
+```
+
+Expect ~1 minute on a full tree for blocking steps (file scans). The script prints
+`python=…` and `head=<short-sha>` at start so logs are attributable to a revision.
 
 ## Not covered by `verify_local.sh`
 
@@ -70,6 +113,7 @@ These still require activation, network, path-specific changes, or long runtimes
 
 | Lane | When it runs | Local command / notes |
 | --- | --- | --- |
+| ruff + ty diff (advisory) | PRs only | `lint.yml` `lint-diff` job; not bundled locally |
 | Pytest suite | Python changes | `scripts/run_tests.sh` |
 | JS / Vitest | Desktop, TUI, dashboard | `npm test` in the owning workspace |
 | `uv lock --check` | `pyproject.toml` / `uv.lock` | `hermes pm lock` after dependency edits |
@@ -79,8 +123,10 @@ These still require activation, network, path-specific changes, or long runtimes
 | Desktop E2E | Desktop changes | CI disposable hosts; not a local default |
 
 The orchestrator job **All required checks pass** (`ci.yaml`) gates merge; use the table above
-to decide what else to run for your diff. The change classifier in CI skips some lanes when
-only docs or frontend files change — locally, still run `verify_local.sh` before any push.
+to decide what else to run for your diff. The change classifier
+(`scripts/ci/classify_changes.py`) skips some lanes when only docs or frontend files change —
+locally, still run `verify_local.sh` before any push (case-collision and footgun gates are
+never skipped in CI).
 
 ## Troubleshooting
 
@@ -91,3 +137,5 @@ only docs or frontend files change — locally, still run `verify_local.sh` befo
 | Advisory skips: no merge-base | Shallow clone or branch diverged | `git fetch --deepen=200 origin main` |
 | Case collision / compat failures | New import path or filename clash | Read the checker stdout; fix the reported path |
 | Tests pass locally but fail in CI | Bare `pytest`, credentials set, or shared `HERMES_HOME` | Always use `scripts/run_tests.sh` |
+| `--advisory` fails the script | Older `verify_local.sh` treated advisory like blocking | Upgrade: advisory steps must not fail the wrapper (see above) |
+| `public-surface: cannot resolve ref` | Shallow clone / base not fetched | `git fetch origin main` or `VERIFY_FETCH_ADVISORY=1` |
