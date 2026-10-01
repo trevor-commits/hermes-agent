@@ -217,7 +217,7 @@ hermes-agent/
 ├── acp_adapter/          # ACP server (VS Code / Zed / JetBrains)
 ├── cron/                 # jobs.py + scheduler.py (+ scheduler_*.py)
 ├── evals/                # Offline benchmarks (codebase_navigability/, compaction/, ...)
-├── scripts/              # run_tests.sh, release.py, check_compat_pointers.py, ci/
+├── scripts/              # run_tests.sh, verify_local.sh, release.py, check_compat_pointers.py, ci/
 ├── website/              # Docusaurus docs (developer-guide/ holds the long-form area docs)
 └── tests/                # Pytest suite (~39k tests / ~3.7k files, Sep 2026)
 ```

@@ -200,6 +200,19 @@ Hermes runtime Python (`HERMES_PYTHON`, else `python` on PATH): Pillow and
 resvg-py are core dependencies. Generated outputs are committed and CI fails if
 they are stale; rerun the generator and commit after changing any source SVG.
 
+### Local verification (offline)
+
+Static checks that block CI merge — no `source ./activate`, no network:
+
+```bash
+chmod +x scripts/verify_local.sh   # once per clone if execute bit missing
+scripts/verify_local.sh
+scripts/verify_local.sh --ruff     # optional; same blocking ruff job as CI
+```
+
+CI-only advisory steps (profile-scope patterns, public-surface diff) need a PR
+merge-base and are omitted here.
+
 ### Run tests
 
 Use the canonical runner on every host:
@@ -954,10 +967,11 @@ refactor/description   # Code restructuring
 
 ### Before submitting
 
-1. **Run tests**: use `scripts/run_tests.sh` for the same environment and per-file isolation as CI.
-2. **Test manually**: Run `hermes` and exercise the code path you changed
-3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
-4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.
+1. **Run offline checks**: `scripts/verify_local.sh` (add `--ruff` when ruff is installed)
+2. **Run tests**: use `scripts/run_tests.sh` for the same environment and per-file isolation as CI.
+3. **Test manually**: Run `hermes` and exercise the code path you changed
+4. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
+5. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.
 
 ### PR description
 

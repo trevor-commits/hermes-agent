@@ -446,6 +446,16 @@ selected generation.
 
 ### Test and editor environments
 
+Before building a test interpreter, run offline static checks that block CI
+merge (no activation):
+
+```bash
+scripts/verify_local.sh
+```
+
+See [Contributing](../developer-guide/contributing.md#local-verification-offline) for
+details and the optional `--ruff` flag.
+
 `source ./activate` (or `. .\activate.ps1` in PowerShell) and both direct
 `setup-hermes` scripts prepare an isolated test interpreter from the locked
 `dev` and `test` dependency groups. `scripts/run_tests.sh` uses that interpreter,
