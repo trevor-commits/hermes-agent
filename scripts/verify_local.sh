@@ -28,6 +28,9 @@ VERIFY_BASE="${VERIFY_BASE:-origin/main}"
 RUN_RUFF=0
 RUN_ADVISORY=0
 ADVISORY_ISSUES=0
+# skipped | ran_clean | ran_with_issues
+ADVISORY_STATE="skipped"
+CURRENT_STEP=""
 
 # Blocking check scripts (must exist before we start; fail fast with a clear path).
 BLOCKING_SCRIPTS=(
@@ -40,6 +43,27 @@ BLOCKING_SCRIPTS=(
   scripts/check_config_yaml_writers.py
   scripts/ci/check_os_marker_fakes.py
 )
+
+ADVISORY_SCRIPTS=(
+  scripts/check_profile_scope_patterns.py
+  scripts/ci/check_public_surface.py
+)
+
+preflight_scripts() {
+  local -n scripts=$1
+  local label="$2"
+  local miss=0
+  for rel in "${scripts[@]}"; do
+    if [[ ! -f "$REPO_ROOT/$rel" ]]; then
+      echo "error: missing ${label} script: $rel" >&2
+      miss=1
+    fi
+  done
+  if [[ "$miss" -ne 0 ]]; then
+    echo "error: incomplete checkout — re-clone or git checkout the branch you intend to verify" >&2
+    exit 1
+  fi
+}
 
 # Compiling some tracked modules emits SyntaxWarning on escape sequences in docstrings;
 # CI uses the same sources — suppress noise so failures stand out.
@@ -102,27 +126,35 @@ if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 cd "$REPO_ROOT"
+
+if ! bash -n "$SCRIPT_DIR/verify_local.sh" 2>/dev/null; then
+  echo "error: verify_local.sh failed bash -n syntax check" >&2
+  exit 1
+fi
+
+on_interrupt() {
+  echo "" >&2
+  if [[ -n "$CURRENT_STEP" ]]; then
+    echo "verify_local: interrupted during: ${CURRENT_STEP}" >&2
+  else
+    echo "verify_local: interrupted" >&2
+  fi
+  exit 130
+}
+trap on_interrupt INT TERM
+
 STARTED_AT=$SECONDS
 HEAD_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "verify_local: python=$("$PYTHON" -V 2>&1 | tr -d '\n') head=${HEAD_SHORT}"
 
-missing=0
-for rel in "${BLOCKING_SCRIPTS[@]}"; do
-  if [[ ! -f "$REPO_ROOT/$rel" ]]; then
-    echo "error: missing checker script: $rel" >&2
-    missing=1
-  fi
-done
-if [[ "$missing" -ne 0 ]]; then
-  echo "error: incomplete checkout — re-clone or git checkout the branch you intend to verify" >&2
-  exit 1
-fi
+preflight_scripts BLOCKING_SCRIPTS blocking
 
 run_step() {
   local title="$1"
   shift
   local ec=0
   local step_start=$SECONDS
+  CURRENT_STEP="$title"
   echo ""
   echo "▶ ${title}"
   if "$@"; then
@@ -133,6 +165,7 @@ run_step() {
     echo "  hint: website/docs/developer-guide/local-ci-parity.md § Troubleshooting" >&2
     exit "${ec}"
   fi
+  CURRENT_STEP=""
 }
 
 # Advisory steps mirror lint.yml continue-on-error: never fail verify_local.
@@ -140,6 +173,7 @@ run_advisory_step() {
   local title="$1"
   shift
   local ec=0
+  CURRENT_STEP="$title"
   echo ""
   echo "▶ ${title}"
   if "$@"; then
@@ -149,6 +183,7 @@ run_advisory_step() {
     ADVISORY_ISSUES=$((ADVISORY_ISSUES + 1))
     echo "  ⚠ ${title} exited ${ec} (advisory — read output; job continues)" >&2
   fi
+  CURRENT_STEP=""
 }
 
 ensure_advisory_merge_base() {
@@ -199,26 +234,46 @@ if [[ "$RUN_RUFF" -eq 1 ]]; then
 fi
 
 if [[ "$RUN_ADVISORY" -eq 1 ]]; then
+  preflight_scripts ADVISORY_SCRIPTS advisory
   if ! git rev-parse --verify "$VERIFY_BASE" >/dev/null 2>&1; then
+    ADVISORY_STATE="skipped_no_ref"
     echo ""
     echo "▶ advisory checks (skipped: ${VERIFY_BASE} not found — run: git fetch origin main)"
   elif ! ensure_advisory_merge_base; then
+    ADVISORY_STATE="skipped_no_merge_base"
     echo ""
     echo "▶ advisory checks (skipped: no merge-base with ${VERIFY_BASE})"
     echo "  hint: git fetch --deepen=200 origin main"
     echo "  or:  VERIFY_FETCH_ADVISORY=1 scripts/verify_local.sh --advisory  # CI-style deepen (network)"
   else
+    ADVISORY_STATE="ran_clean"
     run_advisory_step "profile-scope patterns (advisory)" \
       "$PYTHON" scripts/check_profile_scope_patterns.py --base "$VERIFY_BASE" --head HEAD
     run_advisory_step "public-surface diff (advisory)" \
       "$PYTHON" scripts/ci/check_public_surface.py --base "$VERIFY_BASE" --head HEAD
+    if [[ "$ADVISORY_ISSUES" -gt 0 ]]; then
+      ADVISORY_STATE="ran_with_issues"
+    fi
   fi
 fi
 
+trap - INT TERM
 elapsed=$((SECONDS - STARTED_AT))
 echo ""
-if [[ "$ADVISORY_ISSUES" -gt 0 ]]; then
-  echo "✓ verify_local: blocking passed; ${ADVISORY_ISSUES} advisory step(s) reported issues (${elapsed}s)"
-else
-  echo "✓ verify_local: all checks passed (${elapsed}s)"
-fi
+case "$ADVISORY_STATE" in
+  skipped)
+    echo "✓ verify_local: all blocking checks passed (${elapsed}s); advisory not requested"
+    ;;
+  skipped_no_ref)
+    echo "✓ verify_local: blocking passed (${elapsed}s); advisory skipped (${VERIFY_BASE} missing)"
+    ;;
+  skipped_no_merge_base)
+    echo "✓ verify_local: blocking passed (${elapsed}s); advisory skipped (no merge-base with ${VERIFY_BASE})"
+    ;;
+  ran_with_issues)
+    echo "✓ verify_local: blocking passed; ${ADVISORY_ISSUES} advisory step(s) reported issues (${elapsed}s)"
+    ;;
+  ran_clean)
+    echo "✓ verify_local: blocking + advisory checks passed (${elapsed}s)"
+    ;;
+esac

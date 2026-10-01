@@ -79,6 +79,30 @@ VERIFY_FETCH_ADVISORY=1 scripts/verify_local.sh --advisory
 
 This mirrors the `for i in 1 2 3` deepen loop in `lint.yml` for PR advisory steps.
 
+### Local `HEAD` vs CI `origin/pr-head`
+
+CI advisory steps diff **`origin/pr-head`** (the PR branch tip fetched from GitHub) against
+`origin/<base_ref>`. Locally, `--advisory` diffs **`HEAD`** (your current checkout, including
+uncommitted work) against `VERIFY_BASE` (default `origin/main`). That is intentional: you can
+run advisory checks on a dirty tree before commit. If local advisory is clean but CI still
+prints findings, compare the same refs (`git fetch origin pull/N/head:pr-head` and pass
+`VERIFY_BASE=origin/main` with a temporary branch checkout matching the PR).
+
+### Reliability guarantees
+
+The wrapper is designed for unattended cloud-agent and shallow-clone runs:
+
+- **`set -euo pipefail`** — pipeline and unset-variable failures surface immediately.
+- **Preflight** — every bundled checker script must exist before any step runs (blocking always;
+  advisory scripts are checked only when `--advisory` is passed).
+- **Python ≥ 3.11** — matches `pyproject.toml`; fails before slow scans.
+- **Interrupt handling** — Ctrl+C prints which step was active and exits `130`.
+- **Self syntax-check** — `bash -n` on the wrapper at startup (catches a broken script before
+  a 60s compat scan).
+- **Advisory never fails the process** — exit `0` when blocking passed, even if advisory steps
+  exited non-zero; the closing summary line states `advisory skipped`, `blocking + advisory`,
+  or `N advisory step(s) reported issues`.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -158,3 +182,5 @@ never skipped in CI).
 | Tests pass locally but fail in CI | Bare `pytest`, credentials set, or shared `HERMES_HOME` | Always use `scripts/run_tests.sh` |
 | `--advisory` fails the script | Older `verify_local.sh` treated advisory like blocking | Upgrade: advisory steps must not fail the wrapper (see above) |
 | `public-surface: cannot resolve ref` | Shallow clone / base not fetched | `git fetch origin main` or `VERIFY_FETCH_ADVISORY=1` |
+| Summary says `advisory skipped` | No `--advisory`, missing base ref, or no merge-base | Pass `--advisory`, `git fetch origin main`, or `VERIFY_FETCH_ADVISORY=1` |
+| Local advisory clean, CI advisory noisy | CI diffs `origin/pr-head`; local diffs `HEAD` | Align refs (see **Local HEAD vs CI pr-head** above) |
