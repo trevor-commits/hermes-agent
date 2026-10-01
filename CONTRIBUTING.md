@@ -211,8 +211,9 @@ scripts/verify_local.sh --ruff     # optional; same blocking ruff job as CI
 ```
 
 Optional advisory steps (profile-scope patterns, public-surface diff):
-`scripts/verify_local.sh --advisory` after `git fetch origin main`. Full parity
-table: [Local CI parity](website/docs/developer-guide/local-ci-parity.md).
+`scripts/verify_local.sh --advisory` after `git fetch origin main` (or
+`VERIFY_FETCH_ADVISORY=1` for CI-style deepen fetches). Advisory output never
+fails the script. Full parity table: [Local CI parity](website/docs/developer-guide/local-ci-parity.md).
 
 ### Run tests
 
