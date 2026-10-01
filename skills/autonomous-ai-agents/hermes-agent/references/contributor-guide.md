@@ -6,24 +6,23 @@ For occasional contributors and PR authors. Full developer docs: https://hermes-
 
 ```
 hermes-agent/
-├── run_agent.py          # AIAgent — core conversation loop
+├── run_agent.py          # AIAgent facade; turn loop in agent/turn_*.py
 ├── model_tools.py        # Tool discovery and dispatch
 ├── toolsets.py           # Toolset definitions
-├── cli.py                # Interactive CLI (HermesCLI)
-├── hermes_state.py       # SQLite session store
-├── agent/                # Prompt builder, context compression, memory, model routing, credential pooling, skill dispatch
-├── hermes_cli/           # CLI subcommands, config, setup, commands
-│   ├── commands.py       # Slash command registry (CommandDef)
-│   ├── config.py         # DEFAULT_CONFIG, env var definitions
-│   └── main.py           # CLI entry point and argparse
-├── tools/                # One file per tool
-│   └── registry.py       # Central tool registry
-├── gateway/              # Messaging gateway
-│   └── platforms/        # Platform adapters (telegram, discord, etc.)
+├── cli.py                # HermesCLI facade + hermes_cli/cli_*_mixin.py
+├── hermes_state.py       # SessionDB facade + hermes_state_*.py siblings
+├── agent/                # Turn loop, prompt, compression, memory, providers
+├── hermes_cli/           # CLI subcommands, config, plugins, web routers
+├── tools/                # Tool implementations + registry.py
+├── gateway/              # Messaging gateway (run.py + run_*.py, platforms/)
 ├── cron/                 # Job scheduler
-├── tests/                # Extensive pytest suite (run via scripts/run_tests.sh)
-└── website/              # Docusaurus docs site
+├── tests/                # Pytest (always scripts/run_tests.sh)
+├── skills/ + optional-skills/
+└── website/              # Docusaurus docs
 ```
+
+Large modules are **facades + topic siblings** (`<stem>_<topic>.py`). Find symbols with
+`grep -rn "def name" <dir>/<stem>_*.py` — see root `AGENTS.md` § Facade + siblings layout.
 
 Config: `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys) — both under `$HERMES_HOME` when it is set.
 
@@ -65,10 +64,10 @@ never hardcode `~/.hermes`. For custom/local-only tools, write a plugin in
 ### Adding a Slash Command
 
 1. Add `CommandDef` to `COMMAND_REGISTRY` in `hermes_cli/commands.py`
-2. Add handler in `cli.py` → `process_command()`
-3. (Optional) Add gateway handler in `gateway/run.py`
+2. Wire handler in `cli.py` → `_SLASH_DISPATCH` / the matching `hermes_cli/cli_*_mixin.py` method (see `hermes_cli/AGENTS.md`)
+3. (Optional) Gateway handler in `gateway/run.py` or slash mixins
 
-All consumers (help text, autocomplete, Telegram menu, Slack mapping) derive from the central registry automatically.
+Help text, autocomplete, Telegram menu, and Slack mapping derive from `COMMAND_REGISTRY` automatically.
 
 ### Agent Loop (High Level)
 

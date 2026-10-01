@@ -33,8 +33,7 @@ make `delegate_task` durable across restarts; that is the kanban swarm's job.
 
 Reach for it when the unit of work is clear (a file, an endpoint, a record) and
 there are more units than one context can hold. Skip it for under ~10 units or
-for serial chains. For a refactor or fix campaign on hermes-agent itself, load
-`hermes-agent` (the dev workflow) alongside; this skill owns the fan-out shape.
+for serial chains. For a refactor or fix campaign on hermes-agent itself, preload **`hermes-agent-dev`** (or **`hermes-agent`**) alongside; this skill owns the fan-out shape.
 
 ## Prerequisites
 

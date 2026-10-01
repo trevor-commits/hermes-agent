@@ -56,8 +56,9 @@ Every new or modernised skill — bundled, optional, or contributed — meets al
    usually stale; edits outside the skill's own block are dropped during salvage.
 
 No `offset`/`limit` pagination on skill-loading tools — the agent must read a skill fully (root).
-The salvage/modernisation checklist for external skill PRs is `references/new-skill-pr-salvage.md`
-in the `hermes-agent-dev` skill.
+The salvage/modernisation checklist for external skill PRs is
+`skills/software-development/hermes-agent-dev/references/new-skill-pr-salvage.md` (also load via the
+`hermes-agent-dev` skill).
 
 ## Curator (skill lifecycle)
 

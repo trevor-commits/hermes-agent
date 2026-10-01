@@ -524,5 +524,13 @@ extract, not to regex around it.
 
 Long-form background lives in `website/docs/developer-guide/` (agent-loop, prompt-assembly,
 context-compression-and-caching, gateway-internals, tools-runtime, plugins/, cron-internals,
-session-storage, ...). Workflow rules (PR/issue/review/salvage process) live in the
-`hermes-agent-dev` skill, not here.
+session-storage, ...). Workflow rules (PR/issue/review/salvage, coordinator fleets) live in the
+bundled **`hermes-agent-dev`** skill (`skills/software-development/hermes-agent-dev/`), not here.
+
+## Agent harness files (this repo)
+
+| File | Role |
+|---|---|
+| **`AGENTS.md`** (root + per-area) | Canonical rules for Hermes and other agents that honor `AGENTS.md`; Hermes merges the git-root → cwd chain at session start. |
+| **`CLAUDE.md`** (root) | Thin Claude Code entrypoint that `@`-imports `AGENTS.md` — do not duplicate long rule blocks here. |
+| **`hermes-agent-dev` skill** | In-tree workflow: tests, PR salvage, profile-scope reminders, Cursor Cloud Agent / coordinator fleet notes (`references/coordinator-fleet.md`). Preload with `hermes -s hermes-agent-dev` when developing this checkout. |
