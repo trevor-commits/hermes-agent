@@ -2179,6 +2179,9 @@ def _prepare_job_prompt(
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
+        if job.get("completion_script"):
+            error = "completion_script requires an agent-backed job; no_agent scripts already determine success."
+            return (False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error), None
         return _run_no_agent_job(job, job_id, job_name, cancel_event), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
@@ -2523,18 +2526,26 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        error = _cron_failure_marker_error(final_response)
+        if error is None:
+            error = _completion_script_error(
+                job, execution_id=execution_id, workdir=scope.workdir, cancel_event=cancel_event)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
-                and _cron_failure_marker_error(final_response) is None):
+                and error is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
-        logger.info("Job '%s' completed successfully", job_name)
-        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        success = True
-        return success, output, final_response, None
+        success = error is None
+        if success:
+            logger.info("Job '%s' completed successfully", job_name)
+        else:
+            output += f"\n## Completion failure\n\n{error}\n"
+            logger.warning("Job '%s' did not pass completion: %s", job_name, error)
+        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), error)
+        return success, output, final_response, error
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -3240,7 +3251,7 @@ def _run_one_job_body(
         # declare that semantic failure so the existing failure path updates status, streaks,
         # ledger, and notification routing instead of recording a false healthy result.
         agent_declared = False
-        if success and not job.get("no_agent"):
+        if not job.get("no_agent"):
             marker_error = _cron_failure_marker_error(final_response)
             if marker_error is not None:
                 success, error, agent_declared = False, marker_error, True
@@ -4157,7 +4168,7 @@ from cron.scheduler_delivery import (  # noqa: E402
     _resolve_delivery_targets,
 )
 from cron.scheduler_script import (  # noqa: E402
-    _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
+    _completion_script_error, _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (  # noqa: E402
     _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_wake_gate,

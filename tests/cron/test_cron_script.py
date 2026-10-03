@@ -70,6 +70,32 @@ class TestJobScriptField:
         updated = update_job(job["id"], {"script": "/new/script.py"})
         assert updated["script"] == "/new/script.py"
 
+    def test_optional_completion_script_roundtrip_and_clear(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        legacy = create_job(prompt="Hello", schedule="every 1h")
+        assert "completion_script" not in get_job(legacy["id"])
+        update_job(legacy["id"], {"completion_script": "  verify.py  "})
+        assert get_job(legacy["id"])["completion_script"] == "verify.py"
+        update_job(legacy["id"], {"completion_script": ""})
+        assert get_job(legacy["id"])["completion_script"] is None
+        created = create_job(prompt="Hello", schedule="every 1h", completion_script="verify.py")
+        assert get_job(created["id"])["completion_script"] == "verify.py"
+
+    def test_invalid_completion_script_does_not_mutate_job(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(prompt="Hello", schedule="every 1h")
+        with pytest.raises(ValueError, match="completion_script"):
+            update_job(job["id"], {"completion_script": ["verify.py"]})
+        assert "completion_script" not in get_job(job["id"])
+        with pytest.raises(ValueError, match="agent-backed"):
+            create_job(prompt=None, schedule="every 1h", no_agent=True,
+                       script="run.py", completion_script="verify.py")
+        with pytest.raises(ValueError, match="agent-backed"):
+            update_job(job["id"], {"no_agent": True, "script": "run.py", "completion_script": "verify.py"})
+        assert get_job(job["id"])["no_agent"] is False
+
 
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob

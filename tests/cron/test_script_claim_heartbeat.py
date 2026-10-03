@@ -106,17 +106,18 @@ def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("no_agent", "script_output"),
+    ("no_agent", "script_output", "completion_check"),
     [
-        (True, "watchdog complete"),
-        (False, '{"wakeAgent": false}'),
+        (True, "watchdog complete", False),
+        (False, '{"wakeAgent": false}', False),
+        (False, "completion verified", True),
     ],
-    ids=("script-only-job", "pre-agent-script"),
+    ids=("script-only-job", "pre-agent-script", "completion-script"),
 )
 def test_long_running_script_refreshes_owned_claim_in_profile_store(
-    tmp_path, monkeypatch, no_agent, script_output
+    tmp_path, monkeypatch, no_agent, script_output, completion_check
 ):
-    """Both blocking script paths keep their one-shot claim alive.
+    """Each blocking script path keeps its one-shot claim alive.
 
     The real store update runs on the heartbeat thread.  A second store holds
     the same job ID, proving the thread inherited the active profile's
@@ -135,6 +136,7 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
     monkeypatch.setattr(jobs, "JOBS_FILE", default_cron / "jobs.json")
     monkeypatch.setattr(jobs, "OUTPUT_DIR", default_cron / "output")
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile_home)
 
     original_timestamp = "2026-07-12T12:00:00+00:00"
     original_time = datetime.fromisoformat(original_timestamp)
@@ -184,6 +186,11 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         return updated
 
     def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
+        if completion_check:
+            assert kwargs["extra_env"] == {
+                "HERMES_HOME": str(profile_home), "HERMES_CRON_JOB_ID": "long-script",
+                "HERMES_CRON_EXECUTION_ID": "current-fire",
+            }
         assert heartbeat_seen.wait(timeout=2), (
             "claim was not refreshed while script blocked"
         )
@@ -196,7 +203,12 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         jobs.use_cron_store(profile_home),
         patch("hermes_state_registry.acquire", return_value=MagicMock()),
     ):
-        success, _doc, _response, error = scheduler.run_job(claimed_job)
+        if completion_check:
+            claimed_job["completion_script"] = "verify.py"
+            error = sched_script._completion_script_error(claimed_job, execution_id="current-fire")
+            success = error is None
+        else:
+            success, _doc, _response, error = scheduler.run_job(claimed_job)
         profile_claim = jobs.get_job("long-script")["run_claim"]
 
     assert success is True

@@ -1,5 +1,10 @@
-"""Cron pre-run script execution: timeouts, Windows venv bootstrap, process-tree termination,
-and the claim-heartbeat thread that keeps a long script's run claim alive.
+"""Cron pre-run and completion scripts: timeouts, Windows venv bootstrap, process-tree
+termination, and the claim-heartbeat thread that keeps a long script's run claim alive.
+
+An optional ``completion_script`` on an agent-backed job must exit zero before the run can
+complete. It receives host-owned ``HERMES_CRON_EXECUTION_ID``, ``HERMES_CRON_JOB_ID``, and
+``HERMES_HOME`` values in its child environment. It uses the same scripts-directory boundary,
+timeout, cancellation, and claim heartbeat as other cron scripts; it never changes agent text.
 
 Split out of ``cron.scheduler``. Import names from this module directly (``cron.scheduler`` only
 imports the few it calls itself). Origin-resident helpers and sibling split modules are reached
@@ -337,6 +342,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *, extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -384,6 +390,8 @@ def _run_job_script(
         # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        if extra_env:
+            env.update(extra_env)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -457,6 +465,7 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *, extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while heartbeating its owned one-shot claim. A long script can outlive
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
@@ -465,8 +474,11 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    script_kwargs = {"workdir": workdir, "cancel_event": cancel_event}
+    if extra_env is not None:
+        script_kwargs["extra_env"] = extra_env
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -484,14 +496,42 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, **script_kwargs)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _completion_script_error(
+    job: dict, *, execution_id: Optional[str], workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> Optional[str]:
+    """An opt-in check can veto an agent's success; its identity belongs only to this child."""
+    script = job.get("completion_script")
+    if script is None or (isinstance(script, str) and not script.strip()):
+        return None
+    if not isinstance(script, str):
+        return "Completion check failed: completion_script must be a script path."
+    job_id = job.get("id")
+    if not isinstance(execution_id, str) or not execution_id.strip() or not isinstance(job_id, str) or not job_id.strip():
+        return "Completion check failed: host execution and job identity are required."
+    try:
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        check_gateway_lifecycle("", script)
+        ok, output = _run_job_script_with_claim_heartbeat(
+            job, script, workdir=workdir, cancel_event=cancel_event,
+            extra_env={
+                "HERMES_CRON_EXECUTION_ID": execution_id,
+                "HERMES_CRON_JOB_ID": job_id,
+                "HERMES_HOME": str(_sched._get_hermes_home()),
+            })
+    except Exception as exc:
+        return f"Completion check failed: {type(exc).__name__}: {exc}"
+    return None if ok else f"Completion check failed: {output}"
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

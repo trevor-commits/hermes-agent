@@ -13,8 +13,11 @@ best-effort: a probe failure keeps the historical reason rather than
 mislabeling a healthy run.
 """
 
+import json
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -67,6 +70,7 @@ class _RecordingSessionDB:
 
 def _run_booked_job(
     monkeypatch, tmp_path, *, db_class=_RecordingSessionDB, agent_class=_FakeCronAgent,
+    job_fields=None, execution_id=None, cancel_event=None, dispatch=False,
 ):
     import hermes_state
     import run_agent
@@ -106,13 +110,16 @@ def _run_booked_job(
     monkeypatch.setattr(
         cron_scheduler, "_guard_job_credential_exfil", lambda _job: None
     )
-    result = cron_scheduler.run_job(
-        {
-            "id": "verify-complete",
-            "name": "Verification",
-            "prompt": "Do the thing",
-            "schedule_display": "manual",
-        }
+    job = {
+        "id": "verify-complete",
+        "name": "Verification",
+        "prompt": "Do the thing",
+        "schedule_display": "manual",
+        **(job_fields or {}),
+    }
+    result = (
+        cron_scheduler.run_one_job(job, cancel_event=cancel_event) if dispatch
+        else cron_scheduler.run_job(job, execution_id=execution_id, cancel_event=cancel_event)
     )
     return instances, result
 
@@ -233,3 +240,230 @@ def test_known_failure_cannot_fail_open_on_lifecycle_probe(monkeypatch, tmp_path
 
     assert result[0] is False
     assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
+
+
+def test_explicit_failure_marker_is_applied_before_session_finalization(monkeypatch, tmp_path):
+    response = "[CRON_FAILURE]\nThe required receipt is partial."
+
+    class PartialAgent(_FakeCronAgent):
+        def run_conversation(self, prompt, **kwargs):
+            return {"completed": True, "failed": False, "final_response": response}
+
+    instances, result = _run_booked_job(monkeypatch, tmp_path, agent_class=PartialAgent)
+
+    assert result[0] is False
+    assert result[2] == response
+    assert result[3] == "The required receipt is partial."
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
+
+
+@pytest.mark.parametrize("receipt,expected_success", [
+    ({"status": "complete", "execution_id": "current-fire"}, True),
+    ({"status": "partial", "execution_id": "current-fire"}, False),
+    ({"status": "complete", "execution_id": "older-fire"}, False),
+    (None, False),
+])
+def test_completion_check_gates_audit_and_session_before_success(
+    monkeypatch, tmp_path, receipt, expected_success,
+):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "verify.py").write_text(
+        "import json, os\nfrom pathlib import Path\n"
+        "p = Path(os.environ['HERMES_HOME']) / 'receipt.json'\n"
+        "r = json.loads(p.read_text()) if p.exists() else {}\n"
+        "ok = r.get('status') == 'complete' and r.get('execution_id') == os.environ['HERMES_CRON_EXECUTION_ID']\n"
+        "print(json.dumps({'verified': ok}))\nraise SystemExit(0 if ok else 2)\n"
+    )
+    if receipt is not None:
+        (tmp_path / "receipt.json").write_text(json.dumps(receipt))
+    audit = []
+    monkeypatch.setattr(cron_scheduler._FireAudit, "write", lambda self, result, error: audit.append(error))
+    instances, result = _run_booked_job(
+        monkeypatch, tmp_path, job_fields={"completion_script": "verify.py"}, execution_id="current-fire",
+    )
+    assert result[0] is expected_success
+    assert result[2] == "done"  # Keep the agent's diagnostic response even when its claim is rejected.
+    assert "done" in result[1]
+    assert len(audit) == 1
+    assert (audit[0] is None) is expected_success
+    if not expected_success:
+        assert "Script exited with code 2" in result[3]
+        assert audit == [result[3]]
+    assert [reason for _sid, reason in instances[0].ended] == [
+        "cron_complete" if expected_success else "cron_failed"
+    ]
+
+
+@pytest.mark.parametrize("response,script_exit,expected_success", [
+    ("done", 0, True),
+    ("done", 2, False),
+    ("[CRON_FAILURE]\nThe required receipt is partial.", 0, False),
+])
+def test_completion_outcome_agrees_in_native_job_ledger_and_session(
+    monkeypatch, tmp_path, response, script_exit, expected_success,
+):
+    from cron import executions, jobs
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+
+    class PersistingAgent(_FakeCronAgent):
+        def __init__(self, *, session_id, session_db, **kwargs):
+            self.session_id, self.db = session_id, session_db
+
+        def run_conversation(self, prompt, **kwargs):
+            self.db.create_session(self.session_id, "cron")
+            self.db.append_message(self.session_id, "user", prompt)
+            self.db.append_message(self.session_id, "assistant", response)
+            return {"completed": True, "failed": False, "final_response": response}
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "verify.py").write_text(
+        "import os, sqlite3\nfrom pathlib import Path\n"
+        "home = Path(os.environ['HERMES_HOME'])\n"
+        "with sqlite3.connect(f'file:{home}/cron/executions.db?mode=ro', uri=True) as db:\n"
+        "    row = db.execute('SELECT job_id, status FROM executions WHERE id=?', "
+        "(os.environ['HERMES_CRON_EXECUTION_ID'],)).fetchone()\n"
+        "assert row == (os.environ['HERMES_CRON_JOB_ID'], 'running')\n"
+        "(home / 'check-ran').write_text('verified the exact running execution')\n"
+        f"raise SystemExit({script_exit})\n"
+    )
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setattr(cron_scheduler, "_launch_external_cron_worker", lambda _job: False)
+    token = set_hermes_home_override(tmp_path)
+    try:
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(prompt="Do the thing", schedule="every 1h", deliver="local",
+                                  completion_script="verify.py")
+            _, processed = _run_booked_job(
+                monkeypatch, tmp_path, db_class=lambda **kw: SessionDB(db_path=db_path),
+                agent_class=PersistingAgent, job_fields=job, dispatch=True,
+            )
+            assert processed is True
+            saved = jobs.get_job(job["id"])
+            assert saved["last_status"] == ("ok" if expected_success else "error")
+            assert saved["failure_streak"] == (0 if expected_success else 1)
+            ledger = executions.list_executions(job_id=job["id"])
+    finally:
+        reset_hermes_home_override(token)
+
+    assert len(ledger) == 1
+    assert ledger[0]["status"] == ("completed" if expected_success else "failed")
+    assert ledger[0]["error"] == saved["last_error"]
+    assert (tmp_path / "check-ran").exists() is (not response.startswith("[CRON_FAILURE]"))
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        end_reason, = db.execute("SELECT end_reason FROM sessions").fetchone()
+    assert end_reason == ("cron_complete" if expected_success else "cron_failed")
+
+
+def test_completion_check_requires_host_identity_without_running_script(monkeypatch, tmp_path):
+    from cron import scheduler_script
+
+    def unexpected_script(*args, **kwargs):
+        pytest.fail("script must not run without host identity")
+
+    monkeypatch.setattr(scheduler_script, "_run_job_script", unexpected_script)
+    instances, result = _run_booked_job(
+        monkeypatch, tmp_path,
+        job_fields={"completion_script": "verify.py", "execution_id": "untrusted-stored-fire"},
+    )
+    assert result[0] is False
+    assert "host execution and job identity are required" in result[3]
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
+
+
+@pytest.mark.parametrize("completion_script", [None, "", "  "])
+def test_unconfigured_check_preserves_recoverable_tool_failure(monkeypatch, tmp_path, completion_script):
+    class RecoveredAgent(_FakeCronAgent):
+        def run_conversation(self, prompt, **kwargs):
+            return {"completed": True, "failed": False, "final_response": "Recovered successfully.",
+                    "tool_results": [{"exit_code": 2}]}
+
+    instances, result = _run_booked_job(
+        monkeypatch, tmp_path, agent_class=RecoveredAgent,
+        job_fields={"completion_script": completion_script},
+    )
+    assert result[0] is True
+    assert result[3] is None
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_complete"]
+
+
+def test_quoted_failure_marker_remains_ordinary_response(monkeypatch, tmp_path):
+    class QuotingAgent(_FakeCronAgent):
+        def run_conversation(self, prompt, **kwargs):
+            return {"completed": True, "failed": False,
+                    "final_response": "The old report quoted [CRON_FAILURE]; the current check passed."}
+
+    instances, result = _run_booked_job(monkeypatch, tmp_path, agent_class=QuotingAgent)
+    assert result[0] is True
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_complete"]
+
+
+@pytest.mark.parametrize("script", ["missing.py", "../outside.py"])
+def test_completion_check_keeps_script_path_guard(monkeypatch, tmp_path, script):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "outside.py").write_text("raise SystemExit(0)\n")
+    instances, result = _run_booked_job(
+        monkeypatch, tmp_path, job_fields={"completion_script": script}, execution_id="fire",
+    )
+    assert result[0] is False
+    assert "Script not found" in result[3] or "outside the scripts directory" in result[3]
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_completion_check_keeps_timeout_and_cancellation(monkeypatch, tmp_path, cancelled):
+    from cron.scheduler_script import _completion_script_error
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "slow.py").write_text("import time\ntime.sleep(60)\n")
+    monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(cron_scheduler, "_SCRIPT_TIMEOUT", 2)
+    cancel = threading.Event()
+    if cancelled:
+        cancel.set()
+    error = _completion_script_error(
+        {"id": "job", "completion_script": "slow.py"}, execution_id="fire", cancel_event=cancel,
+    )
+    assert ("cancelled" if cancelled else "timed out") in error
+
+
+def test_completion_check_scopes_concurrent_profiles_and_restores_parent_env(monkeypatch, tmp_path):
+    from cron.scheduler_script import _completion_script_error
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+
+    monkeypatch.setattr(cron_scheduler, "_get_hermes_home", get_hermes_home)
+    monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "parent-fire")
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", "parent-job")
+    parent_env = dict(os.environ)
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for home in homes:
+        (home / "scripts").mkdir(parents=True)
+        (home / "scripts" / "verify.py").write_text(
+            "import json, os\nfrom pathlib import Path\n"
+            "p = Path(__file__).resolve().parents[1]\n"
+            "got = {k: os.environ[k] for k in ('HERMES_HOME', 'HERMES_CRON_JOB_ID', 'HERMES_CRON_EXECUTION_ID')}\n"
+            "(p / 'seen.json').write_text(json.dumps(got))\n"
+            "assert Path(got['HERMES_HOME']).resolve() == p\n"
+            "assert got['HERMES_CRON_JOB_ID'] == 'same-job'\n"
+            "assert got['HERMES_CRON_EXECUTION_ID'] == p.name\n"
+        )
+
+    def verify(home):
+        token = set_hermes_home_override(home)
+        try:
+            return _completion_script_error(
+                {"id": "same-job", "completion_script": "verify.py"}, execution_id=home.name,
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(verify, homes)) == [None, None]
+    assert verify(homes[0]) is None  # A -> B -> A does not retain the sibling's identity.
+    for home in homes:
+        seen = json.loads((home / "seen.json").read_text())
+        assert seen["HERMES_CRON_EXECUTION_ID"] == home.name
+    assert dict(os.environ) == parent_env
