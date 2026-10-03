@@ -170,6 +170,16 @@ def _get_service_pids(all_profiles: bool = False) -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
+        from hermes_constants import get_hermes_home
+
+        # Protection only: include the system owner's raw service PID even while its
+        # replacement is still booting and has not published gateway_state.json yet.
+        with contextlib.suppress(LaunchdGatewayOwnershipError, FileNotFoundError, subprocess.TimeoutExpired):
+            system_home = _system_launchd_gateway_home()
+            if system_home is not None and (all_profiles or get_hermes_home().resolve() == system_home):
+                _loaded, pid = _launchd_print_service_pid("system", _SYSTEM_GATEWAY_LABEL)
+                if pid is not None and pid > 0:
+                    pids.add(pid)
         labels = {get_launchd_label()}
         if all_profiles:
             # Whole fleet, mirroring the systemd ``hermes-gateway*`` glob above.
@@ -3917,6 +3927,12 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 
 from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-exports; tests patch here
     get_launchd_label,
+    _SYSTEM_GATEWAY_LABEL,
+    LaunchdGatewayOwnershipError,
+    _system_launchd_gateway_home,
+    system_launchd_gateway_owner,
+    restart_system_launchd_gateway,
+    _handle_system_launchd_gateway_action,
     _probe_launchd_domain_for_label,
     _launchd_domain,
     _LAUNCHD_JOB_UNLOADED_EXIT_CODES,
@@ -4866,6 +4882,9 @@ def gateway_command(args):
         # System-scope action typed without sudo; the wizard intercepts this earlier with guidance.
         print(str(e))
         sys.exit(1)
+    except LaunchdGatewayOwnershipError as e:
+        print_error(str(e))
+        sys.exit(1)
     except (subprocess.CalledProcessError, RuntimeError) as e:
         # systemctl exited non-zero or is missing entirely: guidance, not a traceback.
         from hermes_cli.gateway_command_errors import explain_service_failure
@@ -5156,6 +5175,7 @@ def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -
 
 
 def _cmd_install(args):
+    _handle_system_launchd_gateway_action("install")
     if is_managed():
         managed_error("install gateway service")
         return
@@ -5188,6 +5208,7 @@ def _cmd_install(args):
 
 
 def _cmd_uninstall(args):
+    _handle_system_launchd_gateway_action("uninstall")
     _refuse_from_inside_gateway("uninstall", "the gateway from terminating itself")
     if is_managed():
         managed_error("uninstall gateway service")
@@ -5239,6 +5260,8 @@ def _print_unfolded_gateway_note(owner) -> None:
 
 
 def _cmd_start(args):
+    if _handle_system_launchd_gateway_action("start", all_profiles=getattr(args, "all", False)):
+        return
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("start", args):
         return
@@ -5273,6 +5296,7 @@ def _cmd_start(args):
 
 
 def _cmd_stop(args):
+    _handle_system_launchd_gateway_action("stop", all_profiles=getattr(args, "all", False))
     _refuse_from_inside_gateway("stop", "restart loops")
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("stop", args):
@@ -5386,6 +5410,8 @@ def _restart_all(system: bool) -> None:
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
+    if _handle_system_launchd_gateway_action("restart", all_profiles=getattr(args, "all", False)):
+        return
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return

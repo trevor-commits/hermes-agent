@@ -105,16 +105,46 @@ def test_detached_worker_teardown_waits_for_future():
     with patch("cron.scheduler._finalize_cron_session") as finalize, \
          patch("cron.scheduler._teardown_cron_agent") as teardown_agent:
         assert defer_teardown_to_running_worker(
-            future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker") is True
+            future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker",
+            success=False) is True
         finalize.assert_not_called()
         teardown_agent.assert_not_called()
 
         future.set_result({"final_response": "late"})
 
-        finalize.assert_called_once_with(fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker")
+        finalize.assert_called_once_with(fake_db, agent, "detached-worker", "detached worker",
+                                         "cron_detached-worker", success=False)
         teardown_agent.assert_called_once_with(agent, "detached-worker")
     assert defer_teardown_to_running_worker(
-        future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker") is False
+        future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker",
+        success=False) is False
+
+
+def test_detached_worker_late_reply_preserves_failed_run(tmp_path):
+    """A reply after the watchdog failed the run cannot become a healthy session."""
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    database = SessionDB(db_path=path)
+    sid = "cron_late_reply"
+    database.create_session(sid, "cron")
+    database.append_message(sid, "user", "work")
+    future = Future()
+    agent = MagicMock(session_id=sid)
+    try:
+        assert defer_teardown_to_running_worker(
+            future, database, agent, "late-reply", "late reply", sid, success=False)
+        database.append_message(sid, "assistant", "late answer")
+        future.set_result({"completed": True, "failed": False, "final_response": "late answer"})
+    finally:
+        database.close()
+
+    reopened = SessionDB(db_path=path, read_only=True)
+    try:
+        assert reopened.get_session(sid)["end_reason"] == "cron_failed"
+        assert reopened.session_lifecycle_statuses([sid]) == {sid: "error"}
+    finally:
+        reopened.close()
 
 
 def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):

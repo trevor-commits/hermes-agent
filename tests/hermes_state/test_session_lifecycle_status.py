@@ -142,6 +142,19 @@ def test_session_lifecycle_statuses_unknown_id(db):
     }
 
 
+@pytest.mark.parametrize("diagnostic_tail", [False, True])
+def test_recorded_cron_failure_wins_over_message_shape(db, diagnostic_tail):
+    db.create_session("failed_cron", source="cron")
+    if diagnostic_tail:
+        db.append_message("failed_cron", "assistant", "Provider unavailable")
+    db.end_session("failed_cron", "cron_failed")
+
+    assert db.session_lifecycle_statuses(["failed_cron"]) == {"failed_cron": SESSION_STATUS_ERROR}
+    db.reopen_session("failed_cron")
+    db.append_message("failed_cron", "assistant", "Recovered", finish_reason="stop")
+    assert db.session_lifecycle_statuses(["failed_cron"]) == {"failed_cron": SESSION_STATUS_COMPLETE}
+
+
 # ---------------------------------------------------------------------------
 # Picker helpers (status annotation + delete wiring)
 # ---------------------------------------------------------------------------

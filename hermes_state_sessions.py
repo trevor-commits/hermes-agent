@@ -1376,25 +1376,28 @@ class SessionSessionsMixin:
         return sessions
 
     def session_lifecycle_statuses(self, session_ids: List[str]) -> Dict[str, str]:
-        """``{session_id: status}`` from each session's LAST message row (``'empty'`` when none); one
-        query, MAX(id) per session joined back — never scans transcripts."""
+        """``{session_id: status}`` from each session's LAST message row (``'empty'`` when none).
+        A recorded cron failure wins over a diagnostic assistant tail; never scans transcripts."""
         ids = [sid for sid in (session_ids or []) if sid]
         if not ids:
             return {}
         statuses: Dict[str, str] = {sid: "empty" for sid in ids}
         rows = self._read_all(f"""
-            SELECT m.session_id, m.role,
+            SELECT s.id AS session_id, s.end_reason, m.id AS message_id, m.role,
                    m.tool_calls IS NOT NULL AS has_tool_calls,
                    m.finish_reason
-            FROM messages m
-            JOIN (
-                SELECT session_id, MAX(id) AS max_id
-                FROM messages
-                WHERE session_id IN ({_session_ids_placeholders(ids)})
-                GROUP BY session_id
-            ) latest ON m.id = latest.max_id
+            FROM sessions s
+            LEFT JOIN messages m ON m.id = (
+                SELECT MAX(id) FROM messages WHERE session_id = s.id
+            )
+            WHERE s.id IN ({_session_ids_placeholders(ids)})
         """, ids)
         for row in rows:
+            if row["end_reason"] == "cron_failed":
+                statuses[row["session_id"]] = SESSION_STATUS_ERROR
+                continue
+            if row["message_id"] is None:
+                continue
             statuses[row["session_id"]] = classify_session_status(
                 role=row["role"], has_tool_calls=bool(row["has_tool_calls"]),
                 finish_reason=row["finish_reason"],

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from hermes_cli.update_cmd_common import _best_effort
 from hermes_cli.update_inventory import _gateway_service_matches_profile
+from hermes_cli.gateway_launchd import LaunchdGatewayOwnershipError
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
@@ -887,8 +888,13 @@ def _restart_launchd_gateway_after_update(
     from hermes_cli.gateway import (
         get_launchd_label, get_launchd_plist_path, launchd_restart, wait_for_launchd_gateway_supervision,
         _is_pid_ancestor_of_current_process, _launchctl_supervised_pid,
+        _SYSTEM_GATEWAY_LABEL, system_launchd_gateway_owner, restart_system_launchd_gateway,
     )
     current_label = get_launchd_label()
+    if current_label == "ai.hermes.gateway" and (owner := system_launchd_gateway_owner()) is not None:
+        if restart_system_launchd_gateway(owner, _gateway_drain_budget(), self_restart_pending=self_restart_pending):
+            return [_SYSTEM_GATEWAY_LABEL], []
+        return [], [_SYSTEM_GATEWAY_LABEL]
     old_pid = None
     try:
         if not get_launchd_plist_path().exists():
@@ -964,17 +970,25 @@ def _restart_macos_launchd_gateways(
         get_launchd_label, get_launchd_plist_path, launchd_gateway_labels_for_install, legacy_launchd_labels_for_install,
         _graceful_restart_via_sigusr1, _launchd_kickstart,
         _locate_launchd_gateway_service, _wait_for_launchd_service_pid,
+        _SYSTEM_GATEWAY_LABEL, system_launchd_gateway_owner, restart_system_launchd_gateway,
     )
+    # Resolve before ANY service mutation. A stale GUI plist must not supersede a
+    # system owner, including when a named profile invokes this fleet update.
+    system_owner = system_launchd_gateway_owner()
     if require_supervision:
         listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
-    _restarted, _failed = _restart_launchd_gateway_after_update(
-        supervision_verify=True, self_restart_pending=self_restart_pending)
-    restarted_services.extend(_restarted)
-    failed_or_stale_units.extend(_failed)
     current_label = get_launchd_label()
+    if system_owner is not None:
+        succeeded = restart_system_launchd_gateway(system_owner, drain_budget, self_restart_pending=self_restart_pending)
+        (restarted_services if succeeded else failed_or_stale_units).append(_SYSTEM_GATEWAY_LABEL)
+    if system_owner is None or current_label != "ai.hermes.gateway":
+        _restarted, _failed = _restart_launchd_gateway_after_update(
+            supervision_verify=True, self_restart_pending=self_restart_pending)
+        restarted_services.extend(_restarted)
+        failed_or_stale_units.extend(_failed)
 
     derived_labels = launchd_gateway_labels_for_install()
     # Units labelled before the profile-name suffix scheme (ai.hermes.gateway-<hash>) are invisible
@@ -986,7 +1000,7 @@ def _restart_macos_launchd_gateways(
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
     for label in derived_labels + legacy_labels:
-        if label == current_label:
+        if label == current_label or (system_owner is not None and label == "ai.hermes.gateway"):
             continue
         # Labels are account-global: root B's default profile derives the same bare label root A
         # installed. A plist pinning a foreign HERMES_HOME is another install's job (#93349).
@@ -1786,6 +1800,16 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
         out.record_receipt()
         _force_kill_stuck_gateways(out.killed_pids)
 
+    except LaunchdGatewayOwnershipError as e:
+        # Do not send an ownership refusal into fresh-child recovery: its generic
+        # profile restart could otherwise recreate the very GUI owner we refused.
+        out.incomplete = True
+        out.phase_errors.append(str(e))
+        out.failed_or_stale_units.append("ai.hermes.gateway.daemon")
+        print(f"  ✗ {e}; gateway owners were left unchanged.")
+        out.record_receipt(phase_error=str(e))
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
     except Exception as e:
         _recover_after_restart_phase_abort(
             e, _pre_update_plan, out, gateway_mode=gateway_mode, restarted_scoped_units=restarted_scoped_units

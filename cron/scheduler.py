@@ -2063,7 +2063,9 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
-def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> None:
+def _finalize_cron_session(
+    session_db, agent, job_id: str, job_name: str, cron_session_id: str, *, success: bool,
+) -> None:
     """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
     _session_db = _BoundedCronSessionDB(session_db, job_id)
@@ -2108,31 +2110,23 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
                     break
             except (Exception, KeyboardInterrupt):
                 continue
-    # Book cron_complete only when the last row is a real assistant reply ([SILENT] counts). Only a
-    # POSITIVELY recognized bad status downgrades (keep tuple in sync with
-    # session_lifecycle_statuses); unknown values / probe failures fail OPEN.
-    # Verified completion booking (#93820): the run may only be recorded as cron_complete when the session's
-    # LAST message row is a real assistant reply — a plain answer or the [SILENT] sentinel (both are
-    # assistant-text rows, so both classify as 'complete'). A turn that died after a tool call,
-    # mid-API-wait, or without any assistant text leaves the last row as a tool result / pending call / user
-    # prompt and must not surface as a healthy run. session_lifecycle_statuses is the existing cost-bounded
-    # classifier for exactly this shape. Only a POSITIVELY recognized pathological status (see the status
-    # vocabulary in hermes_state's session_lifecycle_statuses docstring — keep the tuple below in sync when
-    # it grows) downgrades the booking: an unknown value (newer classifier shape, test doubles) keeps the
-    # historical reason, and so does a failed probe — the booking itself is FAIL-OPEN on probe errors,
-    # because classification is best-effort metadata and must not mislabel a healthy run.
-    _end_reason = "cron_complete"
-    try:
-        _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
-        _lifecycle = _statuses.get(_final_cron_session_id)
-        if _lifecycle in ("interrupted", "error", "empty"):
-            _end_reason = "cron_incomplete_no_output"
-            logger.warning(
-                "Job '%s': session ended without a final assistant "
-                "message (lifecycle=%s) — booking run as %s",
-                job_id, _lifecycle, _end_reason)
-    except (Exception, KeyboardInterrupt) as e:
-        logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
+    # A failed run can leave a plain assistant diagnostic with no error finish marker.
+    # Preserve the run's verdict; transcript shape cannot upgrade it to successful.
+    # Otherwise keep the #93820 incomplete-tail check, including its best-effort fallback
+    # on unknown statuses/probe errors. A real reply or [SILENT] remains cron_complete.
+    _end_reason = "cron_complete" if success else "cron_failed"
+    if success:
+        try:
+            _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
+            _lifecycle = _statuses.get(_final_cron_session_id)
+            if _lifecycle in ("interrupted", "error", "empty"):
+                _end_reason = "cron_incomplete_no_output"
+                logger.warning(
+                    "Job '%s': session ended without a final assistant "
+                    "message (lifecycle=%s) — booking run as %s",
+                    job_id, _lifecycle, _end_reason)
+        except (Exception, KeyboardInterrupt) as e:
+            logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
     try:
         _session_db.end_session(_final_cron_session_id, _end_reason)
         # The scheduler owns cron-session finalization. AIAgent.close() also
@@ -2502,6 +2496,7 @@ def run_job(
     _session_db = None
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
+    success = False
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         scope.enter()
@@ -2538,7 +2533,8 @@ def run_job(
         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
         logger.info("Job '%s' completed successfully", job_name)
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        return True, output, final_response, None
+        success = True
+        return success, output, final_response, None
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -2566,15 +2562,17 @@ def run_job(
             _run_doc_header(job, f"{job_name} (FAILED)", job_id, prompt)
             + format_run_error(e)
         )
-        return False, output, "", error_msg
+        return success, output, "", error_msg
 
     finally:
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
-            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
+            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id,
+            success=success)
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
-            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id)
+            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
+                                   success=success)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held

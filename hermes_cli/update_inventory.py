@@ -374,7 +374,7 @@ def _gateway_service_matches_profile(profile: str, service: object) -> bool:
     """
     name = str(service).removesuffix(".service").rsplit("/", 1)[-1]
     if profile == "default":
-        return name in {"hermes-gateway", "ai.hermes.gateway", "gateway", "gateway-default"}
+        return name in {"hermes-gateway", "ai.hermes.gateway", "ai.hermes.gateway.daemon", "gateway", "gateway-default"}
     return name in {f"hermes-gateway-{profile}", f"ai.hermes.gateway-{profile}", f"gateway-{profile}"}
 
 
