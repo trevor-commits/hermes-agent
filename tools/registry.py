@@ -134,6 +134,10 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     imported: List[str] = []
     for mod_name in module_names:
         try:
+            parent = mod_name.rpartition(".")[0]
+            if parent != "tools":
+                # Package initializers can import this child on another startup thread.
+                importlib.import_module(parent)
             importlib.import_module(mod_name)
             imported.append(mod_name)
         except Exception as e:

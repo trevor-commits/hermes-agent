@@ -20,6 +20,14 @@ const INITIAL_BOOT_STATE: DesktopBootState = {
 
 export const $desktopBoot = atom<DesktopBootState>(INITIAL_BOOT_STATE)
 
+// Explicit recovery invalidates a pending startup before its IPC reset/reload
+// completes, so the old descriptor cannot race the user's Retry intent.
+export const $desktopBootRecoveryRequest = atom(0)
+
+export function requestDesktopBootRecovery(): void {
+  $desktopBootRecoveryRequest.set($desktopBootRecoveryRequest.get() + 1)
+}
+
 function clampProgress(value: number) {
   if (!Number.isFinite(value)) {
     return 0

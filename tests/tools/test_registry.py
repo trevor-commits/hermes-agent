@@ -384,7 +384,9 @@ class TestPackageToolDiscovery:
         with patch("tools.registry.importlib.import_module") as mock_import:
             imported = discover_builtin_tools(tools_dir)
         assert imported == ["tools.connectors.tool"]
-        mock_import.assert_called_once_with("tools.connectors.tool")
+        assert [c.args[0] for c in mock_import.call_args_list] == [
+            "tools.connectors", "tools.connectors.tool",
+        ]
 
     def test_package_siblings_are_libraries_not_scanned(self, tmp_path):
         tools_dir, pkg = self._make_pkg(tmp_path)
@@ -393,7 +395,9 @@ class TestPackageToolDiscovery:
         with patch("tools.registry.importlib.import_module") as mock_import:
             imported = discover_builtin_tools(tools_dir)
         assert imported == ["tools.connectors.tool"]
-        assert {c.args[0] for c in mock_import.call_args_list} == {"tools.connectors.tool"}
+        assert {c.args[0] for c in mock_import.call_args_list} == {
+            "tools.connectors", "tools.connectors.tool",
+        }
 
     def test_package_without_init_is_skipped_loudly(self, tmp_path, caplog):
         tools_dir, _ = self._make_pkg(tmp_path, init=False)
@@ -415,6 +419,92 @@ class TestPackageToolDiscovery:
             ):
                 imported = discover_builtin_tools(tools_dir)
         assert imported == ["tools.connectors.tool"]
+
+    def test_discovery_during_package_initialization_registers_and_dispatches(self, tmp_path):
+        """Package startup and discovery must not invert the parent/child import locks."""
+        import subprocess
+        import sys
+        import textwrap
+
+        tools_dir = tmp_path / "tools"
+        pkg = tools_dir / "package_import_race"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            "from _discovery_race import package_started, release_package\n"
+            "package_started.set()\n"
+            "assert release_package.wait(10), 'discovery did not start'\n"
+            "from .tool import registry\n",
+            encoding="utf-8",
+        )
+        (pkg / "tool.py").write_text(_REGISTERING_SOURCE, encoding="utf-8")
+
+        # A fresh process contains the import-lock hook and any failed import state.
+        code = textwrap.dedent("""
+            import importlib
+            import json
+            import sys
+            import threading
+            import types
+
+            import tools
+            from tools.registry import discover_builtin_tools, registry
+
+            tools.__path__.insert(0, sys.argv[1])
+            gates = types.ModuleType('_discovery_race')
+            gates.package_started = threading.Event()
+            gates.release_package = threading.Event()
+            sys.modules[gates.__name__] = gates
+            package_attempted_child = threading.Event()
+            package_name = 'tools.package_import_race'
+            child_name = package_name + '.tool'
+            original_acquire = importlib._bootstrap._ModuleLock.acquire
+
+            def acquire(lock):
+                owner = threading.current_thread().name
+                if owner == 'discovery' and lock.name == child_name:
+                    result = original_acquire(lock)
+                    gates.release_package.set()
+                    assert package_attempted_child.wait(10), 'package did not import its child'
+                    return result
+                if owner == 'discovery' and lock.name == package_name:
+                    gates.release_package.set()
+                if owner == 'package' and lock.name == child_name:
+                    package_attempted_child.set()
+                return original_acquire(lock)
+
+            importlib._bootstrap._ModuleLock.acquire = acquire
+            errors = []
+            discovered = []
+
+            def import_package():
+                try:
+                    importlib.import_module(package_name)
+                except BaseException as error:
+                    errors.append(repr(error))
+
+            def discover():
+                try:
+                    discovered.extend(discover_builtin_tools(sys.argv[1]))
+                except BaseException as error:
+                    errors.append(repr(error))
+
+            package_thread = threading.Thread(target=import_package, name='package')
+            discovery_thread = threading.Thread(target=discover, name='discovery')
+            package_thread.start()
+            assert gates.package_started.wait(10), 'package did not start'
+            discovery_thread.start()
+            package_thread.join(15)
+            discovery_thread.join(15)
+            assert not package_thread.is_alive() and not discovery_thread.is_alive(), 'import hung'
+            assert not errors, errors
+            assert discovered == [child_name], discovered
+            assert json.loads(registry.dispatch('conn', {})) == {}
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(tools_dir)],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 

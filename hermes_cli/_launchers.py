@@ -11,6 +11,7 @@ interpreter before it publishes either command.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shlex
@@ -48,6 +49,73 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         + entry
     )
     return [str(python), "-I", "-c", bootstrap, *args]
+
+
+def runtime_command_argv(argv: list[str], *, _depth: int = 0) -> list[str] | None:
+    """Logical CLI argv only for our exact generated inline launchers.
+
+    A restart watcher also carries gateway argv, but launches it later. Never
+    infer identity from that suffix or execute source read from a process.
+    Compare syntax with the actual writers, including an old ABI relaunch.
+    """
+    from gateway.status import inline_source_flag_index
+
+    index = inline_source_flag_index(argv)
+    if index is None or index + 1 >= len(argv) or _depth > 1:
+        return None
+    try:
+        tree = ast.parse(argv[index + 1])
+        root_text = next(
+            ast.literal_eval(node.value.args[1]) for node in tree.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "sys.path.insert"
+            and len(node.value.args) == 2 and ast.literal_eval(node.value.args[0]) == 0
+        )
+        if not isinstance(root_text, str) or not Path(root_text).is_absolute():
+            return None
+        root = Path(root_text)
+        tail = argv[index + 2:]
+        shape = ast.dump(tree)
+        candidates = [(_launcher_script("hermes", root, None), ["hermes", *tail])]
+        home = next((
+            ast.literal_eval(node.value.values[-1]) for node in tree.body
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.BoolOp)
+            and ast.unparse(node.targets[0]) == "os.environ['HERMES_HOME']"
+            and isinstance(node.value.values[-1], ast.Constant)
+        ), None)
+        logical = ([f"HERMES_HOME={home}"] if home is not None else []) + ["hermes", *tail]
+        candidates.append((runtime_command(root, tail, python=argv[0], home=home)[3], logical))
+
+        assigned = next((
+            ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "sys.argv"
+        ), None)
+        if isinstance(assigned, list) and assigned and all(isinstance(a, str) for a in assigned):
+            from hermes_cli.venv_sync import relaunch_command
+
+            if assigned[0] == "-c":
+                call = tree.body[-1].value if isinstance(tree.body[-1], ast.Expr) else None
+                if isinstance(call, ast.Call) and ast.unparse(call.func) == "exec" and len(call.args) == 1:
+                    inner = ast.literal_eval(call.args[0])
+                    if isinstance(inner, str):
+                        expected = relaunch_command(Path(argv[0]), root, assigned, [argv[0], "-c", inner], None)[-1]
+                        logical = runtime_command_argv([argv[0], "-I", "-c", inner, *assigned[1:]], _depth=_depth + 1)
+                        if logical is not None:
+                            candidates.append((expected, logical))
+            else:
+                candidates.append((relaunch_command(Path(argv[0]), root, assigned, [argv[0]], "hermes_cli.main")[-1], assigned))
+                if assigned[0].replace("\\", "/").endswith(("/hermes", "/hermes_cli/main.py")):
+                    candidates.append((relaunch_command(Path(argv[0]), root, assigned, [argv[0]], None)[-1], assigned))
+
+        for expected, logical in candidates:
+            if shape == ast.dump(ast.parse(expected)):
+                if logical[1:2] == ["--run-module"]:
+                    return ["hermes", *logical[3:]] if logical[2:3] == ["hermes_cli.main"] else None
+                return logical
+    except (SyntaxError, ValueError, TypeError, IndexError, StopIteration):
+        return None
+    return None
 
 
 def print_runtime_command(repo_root: Path, argv: list[str]) -> None:

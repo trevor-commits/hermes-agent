@@ -1,4 +1,4 @@
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopBootstrapState, DesktopConnectionsRegistry } from '@/global'
@@ -1789,6 +1789,193 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     })
 
     expect($desktopBoot.get().error).toBeTruthy()
+  })
+
+  it.each(['ready', 'pending', 'rejected', 'invalid'] as const)(
+    'keeps a slow startup bounded and adopts only its original successful result (%s)',
+    async outcome => {
+      const startup = deferred<typeof primaryConn>()
+      const desktop = fakeDesktop()
+      desktop.getConnection = vi.fn(() => startup.promise)
+      ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+      const refreshSessions = vi.fn(async () => undefined)
+
+      render(<Harness refreshSessions={refreshSessions} />)
+      await flushAsync()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(45_000)
+      })
+
+      const timeout = $desktopBoot.get().error
+      expect(timeout).toBe('Timed out connecting to Hermes backend')
+      expect($desktopBoot.get().running).toBe(false)
+      expect($desktopBoot.get().visible).toBe(true)
+      expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+
+      // Main's replay is not authority to clear the error or start another dial.
+      act(() =>
+        desktop.emitBootProgress({
+          error: null,
+          fakeMode: false,
+          message: 'Hermes backend is ready',
+          phase: 'backend.ready',
+          progress: 94,
+          running: true,
+          timestamp: Date.now()
+        })
+      )
+      expect($desktopBoot.get().error).toBe(timeout)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(7_000)
+
+        if (outcome === 'ready') {
+          startup.resolve(primaryConn)
+        } else if (outcome === 'rejected') {
+          startup.reject(new Error('Hermes backend exited before it became ready (1).'))
+        } else if (outcome === 'invalid') {
+          startup.resolve({ ...primaryConn, wsUrl: 'https://vps.example.com/api/ws' })
+        }
+
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      if (outcome === 'ready') {
+        expect($gatewayState.get()).toBe('open')
+        expect($desktopBoot.get().visible).toBe(false)
+        expect($desktopBoot.get().error).toBeNull()
+        expect(refreshSessions).toHaveBeenCalledTimes(1)
+        expect(FakeWebSocket.instances).toHaveLength(1)
+      } else {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(180_000)
+        })
+        expect($desktopBoot.get().running).toBe(false)
+        expect($desktopBoot.get().error).toBe(
+          outcome === 'rejected' ? 'Hermes backend exited before it became ready (1).' : timeout
+        )
+        expect($desktopBoot.get().visible).toBe(true)
+        expect(refreshSessions).not.toHaveBeenCalled()
+        expect(FakeWebSocket.instances).toHaveLength(0)
+      }
+
+      expect(desktop.getConnection).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it.each([
+    'unmount',
+    'switch',
+    'apply',
+    'exit',
+    'exit-during-mint',
+    'activation-during-mint',
+    'route-during-mint',
+    'retry',
+    'route'
+  ] as const)('revokes a timed-out startup before a late success can replace newer intent (%s)', async action => {
+    const startup = deferred<typeof primaryConn>()
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn().mockReturnValueOnce(startup.promise).mockResolvedValue(coderConn)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    const view = render(<Harness />)
+    await flushAsync()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(45_000)
+    })
+    expect($desktopBoot.get().error).toBeTruthy()
+    const originalUrl = window.location.href
+
+    try {
+      if (action === 'unmount') {
+        view.unmount()
+      } else if (action === 'switch') {
+        act(() => endGatewaySwitch(beginGatewaySwitch()))
+      } else if (action === 'apply') {
+        act(() => connectionApplied?.())
+        await flushAsync()
+        expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
+      } else if (action === 'exit') {
+        act(() => backendExit?.({ code: 1, signal: null }))
+      } else if (
+        action === 'exit-during-mint' ||
+        action === 'activation-during-mint' ||
+        action === 'route-during-mint'
+      ) {
+        const mint = deferred<string>()
+        desktop.getGatewayWsUrl.mockReturnValueOnce(mint.promise)
+        await act(async () => {
+          startup.resolve(primaryConn)
+          await vi.advanceTimersByTimeAsync(0)
+        })
+
+        if (action === 'exit-during-mint') {
+          act(() => backendExit?.({ code: 1, signal: null }))
+        } else if (action === 'activation-during-mint') {
+          vi.useRealTimers()
+          await act(async () => ensureGatewayProfile('coder'))
+          vi.useFakeTimers()
+          expect(isActivePrimary()).toBe(false)
+          expect($activeGatewayProfile.get()).toBe('coder')
+        } else {
+          window.history.replaceState(null, '', '/?peer=1&profile=coder&connectionId=coder-remote')
+        }
+
+        const connectionBeforeMint = $connection.get()
+        const socketsBeforeMint = FakeWebSocket.instances.length
+        const connectionCallsBeforeMint = desktop.getConnection.mock.calls.length
+        await act(async () => {
+          mint.resolve(primaryConn.wsUrl)
+          await vi.advanceTimersByTimeAsync(0)
+        })
+
+        expect($connection.get()).toBe(connectionBeforeMint)
+        expect(FakeWebSocket.instances).toHaveLength(socketsBeforeMint)
+        expect(desktop.getConnection).toHaveBeenCalledTimes(connectionCallsBeforeMint)
+
+        if (action === 'exit-during-mint') {
+          expect($desktopBoot.get().error).toBeTruthy()
+        } else if (action === 'activation-during-mint') {
+          expect(isActivePrimary()).toBe(false)
+          expect($activeGatewayProfile.get()).toBe('coder')
+        }
+      } else if (action === 'retry') {
+        const reset = deferred<{ ok: boolean }>()
+        const resetBootstrap = vi.fn(() => reset.promise)
+        Object.assign(desktop, {
+          getRecentLogs: vi.fn(async () => ({ lines: [] })),
+          getBootstrapState: vi.fn(async () => ({ bundled: false })),
+          resetBootstrap
+        })
+        const { BootFailureOverlay } = await import('@/components/boot-failure-overlay')
+        render(<BootFailureOverlay />)
+        await flushAsync()
+        fireEvent.click(screen.getByRole('button', { name: /^retry$/i }))
+        expect(resetBootstrap).toHaveBeenCalledTimes(1)
+      } else {
+        window.history.replaceState(null, '', '/?peer=1&profile=coder&connectionId=coder-remote')
+      }
+
+      const error = $desktopBoot.get().error
+      const connection = $connection.get()
+      const sockets = FakeWebSocket.instances.length
+      const connectionCalls = desktop.getConnection.mock.calls.length
+      await act(async () => {
+        startup.resolve(primaryConn)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect($desktopBoot.get().error).toBe(error)
+      expect($connection.get()).toBe(connection)
+      expect(FakeWebSocket.instances).toHaveLength(sockets)
+      expect(desktop.getConnection).toHaveBeenCalledTimes(connectionCalls)
+
+      if (action !== 'activation-during-mint') {
+        expect(desktop.getConnection).toHaveBeenCalledTimes(action === 'apply' ? 2 : 1)
+      }
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
   })
 
   it('softSwitch(): a getConnection() that hangs on a connection-apply switch does not latch $gatewaySwitching forever (#93454)', async () => {

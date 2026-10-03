@@ -511,12 +511,12 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     with contextlib.suppress(OSError):
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         if raw:
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+            return shlex.join(raw.decode("utf-8", errors="replace").rstrip("\x00").split("\x00"))
     with contextlib.suppress(Exception):
         import psutil  # type: ignore
         cmdline_parts = psutil.Process(pid).cmdline()
         if cmdline_parts:
-            return " ".join(cmdline_parts)
+            return shlex.join(cmdline_parts)
     if not _IS_WINDOWS:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             result = subprocess.run(
@@ -588,6 +588,19 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
+def _gateway_command_tokens(command: str) -> list[str] | None:
+    """Preserve inline-source boundaries; unwrap only a generated Hermes launcher."""
+    try:
+        argv = shlex.split(command)
+        if command_line_runs_inline_source(argv):
+            from hermes_cli._launchers import runtime_command_argv
+
+            return runtime_command_argv(argv)
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return command.split()
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -596,10 +609,9 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     argv since ``_apply_profile_override`` removes them before argparse."""
     if not command:
         return None
-    try:
-        raw_tokens = shlex.split(command, posix=False)
-    except ValueError:
-        raw_tokens = command.split()
+    raw_tokens = _gateway_command_tokens(command)
+    if not raw_tokens:
+        return None
     # Strip surrounding quotes, normalize slashes + case per token.
     cased_tokens = [t.strip("\"'").replace("\\", "/") for t in raw_tokens]
     tokens = [t.lower() for t in cased_tokens]
@@ -716,7 +728,7 @@ def _profile_name_for_home(profile_home: Path) -> Optional[str]:
 def profile_flag_value(command: str) -> Optional[str]:
     """The ``-p``/``--profile`` argument of a command line, or None. Token equality is the only safe
     profile match: a substring test lets ``-p ops`` claim (and ``gateway stop`` SIGTERM) ``-p ops-2``."""
-    tokens = command.split()
+    tokens = [t.strip("\"'") for t in (_gateway_command_tokens(command) or [])]
     for i, tok in enumerate(tokens):
         if tok.startswith("--profile="):
             return tok.partition("=")[2]
@@ -752,7 +764,19 @@ def command_line_names_hermes_home(command_lc: str, home_lc: str) -> bool:
     return re.search(rf"(?:^|\s)hermes_home={re.escape(home_lc)}/?(?=\s|$)", command_lc) is not None
 
 
-def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
+def _process_hermes_home(pid: int) -> str | None | object:
+    """Initial launch home only; an unreadable environment is unknown."""
+    try:
+        import psutil
+
+        return psutil.Process(pid).environ().get("HERMES_HOME")
+    except Exception:
+        return _UNSET
+
+
+def _command_line_belongs_to_profile(
+    command: str, profile_home: Path, *, process_home: str | None | object = None
+) -> bool:
     """True when a gateway command line belongs to ``profile_home`` (mirrors
     ``hermes_cli.gateway._matches_current_profile``): a stale state file can record a PID recycled
     onto ANOTHER profile's live gateway. Named profiles carry ``-p``/``--profile <name>`` or
@@ -760,17 +784,33 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).lower().replace("\\", "/").rstrip("/")
+    profile = profile_flag_value(command)
+    if profile is not None:
+        # Hermes applies --profile before reading HERMES_HOME. A mismatching
+        # flag must never fall through to a different home's environment.
+        return profile_name not in (None, "default") and profile.lower() == profile_name.lower()
+    declared_homes = [
+        token.partition("=")[2]
+        for token in (_gateway_command_tokens(command) or [])
+        if token.startswith("HERMES_HOME=")
+    ]
+    # runtime_command's embedded home is a fallback. A launch environment
+    # overrides it; losing that precedence can let one profile stop another.
+    if isinstance(process_home, str) and process_home:
+        declared_homes = [process_home]
+    elif process_home is _UNSET:
+        declared_homes = []
+    explicit_homes = declared_homes or hermes_home_assignments(command_lc)
+    names_home = any(_same_hermes_home(home, profile_home) for home in explicit_homes)
+    if not process_home and process_home is not _UNSET:
+        names_home = names_home or command_line_names_hermes_home(command_lc, home_lc)
     if profile_name is not None and profile_name != "default":
-        if profile_flag_value(command_lc) == profile_name.lower():
-            return True
-        return command_line_names_hermes_home(command_lc, home_lc)
+        return names_home
     # Default profile: accept unless argv names another profile (any spelling the CLI pre-parser
     # accepts, ``--profile=ops`` included -- a substring test let that gateway pass as the default's)
     # or a conflicting explicit HERMES_HOME= (its absence is not disqualifying -- HERMES_HOME usually
     # arrives via the env).
-    if profile_flag_value(command_lc) is not None:
-        return False
-    return not hermes_home_assignments(command_lc) or command_line_names_hermes_home(command_lc, home_lc)
+    return process_home is not _UNSET and (not explicit_homes or names_home)
 
 
 def _host_gateway_serves_home(pid: int, profile_home: Path) -> bool:
@@ -804,7 +844,16 @@ def _record_matches_live_gateway_pid(
         return False
     if expected_home is not None and _host_gateway_serves_home(pid, expected_home):
         return True
-    return expected_home is None or _command_line_belongs_to_profile(live_cmdline, expected_home)
+    try:
+        inline = command_line_runs_inline_source(shlex.split(live_cmdline))
+    except ValueError:
+        inline = False
+    process_home = _process_hermes_home(pid) if inline else None
+    if process_home is _UNSET and isinstance(record.get("hermes_home"), str):
+        process_home = record["hermes_home"]
+    return expected_home is None or _command_line_belongs_to_profile(
+        live_cmdline, expected_home, process_home=process_home
+    )
 
 
 def _build_pid_record() -> dict:

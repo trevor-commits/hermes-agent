@@ -23,7 +23,7 @@ import {
   Wrench,
   X
 } from '@/lib/icons'
-import { $desktopBoot } from '@/store/boot'
+import { $desktopBoot, requestDesktopBootRecovery } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
 
@@ -253,6 +253,7 @@ export function BootFailureOverlay() {
   }
 
   const retry = async () => {
+    requestDesktopBootRecovery()
     setBusy('retry')
     await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
     window.location.reload()

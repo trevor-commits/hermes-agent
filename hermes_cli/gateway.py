@@ -575,41 +575,34 @@ def _scan_gateway_pids(
     from gateway.status import (
         looks_like_gateway_command_line,
         looks_like_gateway_runtime_command_line,
-        profile_flag_value,
-        hermes_home_assignments,
-        command_line_names_hermes_home,
+        _command_line_belongs_to_profile,
+        _process_hermes_home,
+        _read_process_cmdline,
+        command_line_runs_inline_source,
     )
     current_home = str(get_hermes_home().resolve())
-    # Forward slashes on both sides of the HERMES_HOME= match (mirrors gateway.status), and no
-    # trailing separator: the assignments parser strips one, so the systemd ``Environment=``
-    # spelling (``HERMES_HOME=/root/.hermes/``) compares equal to the resolved home.
-    current_home_lc = current_home.lower().replace("\\", "/").rstrip("/")
-    current_profile_arg = _profile_arg(current_home)
-    current_profile_name = current_profile_arg.split()[-1] if current_profile_arg else ""
-    current_profile_name_lc = current_profile_name.lower()
-
-    def _matches_current_profile(command: str) -> bool:
-        command_lc = command.lower().replace("\\", "/")
-        if current_profile_name:
-            # Token equality, not substring: `-p ops` must not claim (or SIGTERM) an `-p ops-2` gateway.
-            if profile_flag_value(command_lc) == current_profile_name_lc:
-                return True
-            return command_line_names_hermes_home(command_lc, current_home_lc)
-
-        # Default profile: accept unless argv advertises another profile in any spelling the CLI
-        # pre-parser accepts (``--profile=ops`` slipped past a substring test, so a default-profile
-        # fallback stop could SIGTERM the named gateway). HERMES_HOME may come via env (invisible to
-        # wmic/CIM), so only a non-matching explicit HERMES_HOME= disqualifies.
-        if profile_flag_value(command_lc) is not None:
-            return False
-        return (not hermes_home_assignments(command_lc)
-                or command_line_names_hermes_home(command_lc, current_home_lc))
 
     def _consider(pid: int, command: str) -> None:
+        # ps flattens the inline program into unquoted words. Re-read argv
+        # for candidate entrypoints, including quoted Windows executables.
+        # This text filter only selects a read; it never grants PID identity.
         matches_runtime = looks_like_gateway_command_line(command) or (
             include_restart_managers and looks_like_gateway_runtime_command_line(command)
         )
-        if matches_runtime and (all_profiles or _matches_current_profile(command)):
+        if not matches_runtime and (
+            "hermes_cli" in command or ("run_path" in command and "hermes" in command)
+        ):
+            command = _read_process_cmdline(pid) or command
+            matches_runtime = looks_like_gateway_command_line(command) or (
+                include_restart_managers and looks_like_gateway_runtime_command_line(command)
+            )
+        try:
+            inline = command_line_runs_inline_source(shlex.split(command))
+        except ValueError:
+            inline = False
+        if matches_runtime and (all_profiles or _command_line_belongs_to_profile(
+            command, Path(current_home), process_home=_process_hermes_home(pid) if inline else None
+        )):
             _append_unique_pid(pids, pid, exclude_pids)
 
     try:
@@ -5656,4 +5649,3 @@ def _pm_runtime_venv_dir(project_root: Path | None = None) -> Path | None:
 
     venv = selected_venv(root)  # a malformed committed selection raises: fail closed
     return venv if venv.is_dir() else None
-
