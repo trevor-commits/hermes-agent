@@ -218,6 +218,79 @@ class TestScopedGatewayPidQuery:
 
 
 class TestGatewayRuntimeStatus:
+    @pytest.mark.parametrize("previous_pid,previous_start,current_start,cleared", [
+        ("different", 10000, 10000, True),
+        ("different", 10000, None, True),
+        ("same", 9700, 10000, True),
+        ("same", 10000, 10000, False),
+        ("same", 10000, 10100, False),
+        ("same", 10000, 10200, False),
+        ("same", 10000, 10201, True),
+        ("same", 10000, 9900, False),
+        ("same", None, 10000, False),
+        ("same", 10000, None, False),
+        ("same", None, None, False),
+        ("same", "malformed", 10000, False),
+        ("same", [], 10000, False),
+        (None, None, 10000, False),
+        (None, 10000, 11000, False),
+    ])
+    def test_runtime_platform_results_belong_to_the_process_incarnation(
+        self, tmp_path, monkeypatch, previous_pid, previous_start, current_start, cleared
+    ):
+        from agent.monitoring.gateway_health import build_gateway_health_snapshot
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: current_start)
+        old_pid = os.getpid() + 1 if previous_pid == "different" else os.getpid()
+        if previous_pid is None:
+            old_pid = None
+        platforms = {
+            "telegram": {"state": "fatal", "error_code": "old_failure"},
+            "reviewer:slack": {"state": "connected"},
+        }
+        (tmp_path / "gateway_state.json").write_text(json.dumps({
+            "pid": old_pid, "start_time": previous_start,
+            "platforms": platforms, "desired_state": "running",
+        }))
+
+        assert status.write_runtime_status(gateway_state="running")
+        payload = status.read_runtime_status()
+        assert payload["platforms"] == ({} if cleared else platforms)
+        assert payload["desired_state"] == "running"
+        snapshot = build_gateway_health_snapshot(
+            payload, gateway_running=True, profile="fixture", install_id="fixture", version="test"
+        )
+        health = next(event for event in snapshot.events if event.name == "gateway.health_snapshot")
+        assert health.fatal_platform_count == (0 if cleared else 1)
+
+    def test_platform_generation_reset_keeps_profile_status_isolated(self, tmp_path, monkeypatch):
+        homes = [tmp_path / "a", tmp_path / "b"]
+        for home in homes:
+            home.mkdir()
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 100)
+        (homes[1] / "gateway_state.json").write_text(json.dumps({
+            "pid": os.getpid() + 1, "start_time": 100,
+            "platforms": {"telegram": {"state": "fatal", "error_code": "previous_process"}},
+        }))
+
+        monkeypatch.setenv("HERMES_HOME", str(homes[0]))
+        assert status.write_runtime_status(
+            gateway_state="running", platform="telegram", platform_state="fatal",
+            error_code="current_failure", error_message="Current adapter failed"
+        )
+        first = status.read_runtime_status()
+        monkeypatch.setenv("HERMES_HOME", str(homes[1]))
+        assert status.write_runtime_status(
+            gateway_state="running", platform="slack", platform_state="connected"
+        )
+        second = status.read_runtime_status()
+        assert set(second["platforms"]) == {"slack"}
+        monkeypatch.setenv("HERMES_HOME", str(homes[0]))
+        assert status.write_runtime_status(active_agents=0)
+        assert status.read_runtime_status()["platforms"] == first["platforms"]
+        assert status.read_runtime_status(homes[1] / "gateway_state.json") == second
+
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "gateway_state.json").write_text(

@@ -1257,6 +1257,19 @@ def _prepare_runtime_status_update(
         previous_payload = _runtime_status_state
         payload = copy.deepcopy(previous_payload)
         current_record = _build_pid_record()
+        # A replacement process has no verdict yet for the previous gateway's adapters.
+        # Retain legacy/unknown identity diagnostics until a different writer is proven.
+        previous_pid, previous_start = payload.get("pid"), payload.get("start_time")
+        writer_changed = previous_pid is not None and previous_pid != current_record["pid"]
+        if (
+            previous_pid == current_record["pid"]
+            and previous_start is not None
+            and current_record["start_time"] is not None
+        ):
+            with contextlib.suppress(TypeError, ValueError, OverflowError):
+                writer_changed = not start_time_fingerprints_match(previous_start, current_record["start_time"])
+        if writer_changed:
+            payload["platforms"] = {}
         payload.setdefault("platforms", {})
         if not isinstance(payload["platforms"], dict):
             payload["platforms"] = {}
