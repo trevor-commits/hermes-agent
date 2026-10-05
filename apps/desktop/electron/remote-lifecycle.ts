@@ -656,7 +656,7 @@ async function pidIsOurDashboard(
   }
 
   const script =
-    'import os,shlex,subprocess,sys\n' +
+    'import ctypes,os,shlex,subprocess,sys\n' +
     `pid=${Number(pid)}\n` +
     `expected=os.path.expanduser(${shq(hermesPath)})\n` +
     // The installer-facing launcher is intentionally preserved for invocation
@@ -671,9 +671,33 @@ async function pidIsOurDashboard(
     `expected_profile=${shq(profile)}\n` +
     `nonce=${shq(spawnNonce)}\n` +
     'try:\n' +
-    ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
-    ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
+    ' if sys.platform=="darwin":\n' +
+    // ps renders argv without preserving quoting. KERN_PROCARGS2 retains the
+    // kernel argument boundaries, including ownership token paths with spaces.
+    '  libc=ctypes.CDLL(None,use_errno=True)\n' +
+    '  mib=(ctypes.c_int*3)(1,49,pid)\n' +
+    '  size=ctypes.c_size_t()\n' +
+    '  if libc.sysctl(mib,3,None,ctypes.byref(size),None,0)!=0:raise OSError(ctypes.get_errno())\n' +
+    '  buf=ctypes.create_string_buffer(size.value)\n' +
+    '  if libc.sysctl(mib,3,buf,ctypes.byref(size),None,0)!=0:raise OSError(ctypes.get_errno())\n' +
+    '  raw=buf.raw[:size.value]\n' +
+    '  argc=ctypes.c_int.from_buffer_copy(raw).value\n' +
+    '  if argc<1 or argc>len(raw):raise ValueError("invalid argc")\n' +
+    '  offset=raw.index(b"\\0",ctypes.sizeof(ctypes.c_int))+1\n' +
+    '  while raw[offset:offset+1]==b"\\0":offset+=1\n' +
+    '  args=[]\n' +
+    '  for _ in range(argc):\n' +
+    '   end=raw.index(b"\\0",offset)\n' +
+    '   args.append(raw[offset:end].decode("utf-8","surrogateescape"))\n' +
+    '   offset=end+1\n' +
+    ' else:\n' +
+    '  raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
+    '  args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
+    'except (ValueError,IndexError):\n' +
+    ' print("FOREIGN");sys.exit(0)\n' +
     'except OSError:\n' +
+    ' if sys.platform=="darwin":\n' +
+    '  print("FOREIGN");sys.exit(0)\n' +
     ' try:\n' +
     '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
     ' except subprocess.CalledProcessError:\n' +
