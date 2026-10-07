@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -177,6 +178,43 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
     assert executions.latest_execution("live")["status"] == "running"
+
+
+def test_scheduled_retention_preserves_daily_proof_and_profile_duplicate_safety(monkeypatch, tmp_path):
+    from cron.occurrences import completed_occurrence
+    import cron.executions as executions
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    active = {"home": homes[0]}
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+    monkeypatch.setattr(executions, "get_hermes_home", lambda: active["home"])
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 12)
+    monkeypatch.setattr(executions, "MAX_SCHEDULED_EXECUTIONS_PER_JOB", 20, raising=False)
+    clock = {"now": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
+    daily = []
+    for day in range(24):
+        clock["now"] += timedelta(days=1)
+        row = executions.create_execution("daily", source="builtin", scheduled_instant=clock["now"].isoformat())
+        daily.append(executions.finish_execution(row["id"], success=True))
+    inflight = executions.create_execution("running", source="builtin")
+    for index in range(120):
+        clock["now"] += timedelta(minutes=1)
+        row = executions.create_execution(f"frequent-{index % 2}", source="builtin",
+                                         scheduled_instant=clock["now"].isoformat())
+        executions.finish_execution(row["id"], success=index % 3 != 0, error="synthetic-failure")
+    assert executions.get_execution(daily[-20]["id"]) == daily[-20]
+    assert executions.get_execution(daily[-21]["id"]) is None
+    assert completed_occurrence({"id": "daily"}, daily[-20]["scheduled_instant"])
+    assert executions.finish_execution(daily[-20]["id"], success=False) is None
+    assert executions.get_execution(inflight["id"]) == inflight
+    records = executions.list_executions(limit=500)
+    assert len(records) <= 12 + 20 * 3 + 1
+    active["home"] = homes[1]
+    assert not completed_occurrence({"id": "daily"}, daily[-20]["scheduled_instant"])
+    assert executions.list_executions() == []
+    active["home"] = homes[0]
+    assert executions.get_execution(daily[-20]["id"]) == daily[-20]
 
 
 def test_recently_finished_long_running_execution_survives_retention(

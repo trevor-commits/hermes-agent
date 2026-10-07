@@ -26,6 +26,10 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+- Terminal execution history retains the global tail plus the last 32 scheduled attempts per
+  job. Frequent jobs cannot displace another job's protected occurrence proof. The terminal
+  bound is 1,000 + 32 × distinct scheduled job IDs; claimed/running rows are never pruned.
+  Only completed rows prove a duplicate occurrence; failed/unknown remain non-completion.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**

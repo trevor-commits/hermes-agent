@@ -9,9 +9,11 @@ import { controlSocketPath } from './ssh-connection'
 
 afterEach((): void => {
   vi.unstubAllEnvs()
+  vi.restoreAllMocks()
 })
 
 test.skipIf(process.platform === 'win32')('local SSH sockets use the suffixed default root', (): void => {
+  vi.spyOn(os, 'homedir').mockReturnValue('/home/test')
   vi.stubEnv('HERMES_DATA_DIR_SUFFIX', 'magic-test')
   const socket: string = controlSocketPath('user', 'host', 22)
 

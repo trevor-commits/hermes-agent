@@ -292,7 +292,7 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     out: List[Path] = []
     for root in roots:
         if not root.exists():
-            continue
+            raise FileNotFoundError(f"Test path does not exist: {root}")
         if root.is_file():
             # Explicit file: include it as-is, skip the _SKIP_PARTS filter
             # since the user named it directly.
@@ -1247,7 +1247,14 @@ def main() -> int:
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
             _SKIP_PARTS = set()
 
-        files = _discover_files(roots)
+        try:
+            files = _discover_files(roots)
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+
+    for file in files:
+        if not file.is_file():
+            parser.error(f"Test file does not exist: {file}")
 
     if not files:
         print("No test files to run", file=sys.stderr)

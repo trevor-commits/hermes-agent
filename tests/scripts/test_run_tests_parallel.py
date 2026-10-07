@@ -50,6 +50,58 @@ def _probe_root(tmp_path):
     return root
 
 
+@pytest.mark.parametrize("kind", ["mixed-missing", "all-missing", "missing-directory", "directory", "duplicate"])
+def test_explicit_test_roots_are_validated_before_any_test_runs(tmp_path, kind):
+    root = _probe_root(tmp_path)
+    tests = root / "probe"
+    tests.mkdir()
+    marker = root / "ran.txt"
+    test = tests / "test_probe.py"
+    test.write_text(f"from pathlib import Path\ndef test_probe():\n    Path({str(marker)!r}).write_text('ran')\n")
+    missing = root / "missing.py"
+    paths = {
+        "mixed-missing": [test, missing], "all-missing": [missing],
+        "missing-directory": [tests, root / "absent"],
+        "directory": [tests], "duplicate": [test, test, tests],
+    }[kind]
+    result = subprocess.run(
+        [sys.executable, str(root / "scripts/run_tests_parallel.py"),
+         *map(str, paths), "-j", "1", "--file-timeout", "30"],
+        cwd=root, capture_output=True, text=True, timeout=60,
+    )
+    if "missing" in kind:
+        assert result.returncode != 0, result.stdout
+        assert "does not exist" in result.stderr
+        assert not marker.exists(), "Missing explicit roots must refuse before starting any test"
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert marker.read_text() == "ran"
+        assert "1 tests passed" in result.stdout
+
+
+@pytest.mark.parametrize("option", ["--paths", "--files", "--files-from"])
+def test_missing_explicit_lists_refuse_before_running_a_valid_file(tmp_path, option):
+    root = _probe_root(tmp_path)
+    marker = root / "ran.txt"
+    test = root / "test_probe.py"
+    test.write_text(f"from pathlib import Path\ndef test_probe():\n    Path({str(marker)!r}).write_text('ran')\n")
+    paths = [test.name, "missing.py"]
+    if option == "--files-from":
+        manifest = root / "files.txt"
+        manifest.write_text("\n".join(paths))
+        value = str(manifest)
+    else:
+        value = " ".join(paths)
+    result = subprocess.run(
+        [sys.executable, str(root / "scripts/run_tests_parallel.py"), option, value,
+         "-j", "1", "--file-timeout", "30"],
+        cwd=root, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode != 0
+    assert "does not exist" in result.stderr
+    assert not marker.exists(), "Validate the whole explicit list before starting tests"
+
+
 def _pid_alive(pid: int) -> bool:
     """POSIX: send signal 0 to probe whether ``pid`` is still alive.
 

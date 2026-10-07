@@ -209,6 +209,9 @@ scripts/run_tests.sh
 scripts/run_tests.sh tests/agent/ -v
 ```
 
+Explicit test paths must exist. A missing file or directory refuses the entire
+invocation before any tests start, including mixed valid/missing path lists.
+
 On Windows, run the script through Bash. When no local `.venv` or `venv`
 contains pytest, the runner accepts the explicit `HERMES_PYTHON` above. It
 clears credentials, isolates `HERMES_HOME`, and runs each test file in a separate

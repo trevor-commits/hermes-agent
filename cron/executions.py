@@ -27,6 +27,9 @@ from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
+# Preserve the most recent 32 scheduled attempts per job in addition to the global tail.
+# Daily jobs retain a month of exact occurrence proof even under frequent-job traffic.
+MAX_SCHEDULED_EXECUTIONS_PER_JOB = 32
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
@@ -176,8 +179,15 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+           ) AND id NOT IN (
+             SELECT id FROM (
+               SELECT id, ROW_NUMBER() OVER (
+                 PARTITION BY job_id ORDER BY finished_at DESC, claimed_at DESC, id DESC
+               ) AS job_rank FROM executions
+               WHERE status IN ('completed','failed','unknown') AND scheduled_instant IS NOT NULL
+             ) WHERE job_rank <= ?
            )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+        (max(0, int(MAX_TERMINAL_EXECUTIONS)), max(0, int(MAX_SCHEDULED_EXECUTIONS_PER_JOB))),
     )
 
 
