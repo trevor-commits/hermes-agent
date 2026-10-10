@@ -279,7 +279,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             with patch("agent.prompt_builder.load_soul_md", return_value=""), env(other), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=other):
                 moved = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {other}", build_system_prompt(moved))
+                self.assertIn(f"- Root: {other.resolve()}", build_system_prompt(moved))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -300,9 +300,86 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
                        return_value=f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}"), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
                 resumed = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {repo}", build_system_prompt(resumed))
+                self.assertIn(f"- Root: {repo.resolve()}", build_system_prompt(resumed))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_launch_directory_symlink_preserves_snapshot_after_repo_changes(self):
+        import os, tempfile
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt
+
+        old_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory(prefix="test-pinned-alias-") as directory:
+            repo = _init_repo(Path(directory) / "repo", "init commit")
+            alias = Path(directory) / "alias"
+            alias.symlink_to(repo.resolve(), target_is_directory=True)
+            try:
+                os.chdir(repo)
+                agent = self._pin_agent()
+                with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                     patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"):
+                    with patch("agent.system_prompt.resolve_context_cwd", return_value=None):
+                        original = build_system_prompt(agent)
+                    (repo / "untracked.txt").write_text("wip\n")
+                    invalidate_system_prompt(agent)
+                    with patch("agent.system_prompt.resolve_context_cwd", return_value=alias):
+                        self.assertEqual(build_system_prompt(agent), original)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_persisted_snapshot_accepts_both_directions_of_a_directory_alias(self):
+        import tempfile
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt
+
+        with tempfile.TemporaryDirectory(prefix="test-pinned-persisted-alias-") as directory:
+            repo = _init_repo(Path(directory) / "repo", "init commit").resolve()
+            alias = Path(directory) / "alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            for stored_cwd, resumed_cwd in ((alias, repo), (repo, alias)):
+                with self.subTest(stored_cwd=stored_cwd, resumed_cwd=resumed_cwd):
+                    (repo / "untracked.txt").unlink(missing_ok=True)
+                    with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                         patch("agent.prompt_builder.build_environment_hints",
+                               return_value=f"Host: x\nUser home directory: /h\nCurrent working directory: {stored_cwd}"), \
+                         patch("agent.system_prompt.resolve_context_cwd", return_value=stored_cwd):
+                        stored = build_system_prompt(self._pin_agent())
+                    self.assertIn("Status: clean", stored)
+                    (repo / "untracked.txt").write_text("wip\n")
+                    db = SimpleNamespace(get_session=lambda sid: {"system_prompt": stored})
+                    with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                         patch("agent.prompt_builder.build_environment_hints",
+                               return_value=f"Host: x\nUser home directory: /h\nCurrent working directory: {resumed_cwd}"), \
+                         patch("agent.system_prompt.resolve_context_cwd", return_value=resumed_cwd):
+                        prompt = build_system_prompt(self._pin_agent(_cached_system_prompt=None, _session_db=db))
+                    self.assertIn(f"Current working directory: {resumed_cwd}", prompt)
+                    self.assertIn("Status: clean", prompt)
+                    self.assertNotIn("untracked.txt", prompt)
+
+    def test_retargeted_alias_refreshes_snapshot_for_the_new_workspace(self):
+        import tempfile
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt
+
+        with tempfile.TemporaryDirectory(prefix="test-pinned-retarget-") as directory:
+            root = Path(directory)
+            repo = _init_repo(root / "repo", "first workspace").resolve()
+            other = _init_repo(root / "other", "second workspace").resolve()
+            alias = root / "alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            agent = self._pin_agent()
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"), \
+                 patch("agent.system_prompt.resolve_context_cwd", return_value=alias):
+                stored = build_system_prompt(agent)
+                self.assertIn(f"- Root: {repo}", stored)
+                alias.unlink()
+                alias.symlink_to(other, target_is_directory=True)
+                invalidate_system_prompt(agent)
+                refreshed = build_system_prompt(agent)
+                self.assertIn(f"- Root: {other}", refreshed)
+                self.assertNotIn(f"- Root: {repo}", refreshed)
 
 
 if __name__ == "__main__":
