@@ -536,13 +536,23 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
 
 
 def _gateway_command_tokens(command: str) -> list[str] | None:
-    """Preserve inline-source boundaries; unwrap only a generated Hermes launcher."""
+    """Preserve inline-source boundaries; unwrap Hermes launchers and inline bootstraps.
+
+    Two generated shapes run the entry point in-process (#124318): the runtime_command
+    launcher (``-m hermes_cli.main`` re-entry) and the inline bootstraps (store launcher
+    script, published launcher, venv_sync re-entry). The latter have no ``-m`` runtime
+    form, so when the runtime unwrap declines, fall through to the bootstrap unwrapper
+    — returning None here would erase a live gateway from every process scan.
+    """
     try:
         argv = shlex.split(command)
         if command_line_runs_inline_source(argv):
             from hermes_cli._launchers import runtime_command_argv
 
-            return runtime_command_argv(argv)
+            runtime = runtime_command_argv(argv)
+            if runtime is not None:
+                return runtime
+            return inline_bootstrap_argv(argv)
         return shlex.split(command, posix=False)
     except ValueError:
         return command.split()
@@ -739,12 +749,15 @@ def _command_line_belongs_to_profile(
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).lower().replace("\\", "/").rstrip("/")
     profile = profile_flag_value(command)
-    if profile is not None and profile.lower() not in ((profile_name or "").lower(), "default"):
-        # Hermes applies --profile before reading HERMES_HOME. A flag naming a
-        # DIFFERENT profile must never fall through to this home's environment.
-        # A flag naming this profile (or the default profile on a default home,
-        # #100817) falls through so env evidence and the branch rules below apply.
-        return False
+    if profile is not None:
+        # Hermes applies --profile before reading HERMES_HOME. A flag naming a DIFFERENT
+        # profile must never fall through to this home's environment. A flag naming THIS
+        # profile accepts on its own (the strongest argv signal); ``--profile default`` on
+        # a default home falls through so env evidence and the rules below apply (#100817).
+        if profile.lower() == (profile_name or "").lower():
+            return True
+        if profile.lower() != "default":
+            return False
     declared_homes = [
         token.partition("=")[2]
         for token in (_gateway_command_tokens(command) or [])
@@ -761,12 +774,10 @@ def _command_line_belongs_to_profile(
     if not process_home and process_home is not _UNSET:
         names_home = names_home or command_line_names_hermes_home(command_lc, home_lc)
     if profile_name is not None and profile_name != "default":
-        # Keeper precedence: for flagless commands a read process's OWN environment
-        # (HERMES_HOME) outranks an embedded runtime_command home, so one profile's
-        # gateway can never be adopted for another's. An explicit ``--profile <name>``
-        # flag naming THIS profile is the strongest argv signal and accepts on its own.
-        if profile_flag_value(command_lc) == profile_name.lower():
-            return True
+        # Keeper precedence: a read process's OWN environment (HERMES_HOME) outranks an
+        # embedded runtime_command home, so one profile's gateway can never be adopted for
+        # another's. The head already accepted an explicit ``--profile <name>`` flag naming
+        # this profile (profile_flag_value resolves through the unwrapped launcher argv).
         return names_home
     # Default profile: accept unless argv names another profile (any spelling the CLI pre-parser
     # accepts, ``--profile=ops`` included -- a substring test let that gateway pass as the default's)
@@ -778,9 +789,14 @@ def _command_line_belongs_to_profile(
         # A read process's own environment is authoritative; embedded runtime_command homes and
         # argv home assignments are secondary to it.
         return not explicit_homes or names_home
-    if profile_flag_value(command_lc) not in (None, "default"):
-        return False
-    return not hermes_home_assignments(command_lc) or command_line_names_hermes_home(command_lc, home_lc)
+    # No env evidence. Keeper: a bare-argv claim requires process evidence — a generated
+    # launcher whose SOURCE embeds an explicit home is NOT the default's, and without a
+    # readable environment nothing else proves it. #100817's carve-out survives: an explicit
+    # ``--profile default`` names a default-home service whose plist mirrors the named shape.
+    return (
+        profile_flag_value(command) == "default"
+        and profile_name in (None, "default")
+    )
 
 
 def _host_gateway_serves_home(pid: int, profile_home: Path) -> bool:

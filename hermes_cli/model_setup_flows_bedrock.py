@@ -54,7 +54,7 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
 
     # Check env var and credential pool (keys added via `hermes auth`)
     bedrock_pconfig = ProviderConfig(id="bedrock", name="Bedrock", auth_type="api_key", api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",))
-    existing_key, existing_source = _resolve_api_key_provider_secret("bedrock", bedrock_pconfig)
+    existing_key, existing_source, _shared_url = _resolve_api_key_provider_secret("bedrock", bedrock_pconfig)
     if existing_key:
         from hermes_cli.env_loader import format_secret_source_suffix
         source_suffix = format_secret_source_suffix(existing_source or "AWS_BEARER_TOKEN_BEDROCK")

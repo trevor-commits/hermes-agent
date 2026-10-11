@@ -47,8 +47,8 @@ def _ask(prompt: str, *, secret: bool = False, raw: bool = False, cancel_msg: st
         return on_cancel
 
 
-def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, str]:
-    """Resolve an existing wizard credential without changing its storage."""
+def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, str, str]:
+    """Resolve an existing wizard credential (token, source, paired endpoint) without changing its storage."""
     from hermes_cli.auth import _resolve_api_key_provider_secret
     return _resolve_api_key_provider_secret(provider_id, pconfig)
 
@@ -60,7 +60,7 @@ def _ensure_flow_api_key(provider_id: str, pconfig, *, missing_hint=()) -> tuple
     Returns ``(existing_key, resolved_key, abort)``.
     """
     from hermes_cli.main_provider_setup import _prompt_api_key
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key, existing_source, _shared_url = _existing_api_key_for_model_flow(provider_id, pconfig)
     if not existing_key:
         for line in missing_hint:
             print(line)

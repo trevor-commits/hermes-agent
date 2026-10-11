@@ -586,6 +586,9 @@ def _scan_gateway_pids(
         looks_like_gateway_command_line,
         looks_like_gateway_runtime_command_line,
         _read_process_cmdline,
+        profile_flag_value,
+        hermes_home_assignments,
+        command_line_names_hermes_home,
     )
     from hermes_cli.dashboard_procs import _hermes_home_for_pid, _normalized_home_for_compare
     current_home_path = get_hermes_home().resolve()
@@ -594,8 +597,16 @@ def _scan_gateway_pids(
     # trailing separator: the assignments parser strips one, so the systemd ``Environment=``
     # spelling (``HERMES_HOME=/root/.hermes/``) compares equal to the resolved home.
     current_home_lc = current_home.lower().replace("\\", "/").rstrip("/")
-    current_profile_arg = _profile_arg(current_home)
-    current_profile_name = current_profile_arg.split()[-1] if current_profile_arg else ""
+    # The profile NAME comes from the home's own path (…/profiles/<name> — gateway.status's
+    # path-derived rule): a scanned home may live outside the default root (relocated
+    # HERMES_HOME, a temp test home), where _profile_arg's default-root registry is empty and
+    # a named profile's gateway would be invisible to its own scanner.
+    current_home_path_resolved = current_home_path
+    current_profile_name = (
+        current_home_path_resolved.name
+        if current_home_path_resolved.parent.name == "profiles"
+        else (_profile_arg(current_home).split()[-1] if _profile_arg(current_home) else "")
+    )
     current_profile_name_lc = current_profile_name.lower()
     # ``_profile_arg`` is "" for ANY root, and get_default_hermes_root() calls a temp or Docker
     # HERMES_HOME "the root itself", so only the home owning the bare service name is the default one.
@@ -605,7 +616,9 @@ def _scan_gateway_pids(
         command_lc = command.lower().replace("\\", "/")
         if current_profile_name:
             # Token equality, not substring: `-p ops` must not claim (or SIGTERM) an `-p ops-2` gateway.
-            if profile_flag_value(command_lc) == current_profile_name_lc:
+            # profile_flag_value resolves through generated launchers (unwrapped argv), so an
+            # inline bootstrap carrying --profile in its SOURCE still matches its profile.
+            if profile_flag_value(command) == current_profile_name_lc:
                 return True
             return command_line_names_hermes_home(command_lc, current_home_lc)
 
@@ -613,7 +626,7 @@ def _scan_gateway_pids(
         # accepts (``--profile=ops`` slipped past a substring test, so a default-profile fallback stop
         # could SIGTERM the named gateway) or a HERMES_HOME= naming another home. An explicit
         # ``--profile default`` names this home (#100817).
-        if profile_flag_value(command_lc) not in (None, "default"):
+        if profile_flag_value(command) not in (None, "default"):
             return False
         if hermes_home_assignments(command_lc):
             return command_line_names_hermes_home(command_lc, current_home_lc)
