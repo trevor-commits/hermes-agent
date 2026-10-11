@@ -50,8 +50,16 @@ def _packaged_resources_dir(desktop_dir: Path) -> Optional[Path]:
     executable = _desktop_packaged_executable(desktop_dir)
     if executable is None:
         return None
-    # macOS: …/Hermes.app/Contents/MacOS/Hermes → …/Contents/Resources
-    return executable.parent.parent / "Resources" if sys.platform == "darwin" else executable.parent / "resources"
+    # The bundle LAYOUT, not the host platform, decides: a macOS app carries
+    # …/Hermes.app/Contents/MacOS/Hermes → …/Contents/Resources, while the
+    # Windows/Linux unpacked dir carries Hermes.exe + a sibling resources/.
+    # Verifying on darwin with a Windows-unpacked tree (a test fixture, or an
+    # install unpacked from the win zip) previously invented a nonexistent
+    # …/Resources dir and reported the packaged app as "stale, unstamped, or
+    # incomplete" (#desktop-layout-sniff).
+    if executable.parent.name == "MacOS" and executable.parent.parent.name == "Contents":
+        return executable.parent.parent / "Resources"
+    return executable.parent / "resources"
 
 
 # The module files the renderer fetches before any app code runs: Vite emits
