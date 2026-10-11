@@ -44,6 +44,12 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     attributes on that module is the canonical test surface (matches
     tests/hermes_cli/test_cmd_update.py).
     """
+    # This suite exercises the HEAD-movement gate on a FAKE project root; the
+    # owning-install retarget must never decide this process is a redirected
+    # install and re-exec the CLI inside the real checkout that owns sys.prefix
+    # (a checkout-rooted venv makes that true on dev runs).
+    import hermes_cli.update_owning_install as _owning
+    monkeypatch.setattr(_owning, "owning_install_root", lambda _root: None)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
