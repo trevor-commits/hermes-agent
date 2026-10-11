@@ -113,7 +113,7 @@ def test_detached_worker_teardown_waits_for_future():
         future.set_result({"final_response": "late"})
 
         finalize.assert_called_once_with(fake_db, agent, "detached-worker", "detached worker",
-                                         "cron_detached-worker", success=False)
+                                         "cron_detached-worker", workdir=None, success=False)
         teardown_agent.assert_called_once_with(agent, "detached-worker")
     assert defer_teardown_to_running_worker(
         future, fake_db, agent, "detached-worker", "detached worker", "cron_detached-worker",
