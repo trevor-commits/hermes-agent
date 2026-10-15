@@ -758,13 +758,12 @@ def _command_line_belongs_to_profile(
     profile = profile_flag_value(command)
     if profile is not None:
         # Hermes applies --profile before reading HERMES_HOME. A flag naming a DIFFERENT
-        # profile must never fall through to this home's environment. A flag naming THIS
-        # profile accepts on its own (the strongest argv signal); ``--profile default`` on
-        # a default home falls through so env evidence and the rules below apply (#100817).
-        if profile.lower() == (profile_name or "").lower():
-            return True
-        if profile.lower() != "default":
+        # profile must never fall through to this home's environment, including default.
+        # Explicit default rehomes the launch environment to its root below (#100817).
+        if profile.lower() != (profile_name or "default").lower():
             return False
+        if profile.lower() != "default":
+            return True
     declared_homes = [
         token.partition("=")[2]
         for token in (_gateway_command_tokens(command) or [])
@@ -777,6 +776,10 @@ def _command_line_belongs_to_profile(
     elif process_home is _UNSET:
         declared_homes = []
     explicit_homes = declared_homes or hermes_home_assignments(command_lc)
+    if profile is not None and profile.lower() == "default":
+        from hermes_cli.profiles import profile_root_for_env_home
+
+        explicit_homes = [str(profile_root_for_env_home(home, profile_home)) for home in explicit_homes]
     names_home = any(_same_hermes_home(home, profile_home) for home in explicit_homes)
     if not process_home and process_home is not _UNSET:
         names_home = names_home or command_line_names_hermes_home(command_lc, home_lc)
@@ -803,6 +806,7 @@ def _command_line_belongs_to_profile(
     return (
         profile_flag_value(command) == "default"
         and profile_name in (None, "default")
+        and (not explicit_homes or names_home)
     )
 
 

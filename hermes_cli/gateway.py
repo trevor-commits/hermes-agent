@@ -590,6 +590,8 @@ def _scan_gateway_pids(
         profile_flag_value,
         hermes_home_assignments,
         command_line_names_hermes_home,
+        _command_line_belongs_to_profile,
+        _UNSET,
     )
     from hermes_cli.dashboard_procs import _hermes_home_for_pid, _normalized_home_for_compare
     from hermes_cli.gateway_migrate_guards import pid_is_other_users
@@ -609,27 +611,26 @@ def _scan_gateway_pids(
         if current_home_path_resolved.parent.name == "profiles"
         else (_profile_arg(current_home).split()[-1] if _profile_arg(current_home) else "")
     )
-    current_profile_name_lc = current_profile_name.lower()
     # ``_profile_arg`` is "" for ANY root, and get_default_hermes_root() calls a temp or Docker
     # HERMES_HOME "the root itself", so only the home owning the bare service name is the default one.
     current_home_is_native = not current_profile_name and _home_owns_bare_service_name(current_home_path)
 
     def _matches_current_profile(pid: int, command: str) -> bool:
         command_lc = command.lower().replace("\\", "/")
+        profile = profile_flag_value(command)
+        if profile is not None:
+            owner_home = _hermes_home_for_pid(pid)
+            if profile.lower() == "default" and owner_home is None and not (
+                current_home_is_native or hermes_home_assignments(command_lc)
+            ):
+                return False
+            return _command_line_belongs_to_profile(
+                command, current_home_path, process_home=owner_home if owner_home is not None else _UNSET
+            )
         if current_profile_name:
-            # Token equality, not substring: `-p ops` must not claim (or SIGTERM) an `-p ops-2` gateway.
-            # profile_flag_value resolves through generated launchers (unwrapped argv), so an
-            # inline bootstrap carrying --profile in its SOURCE still matches its profile.
-            if profile_flag_value(command) == current_profile_name_lc:
-                return True
             return command_line_names_hermes_home(command_lc, current_home_lc)
 
-        # Root home: reject argv that advertises another profile in any spelling the CLI pre-parser
-        # accepts (``--profile=ops`` slipped past a substring test, so a default-profile fallback stop
-        # could SIGTERM the named gateway) or a HERMES_HOME= naming another home. An explicit
-        # ``--profile default`` names this home (#100817).
-        if profile_flag_value(command) not in (None, "default"):
-            return False
+        # Root home without a profile flag: an explicit different home still rejects.
         if hermes_home_assignments(command_lc):
             return command_line_names_hermes_home(command_lc, current_home_lc)
         # No home on argv: it came through the environment (launchd plist, systemd unit, a test's

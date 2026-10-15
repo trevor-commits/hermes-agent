@@ -114,6 +114,25 @@ def test_live_launch_home_preserves_filesystem_aliases(tmp_path):
     assert status._command_line_belongs_to_profile(command, alias, process_home=str(root))
 
 
+@pytest.mark.parametrize("profile_args", [["--profile", "default"], ["-p", "default"], ["--profile=default"]])
+@pytest.mark.parametrize("launch_home", ["embedded", "process", "other-root"])
+def test_explicit_default_rehomes_named_launcher_before_identity_match(tmp_path, profile_args, launch_home):
+    from hermes_cli.profiles import profile_root_for_env_home
+
+    root = tmp_path / "home with 'quotes'"
+    named = root / "profiles" / "ops"
+    command = shlex.join(runtime_command(tmp_path, [*profile_args, "gateway", "run"],
+                                        python="python", home=named))
+    process_home = {"embedded": "", "process": str(named),
+                    "other-root": str(tmp_path / "other" / "profiles" / "ops")}[launch_home]
+    effective_root = profile_root_for_env_home(process_home or str(named), root)
+    assert not status._command_line_belongs_to_profile(command, named, process_home=process_home)
+    assert status._command_line_belongs_to_profile(command, effective_root, process_home=process_home)
+    assert not status._command_line_belongs_to_profile(command, tmp_path / "unrelated", process_home=process_home)
+    if launch_home == "other-root":
+        assert not status._command_line_belongs_to_profile(command, root, process_home=process_home)
+
+
 def test_psutil_serialization_preserves_windows_executable_and_python_escapes(tmp_path, monkeypatch):
     import psutil
 
@@ -154,3 +173,26 @@ def test_macos_scanner_rereads_script_launcher_argv_and_rejects_mentions(tmp_pat
     monkeypatch.setattr(status, "_process_hermes_home", lambda pid: str(home))
     assert cli_gateway._scan_gateway_pids(set()) == [57431]
     assert reads == [57431, 57432]
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("profile_args", [["--profile", "default"], ["-p", "default"], ["--profile=default"]])
+@pytest.mark.parametrize("readable_env", [True, False])
+def test_macos_scanner_applies_explicit_default_before_launch_home(tmp_path, monkeypatch, profile_args, readable_env):
+    from types import SimpleNamespace
+    import hermes_cli.dashboard_procs as dashboard
+    import hermes_cli.gateway as cli_gateway
+
+    root = tmp_path / "home"
+    named = root / "profiles" / "ops"
+    command = shlex.join([f"HERMES_HOME={named}", "hermes", *profile_args, "gateway", "run"])
+    monkeypatch.setattr(cli_gateway, "_get_ancestor_pids", lambda: set())
+    monkeypatch.setattr(cli_gateway.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=f"57431 {command}\n"))
+    monkeypatch.setattr(dashboard, "_hermes_home_for_pid", lambda pid: str(named) if readable_env else None)
+    monkeypatch.setattr(cli_gateway, "get_hermes_home", lambda: named)
+    assert cli_gateway._scan_gateway_pids(set()) == []
+    monkeypatch.setattr(cli_gateway, "get_hermes_home", lambda: root)
+    assert cli_gateway._scan_gateway_pids(set()) == [57431]
+    monkeypatch.setattr(cli_gateway, "get_hermes_home", lambda: tmp_path / "unrelated")
+    assert cli_gateway._scan_gateway_pids(set()) == []
