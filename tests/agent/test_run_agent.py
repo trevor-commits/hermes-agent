@@ -61,6 +61,10 @@ def _mock_plugin_discovery(monkeypatch):
     # Tool definitions are supplied by these unit fixtures. Scanning every
     # bundled plugin again for each isolated test home adds no coverage.
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.PluginManager.discover_and_load",
+        lambda manager, force=False: setattr(manager, "_discovered", True),
+    )
 
 
 @pytest.fixture()
@@ -3987,9 +3991,15 @@ class TestRunConversation:
                 )
             )
             worker.start()
-            assert entered.wait(timeout=2)
-            assert agent.redirect("Use the corrected approach.") is True
-            worker.join(timeout=5)
+            try:
+                assert entered.wait(timeout=2)
+                assert agent.redirect("Use the corrected approach.") is True
+                worker.join(timeout=5)
+                assert worker.is_alive() is False
+            finally:
+                if worker.is_alive():
+                    agent.interrupt()
+                    worker.join(timeout=5)
 
         assert worker.is_alive() is False
         assert calls == 2
