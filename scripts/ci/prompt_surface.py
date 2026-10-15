@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import importlib
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from collections import Counter
 from datetime import UTC, datetime
@@ -74,6 +76,9 @@ SESSION_ID = FIXED_NOW.strftime("%Y%m%d_%H%M%S") + "_prompt_surface"
 
 def _pin_environment() -> None:
     """Pin every input that differs between machines; each one moved bytes in a trial render."""
+    # Select native build metadata and extensions before the deterministic skills OS pin.
+    sysconfig.get_config_vars()
+    importlib.import_module("psutil")
     def refuse(*_a, **_k):
         raise OSError("network disabled while rendering the prompt surface")
     socket.socket.connect = refuse  # type: ignore[method-assign]
@@ -198,11 +203,12 @@ def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
     environment, config or imported modules reaches the bytes."""
     with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
-        home = Path(tmp) / "home"
+        home = (Path(tmp) / "home").resolve()
         home.mkdir()
         staging = Path(tmp) / "out"
         env = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
+            "HERMES_MANAGED_DIR": str(home / "managed"),
             "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "PYTHONPATH": str(ROOT),
             "TMPDIR": tmp, "PYTHONDONTWRITEBYTECODE": "1",
         }

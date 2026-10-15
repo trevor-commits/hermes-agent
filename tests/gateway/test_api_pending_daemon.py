@@ -69,7 +69,8 @@ def test_api_and_ws_pending_controls_share_identity(tmp_path):
     env = {**child_env(), **{k: os.environ[k] for k in ('TIRITH_ENABLED',) if k in os.environ}}
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=base, API_SERVER_KEY='ordinary-daemon-owned-secret',
-               API_SERVER_ENABLED='true', API_SERVER_PORT=str(port), PYTHONUNBUFFERED='1')
+               API_SERVER_ENABLED='true', API_SERVER_PORT=str(port), PYTHONUNBUFFERED='1',
+               HERMES_DISABLE_LAZY_INSTALLS='1')
 
     async def exercise(desc):
         headers = {'Authorization': 'Bearer ordinary-daemon-owned-secret'}

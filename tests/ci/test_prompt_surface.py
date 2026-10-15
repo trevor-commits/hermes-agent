@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import filecmp
 import importlib.util
+import os
 import shutil
+import subprocess
+import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -42,6 +46,58 @@ def test_committed_prompt_surface_is_current(tmp_path):
         "    scripts/run-in-hermes-env python scripts/ci/prompt_surface.py render\n"
         + "\n".join(differences[:20])
     )
+
+
+def test_platform_pin_preserves_native_python_metadata_and_network_ban(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path / ".hermes"))
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import os
+import socket
+import sys
+from scripts.ci.prompt_surface import _pin_environment
+_pin_environment()
+import sysconfig
+import psutil
+from zoneinfo import ZoneInfo
+assert sys.platform == "linux"
+assert sysconfig.get_config_var("py_version")
+assert str(ZoneInfo("UTC")) == "UTC"
+assert psutil.Process().pid == os.getpid()
+with socket.socket() as sock:
+    for operation, args in (
+        (sock.connect, (("127.0.0.1", 1),)),
+        (socket.create_connection, (("127.0.0.1", 1),)),
+        (socket.getaddrinfo, ("example.invalid", 443)),
+    ):
+        try:
+            operation(*args)
+        except OSError as exc:
+            assert "network disabled while rendering" in str(exc), str(exc)
+        else:
+            raise AssertionError("prompt rendering allowed network access")
+"""],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_render_isolates_managed_config_and_canonicalizes_home(tmp_path, monkeypatch):
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    monkeypatch.setattr(prompt_surface.tempfile, "TemporaryDirectory", lambda **_k: nullcontext(str(alias / "..")))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "foreign-policy"))
+
+    def child(_argv, *, env, **_kwargs):
+        home = (tmp_path / "home").resolve()
+        assert env["HOME"] == str(home)
+        assert env["HERMES_HOME"] == str(home / ".hermes")
+        assert env["HERMES_MANAGED_DIR"] == str(home / "managed")
+        assert not Path(env["HERMES_MANAGED_DIR"]).exists()
+        return subprocess.CompletedProcess(_argv, 1, stderr="")
+
+    monkeypatch.setattr(prompt_surface.subprocess, "run", child)
+    assert prompt_surface.render(tmp_path / "unused-output") == 1
 
 
 def test_summary_names_the_surface_and_tool_that_changed(tmp_path):

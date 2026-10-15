@@ -1717,7 +1717,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
       render(<Harness refreshSessions={refreshSessions} />)
       await flushAsync()
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(45_000)
+        await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
       })
 
       const timeout = $desktopBoot.get().error
@@ -1795,7 +1795,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     const view = render(<Harness />)
     await flushAsync()
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(45_000)
+      await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
     })
     expect($desktopBoot.get().error).toBeTruthy()
     const originalUrl = window.location.href
