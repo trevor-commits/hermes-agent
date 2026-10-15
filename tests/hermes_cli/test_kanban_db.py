@@ -551,36 +551,18 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
-def test_infrastructure_spawn_refusal_never_charges_the_card(
-    kanban_home, monkeypatch, all_assignees_spawnable,
-):
-    """The host refusing to place a worker (managed gateway, user bus gone —
-    #114720) is not a card failure: through the REAL spawn boundary and the
-    real dispatcher accounting, ``consecutive_failures`` stays put, the breaker
-    never parks the card as a bare ``blocked``, the run is tagged
-    ``infrastructure`` and the guard spaces the retries. A control spawn
-    failure on the same card still counts."""
-    from tools import process_registry
-
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
-    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
+def _assert_infrastructure_refusal_accounting(monkeypatch, spawn_fn, message):
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
-
-    def spawn_via_real_boundary(task, workspace, board=None):
-        kbd._restart_safe_worker_argv(task, ["hermes", "chat"])  # raises: real probe verdict, real _degrade()
-        raise AssertionError("unreachable")
-
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="bus is down", assignee="a")
         for _ in range(3):
-            res = kbd.dispatch_once(conn, spawn_fn=spawn_via_real_boundary, failure_limit=2)
+            res = kbd.dispatch_once(conn, spawn_fn=spawn_fn, failure_limit=2)
             assert res.auto_blocked == []
         row = conn.execute(
             "SELECT status, block_kind, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
         assert (row["status"], row["block_kind"], row["consecutive_failures"]) == ("ready", None, 0)
-        assert "enable-linger" in row["last_failure_error"]
+        assert message in row["last_failure_error"]
         runs = conn.execute(
             "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
         ).fetchall()
@@ -600,6 +582,39 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         assert conn.execute(
             "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,),
         ).fetchone()[0] == 1
+
+
+@pytest.mark.platforms("linux")
+def test_infrastructure_spawn_refusal_never_charges_the_card(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A managed systemd gateway's unavailable user bus refuses through the
+    real spawn boundary without spending the card's failure budget (#114720)."""
+    from tools import process_registry
+
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
+
+    def spawn_via_real_boundary(task, workspace, board=None):
+        kbd._restart_safe_worker_argv(task, ["hermes", "chat"])  # raises: real probe verdict, real _degrade()
+        raise AssertionError("unreachable")
+
+    _assert_infrastructure_refusal_accounting(monkeypatch, spawn_via_real_boundary, "enable-linger")
+
+
+def test_typed_infrastructure_refusal_preserves_card_budget_on_every_host(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """Dispatch accounting is host-independent even though systemd placement is Linux-only."""
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    message = "restart-safe worker scope unavailable"
+
+    def spawn_refused(task, workspace, board=None):
+        raise RestartSafeScopeUnavailable(message)
+
+    _assert_infrastructure_refusal_accounting(monkeypatch, spawn_refused, message)
 
 
 

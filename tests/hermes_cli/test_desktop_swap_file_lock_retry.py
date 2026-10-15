@@ -40,11 +40,12 @@ def _staged_over_live(tmp_path: Path, monkeypatch):
 
 def test_swap_retries_transient_permission_error_then_promotes(tmp_path, monkeypatch, caplog):
     desktop_dir, staging, live_exe, slept = _staged_over_live(tmp_path, monkeypatch)
+    unpacked = _packaged_exe_rel().parts[0]
     real_rename = os.rename
     locked = {"n": 0}
 
     def scanner_locked_rename(src, dst):
-        if Path(dst) == live_exe.parent and locked["n"] < 2:
+        if Path(src) == staging / unpacked and Path(dst) == desktop_dir / "release" / unpacked and locked["n"] < 2:
             locked["n"] += 1
             raise PermissionError(32, "being used by another process")
         return real_rename(src, dst)
@@ -55,6 +56,7 @@ def test_swap_retries_transient_permission_error_then_promotes(tmp_path, monkeyp
 
     assert promoted == live_exe
     assert live_exe.read_text(encoding="utf-8") == "new"
+    assert locked["n"] == 2
     assert len(slept) == 2  # two transient locks → two backoff sleeps before the promotion
     assert not staging.exists()
 
@@ -78,5 +80,5 @@ def test_swap_gives_up_after_bounded_retries_and_keeps_live_app(tmp_path, monkey
     assert attempts["n"] == len(main_desktop._DESKTOP_SWAP_RENAME_RETRY_DELAYS_S) + 1
     assert len(slept) == len(main_desktop._DESKTOP_SWAP_RENAME_RETRY_DELAYS_S)
     assert live_exe.read_text(encoding="utf-8") == "old"
-    assert not (live_exe.parent.parent / (live_exe.parent.name + ".previous")).exists()
+    assert not (desktop_dir / "release" / (_packaged_exe_rel().parts[0] + ".previous")).exists()
     assert any("Access is denied" in r.message and "live app kept" in r.message for r in caplog.records)

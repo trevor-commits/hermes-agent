@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+import hermes_state_holders
 import hermes_state_repair
 from hermes_cli.doctor_report import Finding
 from hermes_cli.doctor_state import _state_db_wal
@@ -26,6 +30,14 @@ def _large_wal_db(tmp_path):
 
 def test_doctor_checkpoint_runs_only_on_the_exclusive_repair_guard(tmp_path, monkeypatch):
     db = _large_wal_db(tmp_path)
+
+    # Host process scans are a separate boundary; keep the real SQLite probe
+    # and exclusive guard while declaring this temporary database unheld.
+    def no_foreign_holders(path):
+        assert path == db
+        return []
+
+    monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", no_foreign_holders)
 
     bare_connects: list[str] = []
     real_connect = sqlite3.connect
@@ -51,6 +63,31 @@ def test_doctor_checkpoint_runs_only_on_the_exclusive_repair_guard(tmp_path, mon
     assert finding.fixed == 1 and not finding.issues
     # Every writable open went through the repair connector (probe + exclusive guard); none was a bare connect.
     assert bare_connects and len(bare_connects) == len(guard_connects) >= 2
+
+
+@pytest.mark.parametrize("holder_kind", ["known", "unknown"])
+def test_doctor_checkpoint_refuses_foreign_or_uninspectable_holders(tmp_path, monkeypatch, holder_kind):
+    db = _large_wal_db(tmp_path)
+    wal = Path(f"{db}-wal")
+    original_db = db.read_bytes()
+    original_wal = hashlib.sha256(wal.read_bytes()).digest()
+
+    def holders(path):
+        assert path == db
+        return [(4242, str(wal))] if holder_kind == "known" else [(-1, "uninspectable holder")]
+
+    def forbidden_connect(*_args, **_kwargs):
+        pytest.fail("holder refusal must precede every writable SQLite open")
+
+    monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", holders)
+    monkeypatch.setattr(hermes_state_repair, "_connect_repair_durable", forbidden_connect)
+    finding = Finding()
+    _state_db_wal(finding, True, db)
+
+    assert finding.fixed == 0 and len(finding.issues) == 1
+    assert finding.issues[0].index("stop the profile's gateway") < finding.issues[0].index("hermes doctor --fix")
+    assert db.read_bytes() == original_db
+    assert hashlib.sha256(wal.read_bytes()).digest() == original_wal
 
 
 def test_session_count_reads_a_home_with_uri_reserved_characters(tmp_path):
