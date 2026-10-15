@@ -8,7 +8,9 @@ import pytest
 from tools.bot_desktop import resources, runtime
 
 
+@pytest.mark.platforms("linux")
 def test_start_refuses_and_status_explains_when_memory_is_short(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime.placement, "_terminal_backend", lambda: "local")
     monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bd")
     monkeypatch.setattr(runtime, "missing_binaries", list)
     monkeypatch.setattr(runtime, "_launcher_pid", lambda: None)
@@ -23,6 +25,30 @@ def test_start_refuses_and_status_explains_when_memory_is_short(tmp_path, monkey
     with pytest.raises(RuntimeError, match="Not enough free memory"):
         runtime.start()
     assert spawned == [], "the launcher must not be spawned on a host that cannot hold it"
+
+
+@pytest.mark.parametrize("limit", [None, 4096])
+def test_memory_shortage_reports_available_needed_and_known_limit(limit):
+    blocker = resources.memory_blocker(resources.MemoryInfo(available_mb=900, limit_mb=limit), need=1536)
+    assert blocker and "900 MB" in blocker and "1536 MB needed" in blocker
+    assert ("of 4096 MB" in blocker) is (limit is not None)
+
+
+@pytest.mark.platforms("not linux")
+def test_native_unsupported_host_refuses_before_memory_or_allocation(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime.placement, "_terminal_backend", lambda: "local")
+    monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bd")
+    monkeypatch.setattr(runtime, "_launcher_pid", lambda: None)
+    monkeypatch.setattr(runtime, "missing_binaries", lambda: pytest.fail("unsupported host probed Linux binaries"))
+    monkeypatch.setattr(resources, "memory_info", lambda: pytest.fail("unsupported host probed Linux memory"))
+    monkeypatch.setattr(runtime, "_spawn_and_wait", lambda *a, **k: pytest.fail("unsupported host allocated a desktop"))
+
+    st = runtime.status()
+    assert not st.supported and not st.running and not st.installed
+    assert st.blocker is None and st.memory_available_mb is None and st.memory_limit_mb is None
+    with pytest.raises(RuntimeError, match="Linux gateway hosts only"):
+        runtime.start()
+    assert not (tmp_path / "bd").exists()
 
 
 @pytest.mark.parametrize("info", [
@@ -72,15 +98,15 @@ def _cgroup(monkeypatch, tmp_path, *, v2=True, limit, usage, cache):
     if v2:
         monkeypatch.setattr(resources, "_CGROUP_V2", root)
         monkeypatch.setattr(resources, "_CGROUP_V1", tmp_path / "nope")
-        (root / "memory.max").write_text(str(limit))
-        (root / "memory.current").write_text(str(usage))
-        (root / "memory.stat").write_text(f"anon 123\ninactive_file {cache}\nslab 7\n")
+        (root / "memory.max").write_text(str(limit), encoding="utf-8")
+        (root / "memory.current").write_text(str(usage), encoding="utf-8")
+        (root / "memory.stat").write_text(f"anon 123\ninactive_file {cache}\nslab 7\n", encoding="utf-8")
     else:
         monkeypatch.setattr(resources, "_CGROUP_V2", tmp_path / "nope")
         monkeypatch.setattr(resources, "_CGROUP_V1", root)
-        (root / "memory.limit_in_bytes").write_text(str(limit))
-        (root / "memory.usage_in_bytes").write_text(str(usage))
-        (root / "memory.stat").write_text(f"total_inactive_file {cache}\n")
+        (root / "memory.limit_in_bytes").write_text(str(limit), encoding="utf-8")
+        (root / "memory.usage_in_bytes").write_text(str(usage), encoding="utf-8")
+        (root / "memory.stat").write_text(f"total_inactive_file {cache}\n", encoding="utf-8")
 
 
 @pytest.mark.parametrize("v2", [True, False], ids=["cgroup-v2", "cgroup-v1"])

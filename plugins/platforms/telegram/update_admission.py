@@ -165,6 +165,9 @@ class PerChatUpdateProcessor(SimpleUpdateProcessor):
                 release()
             else:
                 prev.add_done_callback(release)
+            # A cancelled same-chat waiter never awaited its handler coroutine.
+            if asyncio.iscoroutine(coroutine):
+                coroutine.close()
 
 
 def build_update_processor(extra, name: str) -> PerChatUpdateProcessor:

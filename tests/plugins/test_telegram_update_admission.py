@@ -396,6 +396,7 @@ async def _check_error_registration(monkeypatch, adapter, app):
 
 async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered):
     scheduled, effects = [], []
+    settled = asyncio.Event()
     create = app._Application__create_task
 
     def cancel_on_schedule(coroutine, *args, **kwargs):
@@ -403,6 +404,9 @@ async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered)
         if kwargs.get("is_error_handler"):
             scheduled.append((task, coroutine))
             task.cancel()
+            # Task completion can precede its callbacks; observe settlement after
+            # the real admission-release callback registered by create().
+            task.add_done_callback(lambda _done: settled.set())
         return task
 
     async def notify(incoming, context):
@@ -416,6 +420,7 @@ async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered)
         assert "111:10" in adapter._inflight_update_ids
         await app.process_update(update(app.bot))
         await app.stop()
+        await asyncio.wait_for(settled.wait(), 2)
     assert len(scheduled) == 1 and not effects
     assert not adapter._inflight_update_ids and not adapter._seen_update_ids
     # The cancelled PTB task never awaited the callback coroutine: it must be closed too.
@@ -761,7 +766,7 @@ async def test_redelivery_to_rebuilt_adapter_is_dropped(monkeypatch, tmp_path):
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
         assert [event.text for event in delivered] == ["hello"]
     # disconnect() waits for the receipt write; the failed preparation is not a receipt.
-    assert set(json.loads(receipts.read_text())["update_ids"]) == {"10"}
+    assert set(json.loads(receipts.read_text(encoding="utf-8-sig"))["update_ids"]) == {"10"}
 
     # A fresh adapter, connected the way the gateway reconnect watcher does it.
     async with connected(monkeypatch, is_reconnect=True) as (adapter, app, delivered):
@@ -780,14 +785,14 @@ async def test_redelivery_to_rebuilt_adapter_is_dropped(monkeypatch, tmp_path):
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
         assert len(delivered) == 1
     stale = time.time() - RECEIPT_TTL_SECONDS - 1
-    receipts.write_text(json.dumps({"update_ids": {"10": stale, "20": "bad", "x": time.time()}}))
+    receipts.write_text(json.dumps({"update_ids": {"10": stale, "20": "bad", "x": time.time()}}), encoding="utf-8")
     async with connected(monkeypatch) as (adapter, app, delivered):
         await app.process_update(update(app.bot, 10))
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
         assert len(delivered) == 1
-    assert set(json.loads(receipts.read_text())["update_ids"]) == {"10"}
+    assert set(json.loads(receipts.read_text(encoding="utf-8-sig"))["update_ids"]) == {"10"}
 
-    receipts.write_text("{not json")
+    receipts.write_text("{not json", encoding="utf-8")
     async with connected(monkeypatch) as (adapter, app, delivered):
         await app.process_update(update(app.bot, 30))
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
@@ -823,8 +828,9 @@ async def test_connect_builds_concurrent_update_processor(monkeypatch):
 
     chat = SimpleNamespace(effective_chat=SimpleNamespace(id=1))
     tasks = []
-    for name in "ABC":
-        tasks.append(asyncio.create_task(processor.process_update(chat, handler(name))))
+    coroutines = [handler(name) for name in "ABC"]
+    for coroutine in coroutines:
+        tasks.append(asyncio.create_task(processor.process_update(chat, coroutine)))
         await asyncio.sleep(0.01)
     tasks[1].cancel()
     await asyncio.sleep(0.01)
@@ -832,6 +838,12 @@ async def test_connect_builds_concurrent_update_processor(monkeypatch):
     results = await asyncio.gather(*tasks, return_exceptions=True)
     assert results[0] is None and results[2] is None
     assert order == ["start A", "end A", "start C", "end C"]  # C waits for A even after B is cancelled
+    assert isinstance(results[1], asyncio.CancelledError)
+    try:
+        assert coroutines[1].cr_frame is None, "cancelled waiter left its handler coroutine unclosed"
+    finally:
+        for coroutine in coroutines:
+            coroutine.close()
 
 
 @pytest.mark.asyncio

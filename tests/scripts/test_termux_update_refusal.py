@@ -51,6 +51,7 @@ def test_validator_accepts_real_cli_refusal_for_installed_identity(artifact, mon
 
     root, source = artifact
     monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    monkeypatch.setenv("PYTHONPATH", str(root))  # Intentional borrowed-interpreter artifact.
     monkeypatch.setattr("hermes_cli.image_provenance.IMAGE_PROVENANCE_PATH", tmp_path / "absent")
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
 

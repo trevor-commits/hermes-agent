@@ -224,6 +224,10 @@ def _source_files() -> list[Path]:
                 d for d in dirnames
                 if d not in _EXEMPT_DIRS and not _is_packaging_copy(d)
             ]
+        elif rel_dir == Path("apps/desktop"):
+            # Native packager outputs contain a foreign Python stdlib; authored
+            # Desktop sources and scripts remain part of this resolution guard.
+            dirnames[:] = [d for d in dirnames if d not in {"build", "dist", "release"}]
         for fname in filenames:
             if fname.endswith(".py"):
                 files.append(Path(dirpath) / fname)
@@ -246,7 +250,7 @@ def _findings() -> list[tuple[str, str, int]]:
     found: list[tuple[str, str, int]] = []
     for path in _source_files():
         try:
-            source = path.read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         if "which(" not in source:
@@ -269,7 +273,7 @@ def _resolution_sites() -> set[tuple[str, str, str]]:
         if rel == "hermes_platform" or rel.startswith("hermes_platform/"):
             continue
         try:
-            source = path.read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         try:
@@ -282,7 +286,7 @@ def _resolution_sites() -> set[tuple[str, str, str]]:
 
 
 def _resolution_allowlist() -> set[tuple[str, str, str]]:
-    rows = json.loads(_RESOLUTION_ALLOWLIST_PATH.read_text(encoding="utf-8"))
+    rows = json.loads(_RESOLUTION_ALLOWLIST_PATH.read_text(encoding="utf-8-sig"))
     return {(row["path"], row["symbol"], row["kind"]) for row in rows}
 
 
@@ -290,6 +294,20 @@ def _format_resolution_sites(sites: set[tuple[str, str, str]]) -> str:
     return "\n".join(
         f"  {path}::{symbol} ({kind})" for path, symbol, kind in sorted(sites)
     )
+
+
+def test_guard_excludes_desktop_outputs_but_keeps_authored_source(tmp_path, monkeypatch):
+    authored = ["apps/desktop/scripts/probe.py", "tools/build/probe.py"]
+    generated = [f"apps/desktop/{output}/packaged-python/probe.py" for output in ("build", "dist", "release")]
+    for name in authored + generated:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('import shutil\nshutil.which("node")\n', encoding="utf-8")
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+
+    assert {path.relative_to(tmp_path).as_posix() for path in _source_files()} == set(authored)
+    assert {(path, command) for path, command, _line in _findings()} == {(path, "node") for path in authored}
+    assert _resolution_sites() == {(path, MODULE_MARKER, "bare_which") for path in authored}
 
 
 def test_bare_which_and_known_path_tables_are_allowlisted():

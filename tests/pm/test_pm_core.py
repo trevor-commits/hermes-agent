@@ -792,6 +792,32 @@ def test_python_stage_keeps_vc_runtimes_on_other_targets(monkeypatch, tmp_path):
     assert (staged / "vcruntime140_1.dll").is_file()
 
 
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("target,should_sign", [
+    ("darwin-arm64", True), ("darwin-x64", True),
+    ("linux-arm64-bionic", False), ("linux-arm64", False), ("linux-x64", False),
+    ("linux-arm64-musl", False), ("linux-x64-musl", False),
+    ("win32-arm64", False), ("win32-x64", False),
+])
+def test_python_stage_signs_only_darwin_payloads_on_macos(monkeypatch, tmp_path, target, should_sign):
+    from pm.registry import get_package
+
+    package = get_package("python")
+    staged = tmp_path / "staged"
+    binary = package.binary(staged, target)
+    assert binary is not None
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"staged interpreter")
+    (staged / "LICENSE").write_text("fixture", encoding="utf-8")
+    signed = []
+    monkeypatch.setattr("hermes_cli.macos_signing.sign_managed_python", lambda path: signed.append(path) or True)
+
+    package.stage(None, staged, "3.14.7", target)
+
+    assert signed == ([binary] if should_sign else [])
+    assert binary.read_bytes() == b"staged interpreter"
+
+
 def test_verify_missing_binary_reports_path_and_listing(tmp_path):
     """A missing binary must say which path is missing and what the
     entry actually contains — the diagnosis that exposes a bad pin."""
