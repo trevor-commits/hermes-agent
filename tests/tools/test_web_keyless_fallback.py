@@ -295,6 +295,41 @@ class TestProviderRouting:
         assert out["success"] is False
         assert "PARALLEL_API_KEY" in out["error"]
 
+    @pytest.mark.parametrize("slot,client_name", [
+        ("_parallel_client", "_get_sync_client"),
+        ("_async_parallel_client", "_get_async_client"),
+    ])
+    def test_missing_parallel_key_never_provisions_sdk(self, monkeypatch, slot, client_name):
+        from plugins.web.parallel import provider
+
+        monkeypatch.setattr(web_tools, slot, None)
+        with patch("pm.ensure_import", side_effect=AssertionError("unconfigured SDK provisioning")) as ensure:
+            with pytest.raises(ValueError, match="PARALLEL_API_KEY"):
+                getattr(provider, client_name)()
+        ensure.assert_not_called()
+
+    @pytest.mark.parametrize("slot,client_name,sdk_name", [
+        ("_parallel_client", "_get_sync_client", "Parallel"),
+        ("_async_parallel_client", "_get_async_client", "AsyncParallel"),
+    ])
+    def test_configured_parallel_client_provisions_once_and_reuses_cache(
+        self, monkeypatch, slot, client_name, sdk_name,
+    ):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from plugins.web.parallel import provider
+
+        monkeypatch.setattr(web_tools, slot, None)
+        monkeypatch.setattr("agent.web_search_provider.get_provider_env", lambda name: "fixture-key")
+        factory = MagicMock()
+        monkeypatch.setitem(sys.modules, "parallel", SimpleNamespace(**{sdk_name: factory}))
+        with patch("pm.ensure_import") as ensure:
+            first = getattr(provider, client_name)()
+            assert getattr(provider, client_name)() is first
+        ensure.assert_called_once_with("parallel-web")
+        factory.assert_called_once_with(api_key="fixture-key")
+
     def test_is_available_stays_false_keyless(self):
         # Keyless tier must NOT leak into is_available() (legacy walk order).
         assert ParallelWebSearchProvider().is_available() is False
