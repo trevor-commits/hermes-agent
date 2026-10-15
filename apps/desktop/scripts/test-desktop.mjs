@@ -30,14 +30,14 @@ const APP = (() => {
     // electron-builder names the unpacked output per-arch: win-arm64-unpacked
     // on arm64, plain win-unpacked on x64. Accept either so the harness works
     // on both hosts instead of hardcoding the x64 layout.
-    const unpacked = ['win-unpacked', `win-${ARCH}-unpacked`]
-      .map(name => path.join(RELEASE_ROOT, name))
-      .find(exists)
+    const unpacked = ['win-unpacked', `win-${ARCH}-unpacked`].map(name => path.join(RELEASE_ROOT, name)).find(exists)
     return {
       appPath: unpacked,
       binary: unpacked ? path.join(unpacked, 'Hermes.exe') : path.join(RELEASE_ROOT, 'win-unpacked', 'Hermes.exe'),
       resourcesPath: unpacked ? path.join(unpacked, 'resources') : path.join(RELEASE_ROOT, 'win-unpacked', 'resources'),
-      asarPath: unpacked ? path.join(unpacked, 'resources', 'app.asar') : path.join(RELEASE_ROOT, 'win-unpacked', 'resources', 'app.asar'),
+      asarPath: unpacked
+        ? path.join(unpacked, 'resources', 'app.asar')
+        : path.join(RELEASE_ROOT, 'win-unpacked', 'resources', 'app.asar'),
       unpackedDistIndex: unpacked
         ? path.join(unpacked, 'resources', 'app.asar.unpacked', 'dist', 'index.html')
         : path.join(RELEASE_ROOT, 'win-unpacked', 'resources', 'app.asar.unpacked', 'dist', 'index.html')
@@ -103,9 +103,7 @@ function ensurePlatformBuilds() {
   if (PLATFORM === 'darwin') return
   if (PLATFORM === 'win32') return
   if (PLATFORM === 'linux') return
-  die(
-    `Desktop bundle validation is only wired for darwin / win32 / linux; platform=${PLATFORM} is not supported.`
-  )
+  die(`Desktop bundle validation is only wired for darwin / win32 / linux; platform=${PLATFORM} is not supported.`)
 }
 
 function ensurePackagedApp() {
@@ -270,18 +268,11 @@ function launchFresh() {
   console.log(`  electron userData: ${userDataDir}`)
   console.log(`  HERMES_HOME: ${hermesHome}`)
   console.log(`  cwd: ${cwd}`)
-
 }
-// ── lifecycle: automated packaged-app start → serve-ready → relaunch → teardown ──
-// Drives the REAL packaged binary through Playwright's Electron channel
-// (launch / firstWindow / app.close() — the app's own exact quit path, backend
-// teardown included), so the harness never kills a process itself. Isolation
-// and identity come from the flags main.ts already honors: sandboxed Electron
-// userData (own single-instance lock) + sandboxed HERMES_HOME + an explicit
-// backend root (main.ts backend-resolution rung 1). Readiness is the serve
-// protocol — a python backend child LISTENING on 127.0.0.1 answering
-// GET /api/health — never gateway.pid (that file is the messaging gateway's
-// record, a different surface) and never a mock.
+// ── lifecycle: packaged app → canonical gateway ready → relaunch → owned teardown ──
+// Electron owns its viewer; the canonical gateway survives app quit. Use the
+// real preload descriptor and native control identity, then retire only the
+// gateway created under this fresh sandbox after both viewer sessions finish.
 const LIFECYCLE_BACKEND_ROOT = process.env.HERMES_DESKTOP_LIFECYCLE_BACKEND_ROOT
 const LIFECYCLE_TIMEOUT_MS = Number(process.env.HERMES_DESKTOP_LIFECYCLE_TIMEOUT_MS) || 150_000
 const LIFECYCLE_KEEP = process.env.HERMES_DESKTOP_LIFECYCLE_KEEP === '1'
@@ -317,38 +308,81 @@ function lifecycleEnv(sandbox) {
   return { env, userDataDir, hermesHome, cwd }
 }
 
-// Readiness, the app's own way: the Electron main logs
-// `HERMES_BACKEND_READY port=<N>` (backend-ready.ts's announcement contract)
-// into <HERMES_HOME>/logs/desktop.log once uvicorn has bound the serve socket.
-// Parse that, then confirm externally that the announced port answers
-// GET /api/health with 200 — the same anonymous health route the app probes.
-// No process enumeration, no kills.
-async function serveBackendReady(hermesHome, label, offset) {
-  const logPath = path.join(hermesHome, 'logs', 'desktop.log')
-  const deadline = Date.now() + LIFECYCLE_TIMEOUT_MS
-  const tried = new Map()
-  let announced = new Set()
-  while (Date.now() < deadline) {
-    let text = ''
-    try {
-      text = fs.readFileSync(logPath, 'utf8').slice(offset)
-    } catch { /* log not created yet */ }
-    for (const m of text.matchAll(/HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/g)) {
-      announced.add(Number(m[1]))
+function lifecycleControl(operation, context) {
+  const { env, hermesHome, ...request } = context
+  const root = env.HERMES_DESKTOP_HERMES_ROOT
+  const python =
+    env.HERMES_PYTHON ||
+    [
+      path.join(root, '.venv', PLATFORM === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+      path.join(root, 'venv', PLATFORM === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+    ].find(exists)
+  if (!python || !exists(python)) throw new Error('Lifecycle requires an existing backend Python interpreter')
+  const result = spawnSync(
+    python,
+    [path.join(DESKTOP_ROOT, 'scripts', 'lifecycle_gateway.py'), operation, hermesHome],
+    {
+      cwd: root,
+      env: { ...env, PYTHONPATH: root },
+      input: JSON.stringify(request),
+      encoding: 'utf8',
+      timeout: operation === 'stop' ? 40_000 : 12_000
     }
-    for (const port of announced) {
-      tried.set(port, 'pending')
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(5_000) })
-        if (res.status === 200) return { port }
-        tried.set(port, `/api/health ${res.status}`)
-      } catch (err) {
-        tried.set(port, err && err.name === 'TimeoutError' ? 'timeout' : 'conn-refused')
+  )
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `Lifecycle gateway ${operation} refused: ${result.error?.message || result.stderr?.trim() || result.status}`
+    )
+  }
+  return JSON.parse(result.stdout)
+}
+
+async function gatewayBackendReady(window, context, label, recordOwner) {
+  const deadline = Date.now() + LIFECYCLE_TIMEOUT_MS
+  let timer
+  const descriptor = await Promise.race([
+    window.evaluate(async () => {
+      const connection = await window.hermesDesktop.getConnection()
+      return {
+        mode: connection.mode,
+        source: connection.source,
+        baseUrl: connection.baseUrl,
+        gatewayEndpoint: connection.gatewayEndpoint
       }
+    }),
+    new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`[${label}] gateway descriptor timed out after ${LIFECYCLE_TIMEOUT_MS}ms`)),
+        LIFECYCLE_TIMEOUT_MS
+      )
+    })
+  ]).finally(() => clearTimeout(timer))
+  const owner = lifecycleControl('inspect', { ...context, connection: descriptor })
+  recordOwner(owner)
+  let lastProbe = 'not answered'
+  while (Date.now() < deadline) {
+    let response
+    try {
+      response = await fetch(`${owner.api_origin}/api/health`, {
+        signal: AbortSignal.timeout(5_000),
+        redirect: 'error'
+      })
+      lastProbe = `HTTP ${response.status}`
+    } catch (error) {
+      lastProbe = error?.name || 'connection failed'
+    }
+    if (response?.status === 200) {
+      const health = await response.json()
+      if (health.ok !== true || health.commit !== owner.code_sha) {
+        throw new Error(`[${label}] gateway health status/revision differs from verified owner`)
+      }
+      return owner
     }
     await new Promise(resolve => setTimeout(resolve, 500))
   }
-  throw new Error(`[${label}] no announced serve backend answered /api/health within ${LIFECYCLE_TIMEOUT_MS}ms (announced ports: ${[...announced].join(', ') || 'none'}; probes: ${[...tried].map(([p, r]) => `${p}:${r}`).join(', ') || 'none'}; log: ${logPath})`)
+  throw new Error(
+    `[${label}] verified gateway did not answer /api/health within ${LIFECYCLE_TIMEOUT_MS}ms (${lastProbe})`
+  )
 }
 
 // Everything the first session created in the isolated home must survive the
@@ -376,16 +410,23 @@ function snapshotHome(root) {
 }
 
 async function runLifecycle() {
+  if (!['darwin', 'linux'].includes(PLATFORM))
+    throw new Error('Lifecycle identity-bound gateway cleanup currently requires macOS or Linux')
+  if (!LIFECYCLE_BACKEND_ROOT) throw new Error('Lifecycle requires HERMES_DESKTOP_LIFECYCLE_BACKEND_ROOT')
   const { _electron } = await import('@playwright/test')
   const sandbox = fs.mkdtempSync(`${FRESH_SANDBOX_ROOT}-lifecycle-`)
   const { env, userDataDir, hermesHome } = lifecycleEnv(sandbox)
   const sessions = []
   let preservedBefore = null
+  let ownedGateway = null
+  let failure = null
+  const revision = spawnSync('git', ['-C', env.HERMES_DESKTOP_HERMES_ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+  if (revision.status !== 0 || !/^[a-f0-9]{40}$/.test(revision.stdout.trim()))
+    throw new Error('Cannot establish backend source revision')
+  const context = { env, hermesHome, sandbox, code_sha: revision.stdout.trim(), started_after: Date.now() / 1000 }
 
   try {
     for (const label of ['session-1', 'session-2']) {
-      const log = path.join(hermesHome, 'logs', 'desktop.log')
-      const offset = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').length : 0
       const app = await _electron.launch({
         executablePath: APP.binary,
         env,
@@ -397,18 +438,28 @@ async function runLifecycle() {
       try {
         const window = await app.firstWindow({ timeout: LIFECYCLE_TIMEOUT_MS })
         console.log(`[${label}] first window: ${window.url()}`)
-        const ready = await serveBackendReady(hermesHome, label, offset)
-        console.log(`[${label}] READY: serve backend announced port ${ready.port}, /api/health → 200`)
+        const ready = await gatewayBackendReady(window, { ...context, expected: ownedGateway }, label, owner => {
+          ownedGateway = owner
+          fs.writeFileSync(path.join(sandbox, 'lifecycle-gateway.json'), JSON.stringify(owner, null, 2), {
+            mode: 0o600
+          })
+        })
+        console.log(`[${label}] READY: owned gateway ${ready.pid} at ${ready.api_origin}, /api/health → 200`)
         sessions.push({ label, appPid: proc.pid, ...ready, windowUrl: window.url() })
         if (label === 'session-1') preservedBefore = snapshotHome(hermesHome)
       } finally {
-        // app.close() is the app's own quit path (before-quit teardown, backend
-        // shutdown included) — not a kill.
+        // Quit only this viewer. The canonical gateway stays available for relaunch.
         await app.close()
         await new Promise((resolve, reject) => {
           if (proc.exitCode !== null || proc.signalCode !== null) return resolve()
-          const timer = setTimeout(() => reject(new Error(`[${label}] app process ${proc.pid} did not exit after close()`)), 30_000)
-          proc.once('exit', () => { clearTimeout(timer); resolve() })
+          const timer = setTimeout(
+            () => reject(new Error(`[${label}] app process ${proc.pid} did not exit after close()`)),
+            30_000
+          )
+          proc.once('exit', () => {
+            clearTimeout(timer)
+            resolve()
+          })
         })
         console.log(`[${label}] exited cleanly (code ${proc.exitCode})`)
       }
@@ -423,13 +474,43 @@ async function runLifecycle() {
       throw new Error(`preserved-state check FAILED — entries missing after relaunch:\n  ${lost.join('\n  ')}`)
     }
     console.log('  preservation: all pre-relaunch home entries survived the quit + relaunch cycle')
-    console.log(JSON.stringify({ sandbox, userDataDir, hermesHome, backendRoot: env.HERMES_DESKTOP_HERMES_ROOT || null, sessions, preserved: { before: preservedBefore.length, after: preservedAfter.length, lost: 0 } }, null, 2))
+    console.log(
+      JSON.stringify(
+        {
+          sandbox,
+          userDataDir,
+          hermesHome,
+          backendRoot: env.HERMES_DESKTOP_HERMES_ROOT || null,
+          sessions,
+          preserved: { before: preservedBefore.length, after: preservedAfter.length, lost: 0 }
+        },
+        null,
+        2
+      )
+    )
+  } catch (error) {
+    failure = error
+    throw error
   } finally {
-    if (!LIFECYCLE_KEEP) {
-      fs.rmSync(sandbox, { recursive: true, force: true })
-      console.log(`  sandbox removed: ${sandbox}`)
-    } else {
-      console.log(`  sandbox kept (HERMES_DESKTOP_LIFECYCLE_KEEP=1): ${sandbox}`)
+    let cleaned = false
+    try {
+      const cleanup = lifecycleControl('stop', { ...context, expected: ownedGateway })
+      fs.writeFileSync(path.join(sandbox, 'lifecycle-gateway-cleanup.json'), JSON.stringify(cleanup, null, 2), {
+        mode: 0o600
+      })
+      console.log(`  owned gateway ${cleanup.pid} exited through native pause; control socket absent`)
+      cleaned = true
+    } catch (cleanupError) {
+      console.error(`  gateway cleanup unverified; sandbox retained: ${sandbox}`)
+      if (failure) throw new AggregateError([failure, cleanupError], `${failure.message}; ${cleanupError.message}`)
+      throw cleanupError
+    } finally {
+      if (cleaned && !LIFECYCLE_KEEP) {
+        fs.rmSync(sandbox, { recursive: true, force: true })
+        console.log(`  sandbox removed: ${sandbox}`)
+      } else {
+        console.log(`  sandbox kept: ${sandbox}`)
+      }
     }
   }
 }
@@ -495,18 +576,14 @@ function validateBundle() {
         `${native.prebuildsDir} nor ${native.buildReleaseDir} exists`
     )
   }
-  const nodeBinaries = nativeBinaryDirs.flatMap(dir =>
-    fs.readdirSync(dir).filter(name => name.endsWith('.node'))
-  )
+  const nodeBinaries = nativeBinaryDirs.flatMap(dir => fs.readdirSync(dir).filter(name => name.endsWith('.node')))
   if (nodeBinaries.length === 0) {
     die(`No .node native binaries found in: ${nativeBinaryDirs.join(', ')}`)
   }
   // Darwin requires a runtime-execed spawn-helper alongside pty.node; missing
   // it manifests as "ENOENT: spawn-helper" on first pty.spawn() call.
   if (PLATFORM === 'darwin') {
-    const spawnHelper = nativeBinaryDirs
-      .map(dir => path.join(dir, 'spawn-helper'))
-      .find(exists)
+    const spawnHelper = nativeBinaryDirs.map(dir => path.join(dir, 'spawn-helper')).find(exists)
     if (!spawnHelper) {
       die(`Missing node-pty spawn-helper (required on darwin) in: ${nativeBinaryDirs.join(', ')}`)
     }
@@ -562,8 +639,9 @@ Fast rerun (skip rebuild if the packaged app already exists):
 
 Automated packaged lifecycle (no host side effects; isolated userData + HERMES_HOME):
   npm run test:desktop:lifecycle
-  # start packaged app → real serve backend ready (/api/health 200) → graceful
+  # start packaged app → canonical gateway ready (/api/health 200) → graceful
   # quit → relaunch → preserved-home check → full teardown of our own processes.
+  # Identity-bound gateway teardown currently supports macOS and Linux.
   # Requires a backend root the packaged app may use (backend-resolution rung 1):
   #   HERMES_DESKTOP_LIFECYCLE_BACKEND_ROOT=<hermes checkout with .venv|venv>
   # Knobs: HERMES_DESKTOP_LIFECYCLE_TIMEOUT_MS and
