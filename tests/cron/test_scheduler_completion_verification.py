@@ -18,6 +18,9 @@ import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+from gateway import session_cron
 
 import pytest
 
@@ -72,17 +75,13 @@ def _run_booked_job(
     monkeypatch, tmp_path, *, db_class=_RecordingSessionDB, agent_class=_FakeCronAgent,
     job_fields=None, execution_id=None, cancel_event=None, dispatch=False,
 ):
-    import hermes_state
     import run_agent
 
-    instances = []
-
-    def _capture_db(*args, **kwargs):
-        db = db_class(*args, **kwargs)
-        instances.append(db)
-        return db
-
-    monkeypatch.setattr(hermes_state, "SessionDB", _capture_db)
+    db = db_class()
+    if not hasattr(db, "db_path"):
+        db.db_path = tmp_path / "state.db"
+    owner = SimpleNamespace(db=db)
+    monkeypatch.setattr("hermes_state_registry.acquire", lambda *_a, **_kw: db)
     monkeypatch.setattr(run_agent, "AIAgent", agent_class)
     monkeypatch.setattr(
         "hermes_constants.resolve_reasoning_config", lambda *_a, **_k: None
@@ -104,7 +103,7 @@ def _run_booked_job(
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_runtime
     )
-    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", lambda: [])
+    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", list)
     monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(cron_scheduler, "get_fallback_chain", lambda _cfg: [])
     monkeypatch.setattr(
@@ -117,11 +116,19 @@ def _run_booked_job(
         "schedule_display": "manual",
         **(job_fields or {}),
     }
+    def run_owned(job, *, execution_id=None, **kwargs):
+        token = session_cron._execution.set((owner, "verify-session", job["id"], execution_id))
+        try:
+            return cron_scheduler.run_job(job, execution_id=execution_id, **kwargs)
+        finally:
+            session_cron._execution.reset(token)
+
+    monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", run_owned)
     result = (
         cron_scheduler.run_one_job(job, cancel_event=cancel_event) if dispatch
-        else cron_scheduler.run_job(job, execution_id=execution_id, cancel_event=cancel_event)
+        else run_owned(job, execution_id=execution_id, cancel_event=cancel_event)
     )
-    return instances, result
+    return [db], result
 
 
 @pytest.fixture(autouse=True)
@@ -239,6 +246,23 @@ def test_known_failure_cannot_fail_open_on_lifecycle_probe(monkeypatch, tmp_path
     instances, result = _run_booked_job(monkeypatch, tmp_path, agent_class=FailedAgent)
 
     assert result[0] is False
+    assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
+
+
+def test_error_after_success_verdict_books_failed_run(monkeypatch, tmp_path):
+    audit_errors = []
+
+    def fail_first_audit(self, result, error):
+        audit_errors.append(error)
+        if error is None:
+            raise OSError("audit callback unavailable")
+
+    monkeypatch.setattr(cron_scheduler._FireAudit, "write", fail_first_audit)
+    instances, result = _run_booked_job(monkeypatch, tmp_path)
+
+    assert result[0] is False
+    assert result[3] == "OSError: audit callback unavailable"
+    assert audit_errors == [None, result[3]]
     assert [reason for _sid, reason in instances[0].ended] == ["cron_failed"]
 
 

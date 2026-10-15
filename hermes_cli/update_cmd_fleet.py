@@ -692,7 +692,7 @@ def _run_pending_fleet_restart() -> bool:
 
 def _systemctl(cmd: list, *, timeout: float):
     """Run a systemctl (or sudo systemctl) invocation, capturing utf-8 text with a timeout."""
-    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
 
 
 def _systemctl_reset_and_restart(manage_cmd: list, svc_name: str, *, scope_cmd: list | None = None):
@@ -927,7 +927,7 @@ def _restart_macos_launchd_gateways(
     # system owner, including when a named profile invokes this fleet update.
     system_owner = system_launchd_gateway_owner()
     if require_supervision:
-        listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
@@ -1174,10 +1174,10 @@ def _sudo_noninteractive_ok(targeted_probe: list) -> bool:
     are about to elevate.
     """
     try:
-        if subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5).returncode == 0:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5, check=False).returncode == 0:
             return True
         # Blanket sudo refused — a targeted NOPASSWD sudoers entry may still work.
-        return subprocess.run(["sudo", "-n", *targeted_probe], capture_output=True, timeout=5).returncode == 0
+        return subprocess.run(["sudo", "-n", *targeted_probe], capture_output=True, timeout=5, check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -1214,7 +1214,7 @@ def _repair_unit_without_fatal_exit_park(svc_name: str, scope: str) -> None:
     system = scope == "system"
     unit_path = (_SYSTEM_UNIT_DIR if system else user_systemd_unit_dir()) / f"{svc_name}.service"
     try:
-        parked = re.search(rf"^RestartPreventExitStatus=.*\b{GATEWAY_FATAL_CONFIG_EXIT_CODE}\b", unit_path.read_text(encoding="utf-8-sig"), re.M)
+        parked = re.search(rf"^RestartPreventExitStatus=.*\b{GATEWAY_FATAL_CONFIG_EXIT_CODE}\b", unit_path.read_text(encoding="utf-8-sig"), re.MULTILINE)
     except OSError:
         return
     if parked:
@@ -1456,7 +1456,7 @@ class _GatewayRestartOutcome:
 
     incomplete: bool
     phase_errors: list
-    pre_restart_gateway_pids: "list | None"
+    pre_restart_gateway_pids: list | None
     restarted_services: list
     failed_or_stale_units: list
     relaunched_profiles: list
@@ -1716,7 +1716,7 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
     try:
         # Every gateway helper the phase needs is imported up front so a broken gateway
         # module aborts into recovery BEFORE any unit is touched.
-        from hermes_cli.gateway import (  # noqa: F401
+        from hermes_cli.gateway import (
             is_macos,
             find_gateway_pids,
             find_profile_gateway_processes,

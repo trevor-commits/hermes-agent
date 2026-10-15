@@ -4,18 +4,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 import { afterEach, test, vi } from 'vitest'
 
-import {
-  gitFor,
-  repoStatus,
-  resolveRenamePath,
-  REVIEW_FILE_CAP,
-  reviewCreatePr,
-  reviewList,
-  SIMPLE_GIT_UNSAFE_BINARY_WARN
-} from './git-review-ops'
+import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewCreatePr, reviewList } from './git-review-ops'
 import type * as NoConsoleGit from './no-console-git'
 
 // `runGh` shells to the `gh` CLI via execFile. Mock it so reviewCreatePr's gh
@@ -97,11 +89,42 @@ test('gitFor accepts a Windows no-console host tuple with restricted characters'
   }
 })
 
-test('gitFor suppresses only the known custom-binary warning and restores console.warn', () => {
+test('the no-console host preserves its Git path while stripping ambient editor commands', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-git-host-env-'))
+
+  tempDirs.push(dir)
+  const scriptPath = path.join(dir, 'host.cjs')
+  fs.writeFileSync(
+    scriptPath,
+    'process.stdout.write(JSON.stringify({ git: process.env.HERMES_GIT_ARGV0, editor: process.env.VISUAL }))'
+  )
+  const previous = process.env.VISUAL
+  process.env.VISUAL = 'untrusted-editor-command'
+  vi.resetModules()
+  vi.doMock('./no-console-git', async importOriginal => ({
+    ...(await importOriginal<typeof NoConsoleGit>()),
+    windowsGitHost: () => ({ isWindows: true, pythonBin: process.execPath, scriptPath })
+  }))
+
+  try {
+    const { gitFor: gitForHost } = await import('./git-review-ops')
+    const result = JSON.parse(await gitForHost(dir, 'git').raw(['status']))
+
+    assert.deepEqual(result, { git: JSON.stringify('git') })
+  } finally {
+    if (previous === undefined) {delete process.env.VISUAL}
+    else {process.env.VISUAL = previous}
+
+    vi.doUnmock('./no-console-git')
+    vi.resetModules()
+  }
+})
+
+test('internally resolved custom binaries do not warn or replace console.warn', () => {
   const spacedBin = String.raw`C:\Program Files\Git\cmd\git.exe`
   // `windowsGitHost()` resolves nothing in this process (no configured roots, no
   // HERMES_DESKTOP_PYTHON), so `gitBin` itself is what simple-git validates — the
-  // spaced `Program Files` path, which warns once per factory call.
+  // spaced `Program Files` path.
   const warnings: unknown[][] = []
   const originalWarn = console.warn
 
@@ -118,16 +141,24 @@ test('gitFor suppresses only the known custom-binary warning and restores consol
 
     assert.equal(console.warn, recordingWarn)
 
-    // The escape hatch used directly still warns: the message gitFor filters is a
-    // live emission of the installed simple-git, so the filter cannot go stale
-    // silently (an upgrade that rewords it fails this test, not production).
+    // Version 4 handles accepted custom paths without a global warning filter.
     simpleGit({ baseDir: process.cwd(), binary: spacedBin, unsafe: { allowUnsafeCustomBinary: true } })
     console.warn('unrelated warning')
   } finally {
     console.warn = originalWarn
   }
 
-  assert.deepEqual(warnings, [[SIMPLE_GIT_UNSAFE_BINARY_WARN], ['unrelated warning']])
+  assert.deepEqual(warnings, [['unrelated warning']])
+})
+
+test('gitFor rejects executable Git configuration and abbreviated executable options', async () => {
+  for (const args of [
+    ['-c', 'trailer.probe.command=echo unsafe', 'status'],
+    ['-c', 'include.path=/tmp/hermes-untrusted-config', 'status'],
+    ['push', '--receive-p=echo unsafe', 'origin', 'HEAD']
+  ]) {
+    await assert.rejects(gitFor(process.cwd(), 'git').raw(args), /unsafe|not allowed|not permitted|blocked/i)
+  }
 })
 
 test('resolveRenamePath: simple rename resolves to the new path', () => {

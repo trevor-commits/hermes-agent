@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { stubThreadEnvironment } from '@/components/assistant-ui/test-utils'
 import { type TranscriptWindowValue, useTranscriptWindow } from '@/components/assistant-ui/thread/transcript-window'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { $activeGatewayProfile } from '@/store/profile'
+import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 import { $transcriptTailBySessionId } from '@/store/transcript-tail'
 
 import { PRIMARY_SESSION_VIEW, SessionViewProvider } from './session-view'
@@ -81,6 +83,32 @@ function mount(storedId = 'stored') {
 }
 
 describe('bounded direct history runtime', () => {
+  it.each(['local', 'remote'])(
+    'uses the restored session owner on %s when the active profile differs',
+    async connectionId => {
+      const api = vi.spyOn(window.hermesDesktop, 'api').mockResolvedValue(page(40))
+      $connection.set({ connectionId, mode: connectionId === 'local' ? 'local' : 'remote' } as never)
+      $activeGatewayProfile.set('default')
+      const storedId = `restored-${connectionId}`
+      setSessionOwnerHint(storedId, { connectionId, profile: 'research', targetProfile: 'backend-research' })
+      const mounted = mount(storedId)
+      try {
+        await act(async () => {
+          await mounted.window.revealRow(40, new AbortController().signal)
+        })
+
+        expect(api).toHaveBeenCalledTimes(1)
+        const request = api.mock.calls[0][0]
+        expect(new URL(request.path, 'http://test').searchParams.get('profile')).toBe('backend-research')
+        expect(request).toMatchObject({ connectionId, profile: 'backend-research' })
+      } finally {
+        mounted.unmount()
+        $connection.set(null)
+        _resetSessionOwnerHintsForTests()
+      }
+    }
+  )
+
   it('reads one around page and selects it without replacing the live store', async () => {
     const api = vi.spyOn(window.hermesDesktop, 'api').mockResolvedValue(page(40))
     const mounted = mount()
