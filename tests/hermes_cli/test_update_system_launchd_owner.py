@@ -131,7 +131,7 @@ def test_update_drains_system_owner_without_reviving_retired_gui(monkeypatch, sy
     assert outcomes[0]["outcome"] == expected_outcome
 
 
-@pytest.mark.parametrize("fault", ["unloaded", "foreign_pid", "foreign_home", "unknown_start", "changed_start", "gui_owner", "unreadable"])
+@pytest.mark.parametrize("fault", ["unloaded", "foreign_pid", "foreign_home", "unknown_start", "changed_start", "gui_owner", "unreadable", "missing_uid"])
 def test_uncertain_system_owner_prevents_gui_fallback(monkeypatch, system_owner, fault):
     _home, plist, retired, state, actions = system_owner
     if fault == "unloaded":
@@ -149,6 +149,8 @@ def test_uncertain_system_owner_prevents_gui_fallback(monkeypatch, system_owner,
         state["gui"] = True
     if fault == "unreadable":
         plist.write_text("not a plist")
+    if fault == "missing_uid":
+        monkeypatch.setattr(launchd, "os", SimpleNamespace())
     old_gui_bytes = retired.read_bytes()
 
     with pytest.raises(RuntimeError, match="[Oo]wner|[Oo]wnership"):

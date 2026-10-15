@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
@@ -2822,7 +2822,7 @@ def _seed_from_singletons(provider: str, entries: list[PooledCredential]) -> tup
     return seed.result
 
 
-def get_env_credential(key: str, *, provider: Optional[str] = None) -> Tuple[str, str]:
+def get_env_credential(key: str, *, provider: Optional[str] = None) -> tuple[str, str]:
     """Resolve a model secret and its shared endpoint without merging environments.
 
     Keeper patch e038df38 (shared profile model access), adapted to the

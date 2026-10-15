@@ -67,7 +67,7 @@ def test_explicit_test_roots_are_validated_before_any_test_runs(tmp_path, kind):
     result = subprocess.run(
         [sys.executable, str(root / "scripts/run_tests_parallel.py"),
          *map(str, paths), "-j", "1", "--file-timeout", "30"],
-        cwd=root, capture_output=True, text=True, timeout=60,
+        cwd=root, capture_output=True, text=True, timeout=60, check=False,
     )
     if "missing" in kind:
         assert result.returncode != 0, result.stdout
@@ -95,7 +95,7 @@ def test_missing_explicit_lists_refuse_before_running_a_valid_file(tmp_path, opt
     result = subprocess.run(
         [sys.executable, str(root / "scripts/run_tests_parallel.py"), option, value,
          "-j", "1", "--file-timeout", "30"],
-        cwd=root, capture_output=True, text=True, timeout=60,
+        cwd=root, capture_output=True, text=True, timeout=60, check=False,
     )
     assert result.returncode != 0
     assert "does not exist" in result.stderr

@@ -502,7 +502,7 @@ class TestPackageToolDiscovery:
         """)
         result = subprocess.run(
             [sys.executable, "-c", code, str(tools_dir)],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
 

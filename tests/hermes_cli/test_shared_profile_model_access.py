@@ -100,7 +100,7 @@ def test_shared_pool_endpoint_stays_paired_with_key(shared_profile):
 
 
 def test_profile_scopes_and_non_model_secrets_remain_isolated(shared_profile):
-    root, profile = shared_profile
+    root, _profile = shared_profile
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     second = root / "profiles" / "second"
     second.mkdir()
@@ -135,7 +135,7 @@ def test_profile_catalog_discovers_root_manual_provider(shared_profile, monkeypa
     monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: {"deepseek": {"env": ["DEEPSEEK_API_KEY"], "models": {}}})
     monkeypatch.setattr(providers, "HERMES_OVERLAYS", {})
     monkeypatch.setattr(models, "_PROVIDER_MODELS", {"deepseek": ["fixture-chat"], "ollama-cloud": []})
-    monkeypatch.setattr(models, "get_curated_nous_model_ids", lambda: [])
+    monkeypatch.setattr(models, "get_curated_nous_model_ids", list)
     monkeypatch.setattr(models, "cached_provider_model_ids", lambda *a, **kw: ["fixture-chat"])
     for name in ("_apply_pricing", "_apply_capabilities", "_apply_featured"):
         monkeypatch.setattr(inventory, name, lambda *a, **kw: None)
@@ -180,13 +180,13 @@ def test_shared_reference_readd_and_suppression(shared_profile):
 @pytest.mark.parametrize("status", ["exhausted", "dead"])
 def test_hydration_keeps_same_key_quarantined(shared_profile, status):
     from agent.credential_persistence import fingerprint_secret_value
-    from datetime import datetime, timezone, timedelta
+    from datetime import UTC, datetime, timedelta
     root, _ = shared_profile
     store = json.loads((root / "auth.json").read_text())
     store["credential_pool"]["deepseek"][0].update(
         last_status=status, secret_fingerprint=fingerprint_secret_value("fixture-alpha"),
-        last_status_at=datetime.now(timezone.utc).timestamp(),
-        last_error_reset_at=(datetime.now(timezone.utc) + timedelta(days=1)).timestamp(),
+        last_status_at=datetime.now(UTC).timestamp(),
+        last_error_reset_at=(datetime.now(UTC) + timedelta(days=1)).timestamp(),
     )
     (root / "auth.json").write_text(json.dumps(store))
     for _ in range(2):

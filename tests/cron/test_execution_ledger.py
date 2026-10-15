@@ -7,7 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -182,7 +182,7 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
 
 def test_scheduled_retention_preserves_daily_proof_and_profile_duplicate_safety(monkeypatch, tmp_path):
     from cron.occurrences import completed_occurrence
-    import cron.executions as executions
+    from cron import executions
 
     homes = [tmp_path / "a", tmp_path / "b"]
     active = {"home": homes[0]}
@@ -190,7 +190,7 @@ def test_scheduled_retention_preserves_daily_proof_and_profile_duplicate_safety(
     monkeypatch.setattr(executions, "get_hermes_home", lambda: active["home"])
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 12)
     monkeypatch.setattr(executions, "MAX_SCHEDULED_EXECUTIONS_PER_JOB", 20, raising=False)
-    clock = {"now": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+    clock = {"now": datetime(2026, 1, 1, tzinfo=UTC)}
     monkeypatch.setattr(executions, "_hermes_now", lambda: clock["now"])
     daily = []
     for day in range(24):

@@ -90,7 +90,10 @@ def system_launchd_gateway_owner() -> tuple[Path, int, int] | None:
         started = get_process_start_time(pid)
         if started is None:
             raise ValueError("process start identity is unavailable")
-        for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        if uid is None:
+            raise ValueError("POSIX user identity is unavailable")
+        for domain in (f"gui/{uid}", f"user/{uid}"):
             gui_loaded, _ = _gw()._launchd_print_service_pid(domain, "ai.hermes.gateway")
             if gui_loaded:
                 raise ValueError("both system and user gateway owners are loaded")
