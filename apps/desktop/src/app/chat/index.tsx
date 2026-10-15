@@ -264,7 +264,7 @@ export function ChatRuntimeBoundary({
 
   // Restored chats can belong to a different profile than the active rail.
   const owner = knownOwnerForSession(storedId)
-  const ownerRoute = owner && typeof owner !== 'string' ? owner : undefined
+  const ownerRoute = typeof owner === 'object' ? owner : undefined
 
   const ownerConnection = ownerRoute?.connectionId
   const ownerProfile = typeof owner === 'string' ? owner : ownerRoute?.targetProfile || ownerRoute?.profile

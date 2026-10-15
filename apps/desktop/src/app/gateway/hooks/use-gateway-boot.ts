@@ -72,11 +72,7 @@ import {
 } from '@/store/gateway-switch'
 import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
 import { notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
-import {
-  $activeGatewayProfile,
-  normalizeProfileKey,
-  refreshActiveProfile
-} from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey, refreshActiveProfile } from '@/store/profile'
 import { requestBackendRestart } from '@/store/recovery-requests'
 import {
   $activeSessionId,
@@ -1482,6 +1478,72 @@ export function useGatewayBoot({
       // later initialization errors must not be reclassified as boot dials.
       let stage: 'resolving' | 'minting' | 'dialing' | 'connected' = 'resolving'
 
+      // Keep recovery bound to this attempt's startup promise and ownership guards.
+      async function handleBootFailure(err: unknown) {
+        if (ownsBoot()) {
+          const message = err instanceof Error ? err.message : String(err)
+          const startupTimedOut = stage === 'resolving' && isTimeoutError(err)
+
+          // Main's classification (#82679) still decides every failure it can
+          // see. The one it cannot see is the renderer-owned WebSocket dial:
+          // after a renderer reload main serves its cached descriptor with a
+          // stale `backend.ready / retryable:false` snapshot, so a remote dial
+          // that never became usable is retryable on its own. Anything after a
+          // successful dial keeps the terminal recovery surface.
+          const canRetry = bootRetryAttempt < BOOT_RETRY_MAX_ATTEMPTS
+          const retryable = !startupTimedOut && canRetry && (stage === 'dialing' || (await bootFailureIsRetryable()))
+
+          if (!ownsBoot()) {
+            return
+          }
+
+          if (retryable && !cancelled) {
+            const delay = reconnectBackoffDelayMs(bootRetryAttempt, { baseDelayMs: BOOT_RETRY_BASE_DELAY_MS })
+            bootRetryAttempt += 1
+            bootFailed = false
+            resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))
+            clearBootRetryTimer()
+            bootRetryTimer = setTimeout(() => {
+              bootRetryTimer = null
+
+              if (ownsBoot()) {
+                void boot()
+              }
+            }, delay)
+
+            return
+          }
+
+          bootFailed = true
+          failDesktopBoot(message)
+          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+          setSessionsLoading(false)
+
+          if (startupTimedOut) {
+            // The renderer's watchdog concluded its wait, not main's owned
+            // startup. Only THIS promise's ready descriptor can recover it;
+            // replayed boot progress still cannot clear a failure (#112899).
+            // Keep the finite error UI while pending, without spawning again.
+            void startup.then(
+              connection => {
+                if (!ownsPendingStartup() || !connection || !isGatewayWebSocketUrl(connection.wsUrl)) {
+                  return
+                }
+
+                bootFailed = false
+                resumeDesktopBootForRetry(translateNow('boot.steps.connectingGateway'))
+                void boot(connection)
+              },
+              error => {
+                if (ownsPendingStartup()) {
+                  failDesktopBoot(error instanceof Error ? error.message : String(error))
+                }
+              }
+            )
+          }
+        }
+      }
+
       try {
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
@@ -1644,68 +1706,7 @@ export function useGatewayBoot({
         // launch is the common path, so it must warn too, not only softSwitch.
         void warnIfTerminalBackendUnavailable()
       } catch (err) {
-        if (ownsBoot()) {
-          const message = err instanceof Error ? err.message : String(err)
-          const startupTimedOut = stage === 'resolving' && isTimeoutError(err)
-
-          // Main's classification (#82679) still decides every failure it can
-          // see. The one it cannot see is the renderer-owned WebSocket dial:
-          // after a renderer reload main serves its cached descriptor with a
-          // stale `backend.ready / retryable:false` snapshot, so a remote dial
-          // that never became usable is retryable on its own. Anything after a
-          // successful dial keeps the terminal recovery surface.
-          const canRetry = bootRetryAttempt < BOOT_RETRY_MAX_ATTEMPTS
-          const retryable = !startupTimedOut && canRetry && (stage === 'dialing' || (await bootFailureIsRetryable()))
-
-          if (!ownsBoot()) {
-            return
-          }
-
-          if (retryable && !cancelled) {
-            const delay = reconnectBackoffDelayMs(bootRetryAttempt, { baseDelayMs: BOOT_RETRY_BASE_DELAY_MS })
-            bootRetryAttempt += 1
-            bootFailed = false
-            resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))
-            clearBootRetryTimer()
-            bootRetryTimer = setTimeout(() => {
-              bootRetryTimer = null
-
-              if (ownsBoot()) {
-                void boot()
-              }
-            }, delay)
-
-            return
-          }
-
-          bootFailed = true
-          failDesktopBoot(message)
-          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
-          setSessionsLoading(false)
-
-          if (startupTimedOut) {
-            // The renderer's watchdog concluded its wait, not main's owned
-            // startup. Only THIS promise's ready descriptor can recover it;
-            // replayed boot progress still cannot clear a failure (#112899).
-            // Keep the finite error UI while pending, without spawning again.
-            void startup.then(
-              connection => {
-                if (!ownsPendingStartup() || !connection || !isGatewayWebSocketUrl(connection.wsUrl)) {
-                  return
-                }
-
-                bootFailed = false
-                resumeDesktopBootForRetry(translateNow('boot.steps.connectingGateway'))
-                void boot(connection)
-              },
-              error => {
-                if (ownsPendingStartup()) {
-                  failDesktopBoot(error instanceof Error ? error.message : String(error))
-                }
-              }
-            )
-          }
-        }
+        await handleBootFailure(err)
       }
     }
 
