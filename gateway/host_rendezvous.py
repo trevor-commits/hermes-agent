@@ -57,6 +57,7 @@ HOST_PROTOCOL_VERSION = 1
 #: RECORDED port and only attaches when the answer is the recorded owner — a record alone proves
 #: nothing about who holds that port right now.
 HOST_IDENTITY_PATH = "/api/host/identity"
+HOST_TOKEN_HEADER = "X-Hermes-Token"
 
 #: Bounded: a closed port, a black-holed one or a foreign listener must cost a second, not a hang.
 PROBE_TIMEOUT_S = 2.0
@@ -307,7 +308,7 @@ def probe_owner(record: HostRecord, *, timeout: float = PROBE_TIMEOUT_S) -> Opti
     import urllib.request
 
     token = read_token(record.role)
-    headers = {"X-Hermes-Token": token, "Authorization": f"Bearer {token}"} if token else {}
+    headers = {HOST_TOKEN_HEADER: token, "Authorization": f"Bearer {token}"} if token else {}
     request = urllib.request.Request(
         f"http://{host}:{record.port}{HOST_IDENTITY_PATH}", headers=headers)
     try:

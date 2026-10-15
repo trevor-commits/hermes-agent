@@ -339,7 +339,9 @@ def _require_token(request: Request) -> None:
     principal the outer seams already accepted; local Desktop runs with no
     static token, so that principal must satisfy route-local policy too.
     """
-    if getattr(request.state, "native_http_principal", None):
+    from hermes_cli.dashboard_auth.native_http import host_identity_authenticated
+
+    if host_identity_authenticated(request) or getattr(request.state, "native_http_principal", None):
         return
     if getattr(request.app.state, "auth_required", False):
         ok = getattr(request.state, "session", None) is not None
@@ -478,9 +480,13 @@ async def _token_auth_seam(request: Request, call_next):
     + ``token_authenticated`` so downstream gates skip enforcement. Non-token
     routes pass through untouched.
     """
-    from hermes_cli.dashboard_auth.native_http import authenticate_native_http, native_profile_scope
+    from hermes_cli.dashboard_auth.native_http import (
+        authenticate_host_identity, authenticate_native_http, native_profile_scope)
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     rejection = await authenticate_native_http(request)
+    if rejection is not None:
+        return rejection
+    rejection = authenticate_host_identity(request, _SESSION_TOKEN)
     if rejection is not None:
         return rejection
     with native_profile_scope(request):
@@ -1438,6 +1444,8 @@ def start_server(
         # startup split from main_loop so the bound (ephemeral) port is readable.
         if not config.loaded:
             config.load()
+            from hermes_cli.dashboard_auth.native_http import CaptureNativeSocketPeer
+            config.loaded_app = CaptureNativeSocketPeer(config.loaded_app)
         server.lifespan = config.lifespan_class(config)
         with server.capture_signals():
             await server.startup()

@@ -7,12 +7,58 @@ issuer. A browser Origin (including an empty one) always disqualifies this path.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hmac
 from pathlib import Path
 
 from fastapi import HTTPException
 from starlette.responses import JSONResponse
 
 HEADER = 'x-hermes-gateway-ticket'
+
+
+class CaptureNativeSocketPeer:
+    """Wrap Uvicorn's loaded app, outside its proxy-header middleware."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] == 'http':
+            scope['hermes.gateway_socket_peer'] = scope.get('client')
+        await self.app(scope, receive, send)
+
+
+def host_identity_authenticated(request):
+    """A host-record credential attests this endpoint, never other owner APIs."""
+    from gateway.host_rendezvous import HOST_IDENTITY_PATH
+
+    return (request.method == 'GET' and request.url.path == HOST_IDENTITY_PATH
+            and getattr(request.state, 'host_identity_principal', False))
+
+
+def authenticate_host_identity(request, session_token):
+    """Admit the private host-record token only for local, non-browser identity reads.
+
+    Standalone dashboards have no gateway ticket issuer. Their owner publishes
+    this token with mode 0600 precisely so another same-user launcher can attach
+    even when browser access requires an authenticated session.
+    """
+    from gateway.host_rendezvous import HOST_IDENTITY_PATH, HOST_TOKEN_HEADER
+
+    if request.method != 'GET' or request.url.path != HOST_IDENTITY_PATH:
+        return None
+    tokens = request.headers.getlist(HOST_TOKEN_HEADER)
+    if not tokens:
+        return None  # Ordinary session authentication still owns this request.
+    peer = request.scope.get('hermes.gateway_socket_peer')
+    if (len(tokens) != 1 or 'origin' in request.headers
+            or not isinstance(peer, (tuple, list)) or len(peer) != 2
+            or peer[0] not in {'127.0.0.1', '::1'} or not session_token
+            or not hmac.compare_digest(tokens[0].encode(), session_token.encode())):
+        return JSONResponse({'detail': 'Unauthorized'}, status_code=401)
+    request.state.host_identity_principal = True
+    request.state.token_authenticated = True
+    return None
 
 
 @contextmanager
