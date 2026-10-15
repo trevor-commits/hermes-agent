@@ -12,13 +12,16 @@ def test_shared_approval_outlives_viewer_and_bypasses_fifo(tmp_path):
     home.mkdir()
     state.mkdir()
     env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
-    env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo))
+    env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo),
+               HERMES_DISABLE_LAZY_INSTALLS='1')
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'authority_controls_peer.py')],
                             cwd=repo, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=100, check=False)
     assert result.returncode == 0, result.stdout + '\n' + result.stderr
     receipt = json.loads((state / 'receipt.json').read_text())
     print(json.dumps(receipt))
     assert receipt['real_terminal_effect'] and receipt['fifo_bypassed'] and receipt['detach_kept_pending']
+    assert not (state / 'tools' / 'facts.json').exists(), 'control fixture installed native tools'
+    assert not list(state.glob('installs/*/pm-runtime/selected.json')), 'control fixture installed a PM runtime'
 
 
 def test_control_identity_rejects_foreign_and_retired_workers(tmp_path, monkeypatch):
