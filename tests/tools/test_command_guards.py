@@ -1,6 +1,8 @@
 """Tests for check_all_command_guards() — the combined floor + dangerous-command guard."""
 
 import os
+import shlex
+import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -75,13 +77,24 @@ class TestCliPrompt:
         assert result["approved"] is True
         cb.assert_not_called()
 
-    def test_dangerous_command_deny(self):
+    def test_dangerous_command_deny(self, tmp_path):
         os.environ["HERMES_INTERACTIVE"] = "1"
         cb = MagicMock(return_value="deny")
-        result = check_all_command_guards("rm -rf /tmp", "local", approval_callback=cb)
+        # The prompt case must not target an ancestor of the test interpreter.
+        command = f"rm -rf {shlex.quote(str(tmp_path / 'disposable-data'))}"
+        result = check_all_command_guards(command, "local", approval_callback=cb)
         assert result["approved"] is False
         cb.assert_called_once()
+        assert cb.call_args.args[0] == command
         assert cb.call_args[1]["allow_permanent"] is True
+
+    def test_runtime_delete_is_blocked_before_the_prompt(self):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+        command = f"rm -f {shlex.quote(sys.executable)}"
+        result = check_all_command_guards(command, "local", approval_callback=cb)
+        assert result["approved"] is False and "Python interpreter" in result["message"]
+        cb.assert_not_called()
 
     def test_session_approval_skips_the_next_prompt(self):
         os.environ["HERMES_INTERACTIVE"] = "1"
