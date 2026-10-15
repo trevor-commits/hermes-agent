@@ -1,5 +1,9 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
+import pytest
+
 from tools import terminal_tool
 from tools import terminal_tool_sudo
 
@@ -91,6 +95,39 @@ def test_validate_workdir_still_blocks_metachars_in_unicode_paths():
     assert terminal_tool._validate_workdir("/tmp/テスト\nwhoami")
     assert terminal_tool._validate_workdir("/tmp/项目|cat /etc/passwd")
     assert terminal_tool._validate_workdir("/tmp/ü\x00ber")
+
+
+@pytest.mark.platforms("linux", "macos")
+@pytest.mark.parametrize("initial_workdir", [False, True])
+def test_terminal_dispatch_runs_in_apostrophe_workdir(tmp_path, monkeypatch, initial_workdir):
+    """Both shell bootstrap and per-command cd preserve an apostrophe as path data."""
+    from tools.environments.local import LocalEnvironment
+    from tools.registry import registry
+
+    workdir = tmp_path / "O'Reilly project"
+    workdir.mkdir()
+    cwd = str(workdir if initial_workdir else tmp_path)
+    task_id = "apostrophe-workdir"
+    env = LocalEnvironment(cwd=cwd, timeout=10, persistent=False)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": cwd, "timeout": 10, "lifetime_seconds": 3600,
+    })
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    try:
+        result = json.loads(registry.dispatch(
+            "terminal", {"command": "pwd -P", "workdir": str(workdir), "timeout": 10}, task_id=task_id))
+        assert result.get("error") is None, result
+        assert result["exit_code"] == 0, result
+        assert result["output"].strip() == str(workdir.resolve())
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize("suffix", ["; whoami", "$(whoami)", "`whoami`", "\nwhoami", "| whoami", "\x00"])
+def test_apostrophe_workdir_does_not_allow_shell_injection(suffix):
+    assert terminal_tool._validate_workdir("/tmp/O'Reilly" + suffix)
 
 
 def test_literal_sudo_executables_receive_password_stdin(monkeypatch):

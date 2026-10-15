@@ -3,11 +3,12 @@ import { act, render } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection, setApiRequestLocalMode } from '@/api/client'
 import { stubThreadEnvironment } from '@/components/assistant-ui/test-utils'
 import { type TranscriptWindowValue, useTranscriptWindow } from '@/components/assistant-ui/thread/transcript-window'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import { $connection, _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
 import { $transcriptTailBySessionId } from '@/store/transcript-tail'
 
 import { PRIMARY_SESSION_VIEW, SessionViewProvider } from './session-view'
@@ -92,6 +93,7 @@ describe('bounded direct history runtime', () => {
       const storedId = `restored-${connectionId}`
       setSessionOwnerHint(storedId, { connectionId, profile: 'research', targetProfile: 'backend-research' })
       const mounted = mount(storedId)
+
       try {
         await act(async () => {
           await mounted.window.revealRow(40, new AbortController().signal)
@@ -108,6 +110,34 @@ describe('bounded direct history runtime', () => {
       }
     }
   )
+
+  it('uses an untagged historical row profile on its ambient remote connection', async () => {
+    const api = vi.spyOn(window.hermesDesktop, 'api').mockResolvedValue(page(40))
+    const storedId = 'restored-legacy-row-profile'
+    $connection.set({ mode: 'remote' } as never)
+    $activeGatewayProfile.set('default')
+    setApiRequestConnection(null)
+    setApiRequestLocalMode(false)
+    setSessions([{ id: storedId, profile: 'research' }] as never)
+    const mounted = mount(storedId)
+
+    try {
+      await act(async () => {
+        await mounted.window.revealRow(40, new AbortController().signal)
+      })
+
+      expect(api).toHaveBeenCalledTimes(1)
+      const request = api.mock.calls[0][0]
+      expect(new URL(request.path, 'http://test').searchParams.get('profile')).toBe('research')
+      expect(request.profile).toBe('research')
+      expect(request.connectionId).toBeUndefined()
+    } finally {
+      mounted.unmount()
+      setSessions([])
+      $connection.set(null)
+      _resetSessionOwnerHintsForTests()
+    }
+  })
 
   it('reads one around page and selects it without replacing the live store', async () => {
     const api = vi.spyOn(window.hermesDesktop, 'api').mockResolvedValue(page(40))

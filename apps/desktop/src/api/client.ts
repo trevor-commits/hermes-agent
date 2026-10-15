@@ -757,7 +757,7 @@ export function setSessionOwnerResolver(resolver: SessionOwnerResolver | null): 
 }
 
 /** The owner scope a session-scoped READ must carry for `id`, or {} when
- *  the caller already pinned a connection or no exact owner is known.
+ *  the caller already pinned a connection or no owner scope is known.
  *  Pins 'local' too (the only way back to this device when the primary is a
  *  remote registry source). When the caller named no profile, the owner's
  *  backend-facing profile rides along: the
@@ -769,8 +769,13 @@ export function sessionReadOwnerPin(id: string, profile?: ProfileScope): { conne
 
   const owner = _sessionOwnerResolver?.(id)
 
-  if (!owner || typeof owner === 'string') {
+  if (!owner) {
     return {}
+  }
+
+  if (typeof owner === 'string') {
+    // Legacy rows name a profile on the ambient backend, not a local connection.
+    return profile == null && owner.trim() ? { profile: owner.trim() } : {}
   }
 
   const connectionId = String(owner.connectionId ?? '').trim()
@@ -782,7 +787,7 @@ export function sessionReadOwnerPin(id: string, profile?: ProfileScope): { conne
   const ownerProfile = String(owner.targetProfile || owner.profile || '').trim()
 
   return {
-    ...(connectionId !== (ambientOwnerConnectionId() ?? 'local') ? { connectionId } : {}),
+    ...(connectionId !== ambientOwnerConnectionId() ? { connectionId } : {}),
     // A multiplexed connection still owns separate profile databases.
     ...(profile == null && ownerProfile ? { profile: ownerProfile } : {})
   }

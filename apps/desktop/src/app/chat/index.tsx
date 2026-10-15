@@ -267,10 +267,15 @@ export function ChatRuntimeBoundary({
   const ownerRoute = owner && typeof owner !== 'string' ? owner : undefined
 
   const ownerConnection = ownerRoute?.connectionId
-  const ownerProfile = ownerRoute?.targetProfile || ownerRoute?.profile
+  const ownerProfile = typeof owner === 'string' ? owner : ownerRoute?.targetProfile || ownerRoute?.profile
 
   const tailProfile = useMemo(
-    () => (ownerProfile ? { connectionId: ownerConnection, profile: ownerProfile } : undefined),
+    () =>
+      ownerProfile
+        ? ownerConnection
+          ? { connectionId: ownerConnection, profile: ownerProfile }
+          : ownerProfile
+        : undefined,
     [ownerConnection, ownerProfile]
   )
 
