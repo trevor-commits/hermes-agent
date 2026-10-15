@@ -40,6 +40,7 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
         conn.close()
 
 
+@pytest.mark.platforms("not macos")
 def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
@@ -48,6 +49,23 @@ def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("configured,expected", [(None, 2), ("OFF", 2), ("NORMAL", 2), ("FULL", 2), ("EXTRA", 3)])
+def test_guest_barriers_keep_the_macos_durability_floor(monkeypatch, tmp_path, configured, expected):
+    _config(monkeypatch, {} if configured is None else {"synchronous": configured})
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA synchronous=1")
+        conn.execute("PRAGMA checkpoint_fullfsync=0")
+        assert apply_durability_barriers(conn)
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == expected
+        assert conn.execute("PRAGMA checkpoint_fullfsync").fetchone()[0] == 1
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
     finally:
         conn.close()
 

@@ -11,12 +11,12 @@ import sqlite3
 import pytest
 
 import hermes_state_wal
-from hermes_state_wal import WalUnsupportedError, _detect_cross_vm_fs, apply_wal_with_fallback
+from hermes_state_wal import WalUnsupportedError, _detect_cross_vm_fs, _mountinfo_fstype, apply_wal_with_fallback
 
 
 def _mountinfo(tmp_path, lines):
     p = tmp_path / "mountinfo"
-    p.write_text("\n".join(lines) + "\n")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(p)
 
 
@@ -30,6 +30,19 @@ SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share r
 
 class TestDetectCrossVmFs:
     @pytest.mark.parametrize("path,expected", [
+        ("/data/agent", "fuse.virtiofs"),
+        ("/mnt/host/db", "9p"),
+        ("/mnt/my share/db", "virtiofs"),
+        ("/home/user/.hermes", "ext4"),
+        ("/data/native/db", "ext4"),
+        ("/datastore", "ext4"),
+    ])
+    def test_mountinfo_parser_reads_supplied_mounts_on_every_host(self, tmp_path, path, expected):
+        mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, NESTED_EXT4, SPACE_VIRTIOFS])
+        assert _mountinfo_fstype(path, mountinfo_path=mi) == expected
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("path,expected", [
         ("/data/agent", True),          # fuse.virtiofs bind mount
         ("/mnt/host/db", True),         # 9p bind mount
         ("/mnt/my share/db", True),     # octal-escaped mount point
@@ -41,6 +54,7 @@ class TestDetectCrossVmFs:
         mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, NESTED_EXT4, SPACE_VIRTIOFS])
         assert _detect_cross_vm_fs(path, mountinfo_path=mi) is expected
 
+    @pytest.mark.platforms("linux")
     @pytest.mark.parametrize("fstype", [
         "ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay", "nfs", "nfs4", "cifs", "fuse.sshfs", "apfs", "f2fs",
     ])
@@ -50,7 +64,16 @@ class TestDetectCrossVmFs:
         assert _detect_cross_vm_fs("/home/user/.hermes", mountinfo_path=mi) is False
 
     def test_missing_mountinfo_conservative_false(self, tmp_path):
-        assert _detect_cross_vm_fs("/data", mountinfo_path=str(tmp_path / "nope")) is False
+        missing = str(tmp_path / "nope")
+        assert _mountinfo_fstype("/data", mountinfo_path=missing) == ""
+        assert _detect_cross_vm_fs("/data", mountinfo_path=missing) is False
+
+    @pytest.mark.platforms("not linux")
+    def test_non_linux_detector_never_reads_a_linux_mount_table(self, tmp_path, monkeypatch):
+        mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS])
+        monkeypatch.setattr(hermes_state_wal, "_mountinfo_fstype",
+                            lambda *a, **k: pytest.fail("non-Linux detection read mountinfo"))
+        assert _detect_cross_vm_fs("/data/agent", mountinfo_path=mi) is False
 
 
 class TestWalRefusalOnCrossVmFs:
