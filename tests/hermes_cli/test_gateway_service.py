@@ -1710,6 +1710,25 @@ class TestPreflightUserSystemd:
 class TestProfileArg:
     """Tests for _profile_arg — returns '--profile <name>' for named profiles."""
 
+    @pytest.fixture(params=[False, True], ids=["external-python", "managed-python"])
+    def launchd_installation(self, request, tmp_path, monkeypatch):
+        """Launcher selection depends on PM facts, not only get_python_path()."""
+        project = tmp_path / 'source with "quotes" and \\ slash'
+        project.mkdir()
+        store = tmp_path / "runtime"
+        store.mkdir()
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project)
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+        if request.param:
+            python = store / "python-test" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.touch()
+            (store / "facts.json").write_text(
+                json.dumps({"packages": {"python": {"entry": "python-test"}}}),
+                encoding="utf-8",
+            )
+        return project, request.param
+
     def test_systemd_unit_for_target_user_includes_named_profile(self, tmp_path, monkeypatch):
         """sudo system install must keep the target user's named profile in ExecStart."""
         root_home = tmp_path / "root"
@@ -1735,7 +1754,9 @@ class TestProfileArg:
         assert command[-4:] == ["--profile", "mybot", "gateway", "run"]
         assert f'HERMES_HOME={target_home / ".hermes" / "profiles" / "mybot"}' in unit
 
-    def test_launchd_plist_wraps_gateway_stderr_with_timestamps(self, tmp_path, monkeypatch):
+    def test_launchd_plist_wraps_gateway_stderr_with_timestamps(
+        self, tmp_path, monkeypatch, launchd_installation
+    ):
         profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
         profile_dir.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -1749,19 +1770,29 @@ class TestProfileArg:
         # The job is launched through osascript so macOS Local Network Privacy attributes the
         # gateway's sockets to a platform binary (#71206); JXA system() waits without the
         # Standard Additions user-cancel polling loop. The real command is the exec'd child,
-        # whose python runs through the PM installation launcher (-I -c bootstrap ...).
+        # whose command persists the native launcher for a PM install, or uses the
+        # explicitly external interpreter through isolated bootstrap otherwise.
         exec_argv = _osascript_exec_argv(program_args)
         assert exec_argv[-4:] == [">>", str(profile_dir / "logs" / "gateway.log"),
                                   "2>>", str(profile_dir / "logs" / "gateway.error.log")]
         program_args = exec_argv[:-4]
-        assert program_args[0] == "/usr/bin/python3"
+        project, managed = launchd_installation
+        executable = str(project / ".hermes" / "bin" / "hermes") if managed else "/usr/bin/python3"
+        assert program_args[0] == executable
+        if managed:
+            assert program_args[:3] == [executable, "--run-module", "hermes_cli.stderr_timestamp"]
+        else:
+            assert program_args[:3] == [executable, "-I", "-c"]
         assert program_args[-5:] == ["--profile", "mybot", "gateway", "run", "--external-supervisor"]
         separator = program_args.index("--")
 
         assert program_args[separator - 2:separator] == ["--error-log", str(profile_dir / "logs" / "gateway.error.log")]
+        assert program_args[separator + 1] == executable
         assert "--replace" not in program_args
 
-    def test_launchd_osascript_wrapper_round_trips_shell_hostile_paths(self, tmp_path, monkeypatch):
+    def test_launchd_osascript_wrapper_round_trips_shell_hostile_paths(
+        self, tmp_path, monkeypatch, launchd_installation
+    ):
         """A home with spaces, quotes and a backslash survives shlex + JXA + plist quoting."""
         profile_dir = tmp_path / 'my "odd" dir \\ here' / ".hermes"
         profile_dir.mkdir(parents=True)
@@ -1773,8 +1804,13 @@ class TestProfileArg:
         program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
         argv = _osascript_exec_argv(program_args)
 
-        assert argv[0] == str(profile_dir / "bin dir" / "python")
+        project, managed = launchd_installation
+        executable = project / ".hermes" / "bin" / "hermes" if managed else profile_dir / "bin dir" / "python"
+        assert argv[0] == str(executable)
+        assert argv[argv.index("--") + 1] == str(executable)
         assert argv[-3:] == [str(profile_dir / "logs" / "gateway.log"), "2>>", str(profile_dir / "logs" / "gateway.error.log")]
+        assert "--external-supervisor" in argv
+        assert "--replace" not in argv
         # The wrapper's own ps line must never be taken for the gateway (stop/status would signal osascript).
         assert status.looks_like_gateway_command_line(" ".join(program_args)) is False
 
