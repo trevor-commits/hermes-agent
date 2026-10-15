@@ -487,9 +487,10 @@ class TestTranscribeLocalExtended:
         assert mock_whisper_cls.call_count == 1
 
     def test_config_device_and_compute_type_passed_to_whisper(self, tmp_path):
-        """User-configured device and compute_type should be forwarded to WhisperModel.
+        """User-configured device and compute_type reach the platform-aware model loader.
 
-        Regression test for #8319: these values were hardcoded to "auto".
+        Regression test for #8319: these values were hardcoded to "auto". The
+        loader's native crash guards are a separate contract from config forwarding.
         """
         audio = tmp_path / "test.ogg"
         audio.write_bytes(b"fake")
@@ -502,7 +503,7 @@ class TestTranscribeLocalExtended:
 
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment], mock_info)
-        mock_whisper_cls = MagicMock(return_value=mock_model)
+        mock_model_loader = MagicMock(return_value=mock_model)
 
         fake_config = {
             "local": {
@@ -512,7 +513,7 @@ class TestTranscribeLocalExtended:
         }
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
-             patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_local_whisper_model", mock_model_loader), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
              patch("tools.transcription_tools._load_stt_config", return_value=fake_config):
@@ -520,9 +521,25 @@ class TestTranscribeLocalExtended:
             result = _transcribe_local(str(audio), "base")
 
         assert result["success"] is True
-        mock_whisper_cls.assert_called_once_with(
-            "base", local_files_only=True, device="cpu", compute_type="float32"
+        mock_model_loader.assert_called_once_with(
+            "base", device="cpu", compute_type="float32"
         )
+
+    @pytest.mark.platforms("macos", arch="arm64")
+    def test_apple_silicon_model_loader_keeps_native_cpu_crash_guard(self, monkeypatch):
+        from tools import transcription_local
+
+        factory = MagicMock()
+        monkeypatch.setattr(transcription_local, "_create_whisper_model", factory)
+        monkeypatch.delenv("KMP_DUPLICATE_LIB_OK", raising=False)
+
+        model = transcription_local._load_local_whisper_model(
+            "base", device="auto", compute_type="float32"
+        )
+
+        assert model is factory.return_value
+        factory.assert_called_once_with("base", device="cpu", compute_type="int8")
+        assert os.environ["KMP_DUPLICATE_LIB_OK"] == "TRUE"
 
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):

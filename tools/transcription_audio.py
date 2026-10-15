@@ -28,12 +28,14 @@ logger = logging.getLogger("tools.transcription_tools")
 
 
 def _find_binary(binary_name: str) -> Optional[str]:
-    """Find a local binary, checking common Homebrew/local prefixes as well as PATH."""
+    """Respect the activated toolchain on PATH before common local fallbacks."""
+    if selected := shutil.which(binary_name):
+        return selected
     for directory in COMMON_LOCAL_BIN_DIRS:
         candidate = Path(directory) / binary_name
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
-    return shutil.which(binary_name)
+    return None
 
 
 _find_ffmpeg_binary = partial(_find_binary, "ffmpeg")
