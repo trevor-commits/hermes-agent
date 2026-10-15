@@ -119,14 +119,15 @@ def _fetch(git_cmd: list[str], root: Path, depth_args: list[str], remote: str, b
         **_uc()._no_prompt_git_kwargs())
 
 
-def fetch_compare_branch(git_cmd: list[str], root: Path, branch: str, depth_args: list[str]):
+def fetch_compare_branch(git_cmd: list[str], root: Path, branch: str, depth_args: list[str], *, prefer_upstream: bool = True):
     """Fetch only ``branch`` and return ``(fetch_result, compare_ref)``.
 
     A bare ``git fetch <remote>`` pulls every ref, and this repo has thousands of auto-generated
     branches. ``main`` prefers upstream as the canonical reference; other branches go straight
-    to origin, because a fork's branch usually has no upstream counterpart.
+    to origin, because a fork's branch usually has no upstream counterpart. An explicit
+    branch sets ``prefer_upstream=False`` so check and apply select the same fork target.
     """
-    if branch == "main":
+    if prefer_upstream and branch == "main":
         # A local probe (~6 ms) spares non-fork installs a failed network fetch (~0.3-1 s).
         if _git(git_cmd, root, ["remote", "get-url", "upstream"]).returncode == 0:
             fetch_result = _fetch(git_cmd, root, depth_args, "upstream", branch)

@@ -210,6 +210,60 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                 assert git(t.clone, 'remote') == 'origin'
 
 
+@pytest.mark.parametrize('origin_state', ['unchanged', 'advanced', 'missing'])
+@pytest.mark.parametrize('check_only', [False, True])
+def test_explicit_main_stays_on_the_fork_target(update_tree, monkeypatch, origin_state, check_only):
+    """An explicit branch is an origin-only selection, even with a newer upstream main."""
+    from hermes_cli import update_custody
+
+    t = update_tree
+    git(t.clone, 'checkout', '-q', 'main')
+    upstream = t.origin.parent / 'upstream'
+    git(t.origin.parent, 'clone', '-q', str(t.origin), str(upstream))
+    git(t.clone, 'remote', 'add', 'upstream', str(upstream))
+    target = t.base if origin_state == 'unchanged' else t.wanted
+    git(t.origin, 'reset', '--hard', target)
+    if origin_state == 'missing':
+        git(t.origin, 'update-ref', '-d', 'refs/heads/main')
+    t.args.branch, t.args.check, t.args.gateway = 'main', check_only, True
+    monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', _sync_with_upstream_if_needed)
+    calls = []
+    run_git = update_custody.run_git
+
+    def record(git_cmd, args, **kwargs):
+        calls.append(list(args))
+        return run_git(git_cmd, args, **kwargs)
+
+    monkeypatch.setattr(update_custody, 'run_git', record)
+    if origin_state == 'missing':
+        with pytest.raises(SystemExit) as stopped:
+            cli_main.cmd_update(t.args)
+        assert stopped.value.code == 1
+    else:
+        cli_main.cmd_update(t.args)
+
+    assert not [args for args in calls if args[0] == 'fetch' and 'upstream' in args]
+    assert not [args for args in calls if args[0] == 'push']
+    assert not [args for args in calls if args[0] in {'merge', 'pull'} and (
+        'upstream' in args or t.newer in args)]
+    assert git(t.clone, 'rev-parse', 'HEAD') == (t.base if check_only or origin_state == 'missing' else target)
+    assert git(t.clone, 'branch', '--show-current') == 'main'
+    assert not git(t.clone, 'stash', 'list')
+    assert git(upstream, 'rev-parse', 'HEAD') == t.newer
+    if origin_state == 'missing':
+        assert not git(t.origin, 'for-each-ref', '--format=%(objectname)', 'refs/heads/main')
+    else:
+        assert git(t.origin, 'rev-parse', 'HEAD') == target
+    if check_only or origin_state == 'missing':
+        assert not t.requests
+    else:
+        request, = t.requests
+        assert request['expected_sha'] == target
+        assert request['branch'] == 'main'
+        if origin_state == 'unchanged':
+            assert 'official repo not checked' in request['completion_message']
+
+
 @pytest.mark.parametrize('server', ['sha', 'fetch-refused', 'at-release', 'ahead-release', 'explicit-branch'])
 def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, monkeypatch, server):
     """A stable update is pinned to the channel's exact commit: no tag lookup on

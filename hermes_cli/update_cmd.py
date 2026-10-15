@@ -678,6 +678,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
     is_shallow = _check.is_shallow_repository(git_cmd, root)
     fetch_result, compare_branch = _check.fetch_compare_branch(
         git_cmd, root, branch, ["--depth", "1"] if is_shallow else [],
+        prefer_upstream=not branch_explicit,
     )
     if fetch_result.returncode != 0:
         _print_fetch_failure(fetch_result.stderr)
@@ -1385,7 +1386,7 @@ def _apply_parked_branch_guard(
 
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
-    switch_branch, target_ref=None, _windows_gateway_resume):
+    switch_branch, target_ref=None, allow_upstream_sync=True, _windows_gateway_resume):
     """Parked-branch guard, land on the target, stash, count new commits. Exits when the
     checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
     date, -1 when tips differ but the shallow count is unrecoverable."""
@@ -1470,8 +1471,8 @@ def _prepare_checkout_for_update(
     # branch, which returns immediately after: an update that pulled hundreds of upstream commits printed
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
-    upstream_checked = True
-    if commit_count == 0 and is_fork and branch == "main" and not release_tag:
+    upstream_checked = allow_upstream_sync or not is_fork
+    if commit_count == 0 and allow_upstream_sync and is_fork and branch == "main" and not release_tag:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
             upstream_checked = _m()._sync_with_upstream_if_needed(
@@ -1925,10 +1926,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         current_branch = _current_branch_name(git_cmd, check=True)
         _commit.record_run_start(git_cmd, _m().PROJECT_ROOT)
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
+        # An explicit branch selects this fork's target, not an implicit upstream publication.
+        allow_upstream_sync = not getattr(args, "branch", None)
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
-            target_ref=target_ref, _windows_gateway_resume=_windows_gateway_resume)
+            target_ref=target_ref, allow_upstream_sync=allow_upstream_sync, _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
 
         if commit_count == 0:
@@ -1953,7 +1956,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=allow_upstream_sync and is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
         _apply_pulled_update(
