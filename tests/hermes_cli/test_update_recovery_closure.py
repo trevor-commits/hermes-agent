@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import venv
 import zlib
 from pathlib import Path
 
@@ -98,7 +99,11 @@ def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None
     (root / ".git/info/attributes").unlink()
 
     (tmp_path / "bin").mkdir()
-    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", Path(sys.executable),
+    # A missing fixture module must fail import and reach the real closure repair.
+    # The test runner's editable install would otherwise supply it from SOURCE.
+    launcher_env = tmp_path / "launcher-python"
+    venv.EnvBuilder(with_pip=False).create(launcher_env)
+    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", launcher_env / "bin/python",
                                                _launchers._launcher_script("hermes", root, None))
     assert launcher is not None
     return root, env, original, launcher
@@ -236,7 +241,8 @@ def test_the_closure_is_pres_committed_bytes_read_in_one_cat_file_spawn(tmp_path
     for args in (("init", "-q", "-b", "main"), ("add", "-A"),
                  ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "pre")):
         subprocess.run(["git", "-C", str(root), *args], env=env, check=True)
-    pre = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    pre = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                  text=True, encoding="utf-8").strip()
     (root / RECOVERY_CLOSURE[0]).write_bytes(b"# a working-tree edit, never published\n")
     spawns = []
     real = commit.run_git

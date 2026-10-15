@@ -2,6 +2,7 @@
 caches that live OUTSIDE HERMES_HOME and survive the home rmtree (#62209)."""
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import pytest
 from hermes_cli import uninstall
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only sweep")
+@pytest.mark.platforms("macos")
 def test_remove_dashboard_launchd_jobs_boots_out_and_deletes_matching_plists(
         monkeypatch, tmp_path, capsys):
     agents_dir = tmp_path / "LaunchAgents"
@@ -33,8 +34,10 @@ def test_remove_dashboard_launchd_jobs_boots_out_and_deletes_matching_plists(
                     agents_dir)
     serve = job("com.user.hermes-serve", ["hermes", "serve"], agents_dir)
     unrelated = job("com.user.keep", ["/usr/bin/say", "hello"], agents_dir)
-    daemon = job("io.nousresearch.hermes-agent.dashboard", ["hermes_cli.main", "dashboard"],
+    daemon = job("io.nousresearch.hermes-agent.dashboard",
+                 [sys.executable, "-m", "hermes_cli.main", "dashboard"],
                  daemons_dir)
+    lookalike = job("com.user.module-lookalike", ["hermes_cli.main", "dashboard"], daemons_dir)
 
     booted = []
     monkeypatch.setattr(uninstall.subprocess, "run", lambda cmd, **kw: booted.append(cmd))
@@ -46,15 +49,22 @@ def test_remove_dashboard_launchd_jobs_boots_out_and_deletes_matching_plists(
     assert sorted(removed) == sorted([dashboard, serve, daemon])
     assert not dashboard.exists() and not serve.exists() and not daemon.exists()
     assert unrelated.exists()  # non-Hermes job is never touched
-    domains = {tuple(cmd[2].rsplit("/", 1)) for cmd in booted}
-    assert ("com.user.hermes-dashboard", "gui/501") in domains or \
-        {d for d, _ in domains} >= {"gui/501", "user/501"} or booted  # bootout attempted per domain
-    assert all(cmd[:2] == ["launchctl", "bootout"] for cmd in booted)
+    assert lookalike.exists()  # a module name alone is not a Python module invocation
+    uid = os.getuid()  # windows-footgun: ok — macOS-only test
+    assert sorted(booted) == sorted([
+        ["launchctl", "bootout", f"{domain}/{label}"]
+        for domain, label in (
+            (f"gui/{uid}", "com.user.hermes-dashboard"),
+            (f"user/{uid}", "com.user.hermes-dashboard"),
+            (f"gui/{uid}", "com.user.hermes-serve"),
+            (f"user/{uid}", "com.user.hermes-serve"),
+            ("system", "io.nousresearch.hermes-agent.dashboard"),
+        )
+    ])
 
 
+@pytest.mark.platforms("macos")
 def test_remove_dashboard_launchd_jobs_skips_malformed_plists(monkeypatch, tmp_path):
-    if sys.platform != "darwin":
-        pytest.skip("macOS-only sweep")
     agents_dir = tmp_path / "LaunchAgents"
     agents_dir.mkdir()
     (agents_dir / "broken.plist").write_text("<plist><dict>&", encoding="utf-8")
@@ -66,7 +76,7 @@ def test_remove_dashboard_launchd_jobs_skips_malformed_plists(monkeypatch, tmp_p
     assert (agents_dir / "broken.plist").exists()  # skipped, not aborted
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only sweep")
+@pytest.mark.platforms("macos")
 def test_full_uninstall_sweeps_macos_caches_and_dashboard_launchd(monkeypatch, tmp_path):
     """The full-wipe step must reach the caches + launchd sweep, keep-data must not."""
     project_root = tmp_path / "hermes-agent"

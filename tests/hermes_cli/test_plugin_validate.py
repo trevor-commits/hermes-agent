@@ -65,9 +65,10 @@ def test_portable_validation_fails_orphan_and_reports_availability(tmp_path: Pat
     )
     report = validate_plugin_dir(declared)
     assert any(
-        name == "server availability: worker" and ok and detail in {"missing_app", "unsupported_os"}
+        name == "server availability: worker" and ok
+        and detail in {f"missing_app, path {app}", "unsupported_os"}
         for name, ok, detail in report.checks
-    )
+    ), report.checks
 
 
 BASE_MANIFEST = {
@@ -80,7 +81,7 @@ BASE_MANIFEST = {
 def test_requires_hermes_spec_is_validated(tmp_path):
     manifest = dict(BASE_MANIFEST, description="café", requires_hermes=">=0.21")
     d = _make_plugin(tmp_path, manifest=manifest)
-    (d / "plugin.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8-sig")
+    (d / "plugin.yaml").write_bytes(b"\xef\xbb\xbf" + yaml.safe_dump(manifest).encode("utf-8"))
 
     report = validate_plugin_dir(d)
 

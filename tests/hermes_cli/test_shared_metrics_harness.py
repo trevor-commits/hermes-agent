@@ -53,7 +53,8 @@ def test_patch_and_write_file_count_outcome_and_the_strategy_that_landed(direct_
     _handle_patch({"path": str(target), "old_string": "x = 1", "new_string": "x = 2"}, task_id="t")
     _handle_patch({"mode": "patch", "patch": (
         f"*** Begin Patch\n*** Update File: {target}\n@@\n-def f():\n+def g():\n*** End Patch\n")}, task_id="t")
-    assert "return 3" in target.read_text() and "def g" in target.read_text()
+    edited = target.read_text(encoding="utf-8-sig")
+    assert "return 3" in edited and "def g" in edited
 
     rows = _rows(tmp_path, contract.FILE_EDIT_METRIC, "tool", "mode", "outcome", "match_strategy")
     fuzzy = [r for r in rows if r[3] not in {"exact", "none"}]
@@ -115,7 +116,9 @@ def test_foreground_terminal_commands_count_by_kind_and_outcome(direct_runtime, 
     results = [json.loads(terminal_tool(command, task_id="harness", timeout=timeout)) for command, timeout in (
         ("ls /definitely/not/here", 30), ("echo ok", 30), ("sh -c 'exit 124'", 30), ("sleep 5", 1),
     )]
-    assert [r["exit_code"] for r in results] == [2, 0, 124, 124]
+    # BSD and GNU ls use different positive exit codes for a missing path.
+    assert results[0]["exit_code"] > 0
+    assert [r["exit_code"] for r in results[1:]] == [0, 124, 124]
     terminal_tool("true", task_id="harness", _host_local=True)  # Hermes' own control plane: never counted
     rows = _rows(tmp_path, contract.TERMINAL_OUTCOME_METRIC, "backend", "command_kind", "outcome")
     assert rows == sorted([
@@ -252,7 +255,8 @@ def test_everything_is_a_no_op_while_disabled(direct_runtime, tmp_path, monkeypa
 def test_v3_schema_accepts_exactly_the_contract_values():
     from hermes_cli import observability
 
-    schema = json.loads((Path(observability.__file__).parent / "schemas/hermes.shared_metrics.v4.schema.json").read_text())
+    schema = json.loads((Path(observability.__file__).parent / "schemas/hermes.shared_metrics.v4.schema.json")
+                        .read_text(encoding="utf-8-sig"))
     by_name = {d["properties"]["name"]["const"]: d for d in schema["$defs"].values() if "properties" in d}
     for metric in (contract.FILE_EDIT_METRIC, contract.LOOP_GUARD_METRIC, contract.TOOL_RECOVERY_METRIC,
                    contract.TERMINAL_OUTCOME_METRIC, contract.MODEL_REPLY_ISSUE_METRIC):
