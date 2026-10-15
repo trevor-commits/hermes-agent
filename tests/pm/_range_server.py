@@ -101,6 +101,12 @@ class RangeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class _RangeServer(HTTPServer):
+    # Keep requests serial for deterministic pause/progress tests, but admit all eight
+    # downloader connections. The stdlib backlog of five resets queued sockets on macOS.
+    request_queue_size = 16
+
+
 @pytest.fixture
 def dl_server():
     RangeHandler.payloads = {}
@@ -110,7 +116,7 @@ def dl_server():
     RangeHandler.no_range = False
     RangeHandler.etags = True
     RangeHandler.chunk = 1 << 20
-    server = HTTPServer(("127.0.0.1", 0), RangeHandler)
+    server = _RangeServer(("127.0.0.1", 0), RangeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
