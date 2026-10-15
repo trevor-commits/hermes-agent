@@ -249,6 +249,9 @@ class TestSetChannelCLI:
         monkeypatch.setattr(socket.socket, "connect", _denied("socket.connect"))
         # Real root, real filesystem — but a temp one, never the checkout.
         monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path))
+        # The borrowed test interpreter intentionally exercises this root. Keep
+        # native owning-install recovery enabled and declare that selection.
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
 
     def _home(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"

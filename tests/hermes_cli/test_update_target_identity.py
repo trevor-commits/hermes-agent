@@ -56,6 +56,8 @@ def update_tree(tmp_path, monkeypatch):
     newer = git(origin, 'rev-parse', 'HEAD')
 
     monkeypatch.setattr(cli_main, 'PROJECT_ROOT', clone)
+    # The fixture deliberately runs its temporary checkout on the test venv.
+    monkeypatch.setenv('PYTHONPATH', str(clone))
     monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
     monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'release-snapshot')
     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)
@@ -237,15 +239,27 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
         assert cwd in {t.clone, t.origin}, (command, cwd)
         assert 'push' not in command and 'pull' not in command and 'ls-remote' not in command, command
         calls.append(command)
-        if 'fetch' in command and t.wanted in command and server == 'fetch-refused':
-            return subprocess.CompletedProcess(command, 128, stdout='', stderr='fixture: raw SHA wants disabled')
         return run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, 'run', guarded_run)
     if server == 'fetch-refused':
+        # macOS watches fetch via Popen, so subprocess.run is not its boundary.
+        from hermes_cli import update_custody
+        native_run_git = update_custody.run_git
+        refused = []
+
+        def refuse_selected_fetch(git_cmd, args, **kwargs):
+            if args[0] == 'fetch' and t.wanted in args:
+                refused.append(list(args))
+                return subprocess.CompletedProcess([*git_cmd, *args], 128, stdout='',
+                                                   stderr='fixture: raw SHA wants disabled')
+            return native_run_git(git_cmd, args, **kwargs)
+
+        monkeypatch.setattr(update_custody, 'run_git', refuse_selected_fetch)
         with pytest.raises(SystemExit) as error:
             cli_main.cmd_update(t.args)
         assert error.value.code == 1
+        assert refused == [['fetch', '--no-tags', 'origin', t.wanted]]
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
         assert t.resumed
         assert t.requests == []

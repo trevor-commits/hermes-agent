@@ -285,6 +285,8 @@ _ZIP_PARENT = textwrap.dedent('''
     calls = cell / "parent-resume-calls.jsonl"
     from hermes_cli import main as hermes_main, update_cmd, update_inventory, update_receipt
     hermes_main.PROJECT_ROOT = cell / "source"
+    # This disposable source is intentionally selected on the parent's test interpreter.
+    os.environ["PYTHONPATH"] = os.pathsep.join((str(hermes_main.PROJECT_ROOT), os.environ["PYTHONPATH"]))
     receipts = update_receipt._receipt_dir()
     receipts.mkdir(parents=True, exist_ok=True)
     os.environ["PROBE_RECEIPTS"] = str(receipts)

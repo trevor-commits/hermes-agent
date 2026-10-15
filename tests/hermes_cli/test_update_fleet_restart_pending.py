@@ -91,14 +91,15 @@ def _make_head_moved_side_effect(pre_sha=PRE_SHA, post_sha=POST_SHA):
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Isolate machine maintenance while exercising interrupted fleet updates."""
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
-    # The update's git (the commit point's target resolve, the move itself) goes through the custody
-    # runner; off Windows it calls subprocess.run, on Windows a job-bound Popen the fake above
-    # would miss. Fake the runner itself so the seam holds on every OS.
+    # Git's custody boundary can use Popen on Windows and for watched macOS
+    # fetches. Patch that shared boundary so this fleet fixture never runs real Git.
     from hermes_cli import update_custody
 
-    monkeypatch.setattr(update_custody, "run",
-                        lambda argv, *, inherit_lock=False, **kw: run_side_effect(list(argv), **kw))
+    monkeypatch.setattr(update_custody, "run_git",
+                        lambda git_cmd, args, **kw: run_side_effect([*git_cmd, *args], **kw))
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    # Declare the temporary checkout selection to native owning-install recovery.
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setattr(update_cmd, "_prepare_updated_checkout", lambda *a, **k: None)
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")
