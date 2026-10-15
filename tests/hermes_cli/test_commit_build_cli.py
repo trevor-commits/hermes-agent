@@ -36,11 +36,16 @@ def test_sealed_cli_never_checks_or_spawns_updater(payload, tmp_path, args):
     root, source = payload
     home = tmp_path / "home"
     home.mkdir()
-    env = {**os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root)}
+    # The test borrows the checkout's interpreter deliberately. Declare that
+    # choice through PYTHONPATH so owning-install recovery cannot mistake the
+    # sealed payload for an accidentally redirected editable install.
+    env = {
+        **os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root),
+        "PYTHONPATH": os.pathsep.join((str(root), str(source))),
+    }
     # Real imports and parser, no admission mocks. Audit attempts even if a caller swallows the error.
     script = f"""
 import json, sys
-sys.path[:0] = [{str(root)!r}, {str(source)!r}]
 sys.argv = ['hermes', *{args!r}]
 attempts = []
 def audit(event, args):
