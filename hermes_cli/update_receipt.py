@@ -42,7 +42,7 @@ import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1114,6 +1114,50 @@ def row_is_external(row: Any) -> bool:
     return isinstance(row, dict) and row.get("state") == EXTERNAL_STATE
 
 
+def normalize_served_profiles(
+    served_profiles: Any, known_profile_homes: Mapping[str, str | Path],
+) -> list[str] | None:
+    """Normalize a verified owner's roster without trusting names inferred from paths.
+
+    Older gateways publish names; session-authority runtimes publish absolute
+    ``{home, profile_id}`` pairs. Both must describe distinct registered homes.
+    None means absent or unusable coverage, never permission to widen it.
+    """
+    def canonical_home(value):
+        if not isinstance(value, (str, Path)) or not Path(value).is_absolute():
+            raise ValueError("profile home must be absolute")
+        return os.path.normcase(str(Path(value).resolve()))
+
+    if not isinstance(served_profiles, list) or not served_profiles:
+        return None
+    try:
+        by_home = {canonical_home(home): name for name, home in known_profile_homes.items()}
+        if len(by_home) != len(known_profile_homes):
+            return None
+        schema = type(served_profiles[0])
+        if schema not in (str, dict):
+            return None
+        names = []
+        for entry in served_profiles:
+            if type(entry) is not schema:
+                return None
+            if schema is str:
+                name = entry
+            else:
+                if not all(isinstance(entry.get(key), str) for key in ("home", "profile_id")):
+                    return None
+                home = canonical_home(entry["home"])
+                if home != canonical_home(entry["profile_id"]):
+                    return None
+                name = by_home.get(home)
+            if not name or name not in known_profile_homes or name in names:
+                return None
+            names.append(name)
+        return names
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _fleet_row(
     profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any,
     state: str = "unknown", code_root: Optional[Path] = None,
@@ -1184,13 +1228,14 @@ def collect_fleet_versions(
             runtime_status_pid_is_live,
         )
 
-        for profile, home in _profile_homes():
+        profile_homes = dict(_profile_homes())
+        for profile, home in profile_homes.items():
             sock = _socket_identity(home)
             if sock is not None:
                 pid, identity = sock
                 row = _fleet_row(
                     profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha,
-                    served_profiles=identity.get("served_profiles"),
+                    served_profiles=normalize_served_profiles(identity.get("served_profiles"), profile_homes),
                     code_root=_gateway_code_root(pid, home), expected_root=expected_root,
                     self_restart_pending=_pending,
                 )
@@ -1210,7 +1255,7 @@ def collect_fleet_versions(
                 results.append(
                     _fleet_row(
                         profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha,
-                        served_profiles=record.get("served_profiles"),
+                        served_profiles=normalize_served_profiles(record.get("served_profiles"), profile_homes),
                         code_root=_gateway_code_root(pid, home), expected_root=expected_root,
                         self_restart_pending=_pending,
                     )

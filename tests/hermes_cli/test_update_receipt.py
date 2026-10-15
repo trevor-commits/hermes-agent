@@ -379,6 +379,10 @@ class TestFleetClassification:
     def test_current_multiplexer_reports_its_served_profiles(self, monkeypatch, tmp_path):
         """One verified multiplexer is evidence for every profile it serves."""
         sha = "a" * 40
+        home = tmp_path / "fleet_home"
+        monkeypatch.setattr(ur, "_profile_homes", lambda: [
+            ("default", home), ("coder", home / "profiles" / "coder"),
+        ])
         fleet = self._fleet_with(
             monkeypatch,
             tmp_path,
