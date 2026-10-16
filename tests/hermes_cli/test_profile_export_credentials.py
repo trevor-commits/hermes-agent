@@ -10,6 +10,7 @@ The live profile on disk must stay untouched.
 """
 
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,13 @@ from plugins.teams_pipeline.store import DEFAULT_TEAMS_PIPELINE_STORE_FILENAME
 
 # Long enough to match agent.redact prefix patterns (sk- + 10+ chars).
 _LEAKED_KEY = "sk-or-v1-reallyLongSecretKeyValue12345678"
+
+
+@pytest.fixture(autouse=True)
+def _ample_backup_capacity(monkeypatch):
+    """Credential coverage must not depend on the host's current disk pressure."""
+    from hermes_cli import backup_sqlite
+    monkeypatch.setattr(backup_sqlite.shutil, "disk_usage", lambda path: SimpleNamespace(free=1024**4))
 
 
 def _patch_named_profile(monkeypatch, profiles_root, profile_dir):

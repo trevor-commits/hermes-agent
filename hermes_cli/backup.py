@@ -26,7 +26,10 @@ from hermes_state_holders import read_only_db_uri
 
 from agent.provider_media import GENERATED_SUBDIR
 from hermes_cli.archive_safe import normalize_archive_parts
-from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db
+from hermes_cli.backup_sqlite import (
+    BackupCapacityError, BackupInProgressError, _backup_operation_lock, _close_quietly, _safe_copy_db,
+    bounded_backup_walk, estimate_backup_bytes, require_backup_capacity,
+)
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS, profile_root_entry
 from hermes_cli.sizefmt import format_bytes as _format_size
 
@@ -170,51 +173,8 @@ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db", "vault.key", "vault.json.
 _EXTERNAL_PREFIX = "_external/"
 
 
-class BackupInProgressError(RuntimeError):
-    """Raised when another process already owns the Hermes backup slot."""
-
-
 class _SQLiteSnapshotError(RuntimeError):
     pass
-
-
-@contextmanager
-def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
-    """Acquire one cross-process backup slot for full and quick snapshots."""
-    lock_path = hermes_home / ".backup.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
-    acquired = False
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    try:
-        if os.name == "nt":
-            import msvcrt
-            if lock_path.stat().st_size == 0:
-                handle.write(b" ")
-                handle.flush()
-            def _lock_op(flag: int) -> None:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), flag, 1)
-            lock_flag, unlock_flag = msvcrt.LK_NBLCK, msvcrt.LK_UNLCK
-        else:
-            import fcntl
-            def _lock_op(flag: int) -> None:
-                fcntl.flock(handle.fileno(), flag)
-            lock_flag, unlock_flag = fcntl.LOCK_EX | fcntl.LOCK_NB, fcntl.LOCK_UN
-        while not acquired:
-            try:
-                _lock_op(lock_flag)
-                acquired = True
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise BackupInProgressError("another Hermes backup is already running")
-                time.sleep(0.05)
-        yield
-    finally:
-        if acquired:
-            with suppress(OSError):
-                _lock_op(unlock_flag)
-        handle.close()
 
 
 @contextmanager
@@ -278,7 +238,7 @@ def _iter_external_files(base: Path) -> list[Path]:
     if not base.is_dir():
         return []
     files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+    for dirpath, dirnames, filenames in bounded_backup_walk(base):
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
         files.extend(fp for fp in (Path(dirpath) / f for f in filenames)
                      if not (_is_non_regular_path(fp) or fp.name in _EXCLUDED_NAMES
@@ -330,7 +290,7 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update path so they can never drift.
     """
-    for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
+    for dirpath, dirnames, filenames in bounded_backup_walk(hermes_root):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
         kept = [
@@ -548,8 +508,7 @@ _RUN_BACKUP_PREFIX = "hermes-backup-"
 
 
 def _resolve_backup_output_path(output: Optional[str]) -> Path:
-    """Turn ``--output`` (file, directory, or None) into a ``.zip`` path whose parent exists;
-    an unwritable path exits with a one-line error, not a traceback."""
+    """Resolve ``--output`` without creating anything before backup admission."""
     out_path = None
     default_name = f"{_RUN_BACKUP_PREFIX}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
     try:
@@ -561,11 +520,16 @@ def _resolve_backup_output_path(output: Optional[str]) -> Path:
             out_path = Path.home() / default_name
         if out_path.suffix.lower() != ".zip":
             out_path = out_path.with_suffix(out_path.suffix + ".zip")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(f"Error: cannot write backup to {output or out_path}: {exc}")
         raise SystemExit(1) from exc
     return out_path
+
+
+def _full_backup_admission(home: Path, output: Path, external=()) -> None:
+    require_backup_capacity([(home, 0), (output, 0)])
+    sources = [path for path, _ in _iter_backup_files(home, output)] + list(external)
+    require_backup_capacity([(home, 0), (output, estimate_backup_bytes(sources, archive=True))])
 
 
 def _collect_external_entries() -> tuple[list[tuple[Path, str]], list[str]]:
@@ -602,8 +566,14 @@ def run_backup(args) -> bool:
         sys.exit(1)
 
     try:
+        output = _resolve_backup_output_path(args.output)
+        require_backup_capacity([(hermes_root, 0), (output, 0)])
+        _full_backup_admission(hermes_root, output)
         with _backup_operation_lock(hermes_root):
             return _run_backup_locked(args, hermes_root)
+    except BackupCapacityError as exc:
+        print(f"Backup held: {exc}")
+        raise SystemExit(75) from exc
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
@@ -618,6 +588,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     skipped_dirs: set = set()
     files_to_add: list[tuple[Path, Path]] = list(_iter_backup_files(hermes_root, out_path, skipped_dirs))
     external_to_add, skipped_external = _collect_external_entries()
+    require_backup_capacity([(hermes_root, 0), (out_path, estimate_backup_bytes(
+        [p for p, _ in files_to_add + external_to_add], archive=True))])
     if not files_to_add and not external_to_add:
         logger.info("backup phase=scan status=empty duration_ms=%.1f", (time.monotonic() - scan_started) * 1000)
         print("No files to back up.")
@@ -628,6 +600,11 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
                 (time.monotonic() - scan_started) * 1000, file_count)
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Error: cannot write backup to {out_path}: {exc}")
+        raise SystemExit(1) from exc
     errors = []
     t0 = time.monotonic()
 
@@ -1192,13 +1169,13 @@ def _create_prefixed_full_backup(
     if not hermes_root.is_dir():
         return None
     backup_dir = hermes_root / _PRE_UPDATE_BACKUPS_DIR
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        logger.warning("Could not create %s backup dir %s: %s", what, backup_dir, exc)
-        return None
     out_path = backup_dir / f"{prefix}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
-    if _write_full_zip_backup(out_path, hermes_root) is None:
+    try:
+        written = _write_full_zip_backup(out_path, hermes_root)
+    except (BackupCapacityError, OSError) as exc:
+        logger.warning("%s backup held: %s", what, exc)
+        return None
+    if written is None:
         # Incomplete runs publish straight to ``*.incomplete.zip`` (all-failed runs are discarded);
         # cap those salvages at one without letting them rotate complete backups out.
         _prune_incomplete_zips(backup_dir, prefix, prune_what)
@@ -1229,6 +1206,12 @@ def create_pre_migration_backup(
 # Quick state snapshots (used by /snapshot slash command and hermes backup --quick)
 # ---------------------------------------------------------------------------
 
+def _quick_backup_admission(homes: list[Path], max_file_size=None) -> None:
+    require_backup_capacity([(home, 0) for home in homes])
+    require_backup_capacity([(home / _QUICK_SNAPSHOTS_DIR, estimate_backup_bytes(
+        [home / rel for rel in _QUICK_STATE_FILES], max_file_size=max_file_size, quick=True)) for home in homes])
+
+
 def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
@@ -1237,13 +1220,15 @@ def create_quick_snapshot(
 ) -> Optional[str]:
     """Create one atomic quick snapshot while holding the shared backup slot."""
     home = hermes_home or get_hermes_home()
-    with _backup_operation_lock(home):
-        return _create_quick_snapshot_locked(
-            label=label,
-            hermes_home=home,
-            keep=keep,
-            max_file_size=max_file_size,
-        )
+    homes = [home] + ([p for _, p in _sibling_profile_homes(home)] if label == "pre-update" and hermes_home is None else [])
+    try:
+        _quick_backup_admission(homes, max_file_size)
+        with _backup_operation_lock(home):
+            _quick_backup_admission(homes, max_file_size)
+            return _create_quick_snapshot_locked(label, home, keep, max_file_size)
+    except BackupCapacityError as exc:
+        logger.warning("Quick snapshot held: %s", exc)
+        return None
 
 
 def _create_quick_snapshot_locked(
@@ -1272,6 +1257,8 @@ def _create_quick_snapshot_locked(
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+
+    _quick_backup_admission([home], max_file_size)
 
     def _too_large(path: Path, rel_name: str) -> bool:
         """True (and warn) when ``path`` exceeds the max_file_size cap."""
@@ -1831,7 +1818,13 @@ def create_pre_update_snapshots_all_profiles(
     """
     results: dict[str, str] = {}
     home = invoking_home or get_hermes_home()
-    for name, profile_home in _sibling_profile_homes(home):
+    siblings = _sibling_profile_homes(home)
+    try:
+        _quick_backup_admission([p for _, p in siblings], max_file_size)
+    except BackupCapacityError as exc:
+        logger.warning("Sibling snapshots held: %s", exc)
+        return results
+    for name, profile_home in siblings:
         try:
             snap_id = create_quick_snapshot(
                 label="pre-update",
@@ -2099,6 +2092,7 @@ def run_quick_backup(args) -> None:
 def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     """Single-flight wrapper for automatic full zip backups."""
     try:
+        _full_backup_admission(hermes_root, out_path)
         with _backup_operation_lock(hermes_root):
             return _write_full_zip_backup_locked(out_path, hermes_root)
     except BackupInProgressError as exc:
@@ -2116,6 +2110,9 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         return None
     if not files_to_add:
         return None
+    require_backup_capacity([(hermes_root, 0), (out_path, estimate_backup_bytes(
+        [p for p, _ in files_to_add], archive=True))])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("automatic backup phase=scan status=complete duration_ms=%.1f files=%d",
                 (time.monotonic() - scan_started) * 1000, len(files_to_add))
 

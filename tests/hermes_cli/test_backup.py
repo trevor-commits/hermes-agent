@@ -21,11 +21,11 @@ import hermes_cli.gateway_setup_service as service_setup
 
 @pytest.fixture(autouse=True)
 def _no_real_gateway_service(monkeypatch):
-    """run_import() may start an existing gateway service post-restore; tests must
-    never touch the host's systemd/launchd. Individual tests re-patch these to
-    assert the wiring."""
+    """Isolate host capacity and gateway services; tests may override these seams."""
     import hermes_cli.gateway as gateway_mod
+    from hermes_cli import backup_sqlite
 
+    monkeypatch.setattr(backup_sqlite.shutil, "disk_usage", lambda path: Namespace(free=1024**4))
     monkeypatch.setattr(service_setup, "ensure_gateway_service", lambda **kw: False)
     monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
 

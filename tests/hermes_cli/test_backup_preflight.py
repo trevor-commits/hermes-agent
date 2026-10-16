@@ -12,7 +12,9 @@ def test_preflight_captures_committed_wal_without_application_imports(tmp_path):
     db = home / "state.db"
     script = Path(__file__).resolve().parents[2] / "hermes_cli" / "backup_sqlite.py"
     runner = """
-import runpy, sys
+import runpy, sys, shutil
+from types import SimpleNamespace
+shutil.disk_usage = lambda path: SimpleNamespace(free=1024**4)
 class NoApplicationImports:
     def find_spec(self, fullname, path=None, target=None):
         if fullname.startswith(('hermes', 'utils', 'yaml')):
@@ -50,7 +52,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     writer.close()
     previous = sorted(home.glob("state.db.pre-update-emergency-*.bak"))
     db.write_bytes(b"broken database")
-    result = subprocess.run([sys.executable, "-I", "-S", str(script), str(home)], capture_output=True, text=True, timeout=20, check=False)
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", runner, str(script), str(home)], capture_output=True, text=True, timeout=20, check=False)
     assert result.returncode != 0
     assert sorted(home.glob("state.db.pre-update-emergency-*.bak")) == previous
     assert not list(home.glob("*.partial"))

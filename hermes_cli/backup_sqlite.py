@@ -6,16 +6,196 @@ imports cannot load. Full and quick backups use the same SQLite copy operation.
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_T7_ROOT = Path("/Volumes/T7")
+_DISK_GUARD = "/Users/gillettes/.local/bin/disk-guard"
+_T7_RESERVE_BYTES = 200 * 1024**3
+_LOCAL_RESERVE_BYTES = 15 * 1024**3
+_BACKUP_SCAN_MAX_ENTRIES = 250_000
+_BACKUP_SCAN_SECONDS = 15.0
+
+
+class BackupCapacityError(RuntimeError):
+    """Backup admission refused; existing recovery files must remain untouched."""
+
+
+def _verify_backup_volume(device: int) -> None:
+    """Reuse the installed exact-volume verifier without environment overrides."""
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("DISK_GUARD_", "DG_"))}
+    try:
+        result = subprocess.run([_DISK_GUARD, "t7-verify", "--json"],
+                                capture_output=True, text=True, timeout=15, check=False,
+                                env=environment)
+        proof = json.loads(result.stdout)
+        if (result.returncode or not isinstance(proof, dict)
+                or proof.get("verified") is not True or proof.get("root") != str(_T7_ROOT)
+                or proof.get("offload") != str(_T7_ROOT / "Offload")
+                or _T7_ROOT.stat().st_dev != device):
+            raise BackupCapacityError("exact T7 backup destination unavailable")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise BackupCapacityError("exact T7 backup destination unavailable") from exc
+
+
+def require_backup_capacity(writes: list[tuple[Path, int]]) -> None:
+    """Aggregate raw projected usage by destination device before any write."""
+    groups = {}
+    try:
+        local_device = Path.home().stat().st_dev
+        for path, estimate in writes:
+            resolved = path.expanduser().resolve()
+            lexical_t7 = path == _T7_ROOT or _T7_ROOT in path.parents
+            resolved_t7 = resolved == _T7_ROOT or _T7_ROOT in resolved.parents
+            if lexical_t7 and not resolved_t7:
+                raise BackupCapacityError("T7 backup destination escaped its volume")
+            while not resolved.exists():
+                resolved = resolved.parent
+            device = resolved.stat().st_dev
+            anchor, total, on_t7 = groups.get(device, (resolved, 0, False))
+            groups[device] = (anchor, total + estimate, on_t7 or resolved_t7)
+        for device, (anchor, total, on_t7) in groups.items():
+            if on_t7:
+                _verify_backup_volume(device)
+            floor = _T7_RESERVE_BYTES if on_t7 else _LOCAL_RESERVE_BYTES if device == local_device else 0
+            if shutil.disk_usage(anchor).free - total < floor:
+                raise BackupCapacityError(f"backup held: projected raw free space below {floor // 1024**3} GiB reserve")
+    except OSError as exc:
+        raise BackupCapacityError("backup capacity unavailable") from exc
+
+
+def _bounded_backup_names(names, deadline):
+    for name in names:
+        if time.monotonic() >= deadline:
+            raise BackupCapacityError("backup metadata scan exceeded its finite limit")
+        yield name
+
+
+def bounded_backup_walk(root: Path):
+    """Prunable scandir walk with finite metadata work and no ignored read errors."""
+    pending, count = [root], 0
+    deadline = time.monotonic() + _BACKUP_SCAN_SECONDS
+    try:
+        while pending:
+            directory = pending.pop()
+            directories, files = [], []
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    count += 1
+                    if count > _BACKUP_SCAN_MAX_ENTRIES or time.monotonic() >= deadline:
+                        raise BackupCapacityError("backup metadata scan exceeded its finite limit")
+                    (directories if entry.is_dir(follow_symlinks=False) else files).append(entry.name)
+            if time.monotonic() >= deadline:
+                raise BackupCapacityError("backup metadata scan exceeded its finite limit")
+            yield directory, directories, _bounded_backup_names(files, deadline)
+            pending.extend(directory / name for name in reversed(directories))
+    except OSError as exc:
+        raise BackupCapacityError("backup metadata scan incomplete") from exc
+
+
+def _selected_backup_files(source: Path, quick: bool):
+    try:
+        info = source.stat()
+    except FileNotFoundError:
+        if quick:  # Absent optional quick-state paths are normal; selected full files are not.
+            return
+        raise
+    if stat.S_ISDIR(info.st_mode):
+        for directory, dirs, files in bounded_backup_walk(source):
+            if quick:
+                dirs[:] = [name for name in dirs if name not in ("workspaces", "attachments")]
+            yield from (directory / name for name in files)
+    else:
+        yield source
+
+
+def estimate_backup_bytes(paths, *, archive: bool = False, max_file_size=None, quick: bool = False) -> int:
+    """Bound selected copies plus WAL, SQLite staging, and archive overhead."""
+    total = largest_db = count = 0
+    deadline = time.monotonic() + _BACKUP_SCAN_SECONDS
+    try:
+        for source in paths:
+            count += 1
+            if count > _BACKUP_SCAN_MAX_ENTRIES or time.monotonic() >= deadline:
+                raise BackupCapacityError("backup size estimate exceeded its finite limit")
+            for path in _selected_backup_files(source, quick):
+                count += 1
+                if count > _BACKUP_SCAN_MAX_ENTRIES or time.monotonic() >= deadline:
+                    raise BackupCapacityError("backup size estimate exceeded its finite limit")
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                size = info.st_size
+                if max_file_size is not None and size > max_file_size:
+                    continue
+                if path.suffix == ".db":
+                    wal = path.with_name(path.name + "-wal")
+                    with suppress(FileNotFoundError):
+                        size += wal.stat().st_size
+                    size = size * 115 // 100 + 64 * 1024**2
+                    largest_db = max(largest_db, size)
+                total += size + 1024
+    except OSError as exc:
+        raise BackupCapacityError("backup source size unavailable") from exc
+    if time.monotonic() >= deadline:
+        raise BackupCapacityError("backup size estimate exceeded its finite limit")
+    return total * 101 // 100 + (largest_db if archive else 0) + 16 * 1024**2
+
+
+class BackupInProgressError(RuntimeError):
+    """Raised when another process already owns the Hermes backup slot."""
+
+
+@contextmanager
+def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
+    """Acquire one cross-process backup slot for full and quick snapshots."""
+    lock_path = hermes_home / ".backup.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if lock_path.stat().st_size == 0:
+                handle.write(b" ")
+                handle.flush()
+            def _lock_op(flag: int) -> None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), flag, 1)
+            lock_flag, unlock_flag = msvcrt.LK_NBLCK, msvcrt.LK_UNLCK
+        else:
+            import fcntl
+            def _lock_op(flag: int) -> None:
+                fcntl.flock(handle.fileno(), flag)
+            lock_flag, unlock_flag = fcntl.LOCK_EX | fcntl.LOCK_NB, fcntl.LOCK_UN
+        while not acquired:
+            try:
+                _lock_op(lock_flag)
+                acquired = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise BackupInProgressError("another Hermes backup is already running")
+                time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            with suppress(OSError):
+                _lock_op(unlock_flag)
+        handle.close()
+
 
 
 class _SQLiteBackupTimeout(RuntimeError):
@@ -85,6 +265,14 @@ def preflight_state_db(home: Path) -> dict:
     source = home / "state.db"
     if not source.exists():
         return {"path": None, "message": "state.db not found (fresh install?)"}
+    require_backup_capacity([(home, estimate_backup_bytes([source]))])
+    with _backup_operation_lock(home):
+        require_backup_capacity([(home, estimate_backup_bytes([source]))])
+        return _preflight_state_db_locked(home)
+
+
+def _preflight_state_db_locked(home: Path) -> dict:
+    source = home / "state.db"
     prefix = "state.db.pre-update-emergency-"
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
     destination = home / f"{prefix}{stamp}-{os.getpid()}.bak"
