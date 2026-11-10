@@ -30,6 +30,7 @@ import crypto from 'node:crypto'
 import { READY_IN_MERGED_OUTPUT_RE } from './backend-ready'
 import { parseRemoteProfileListing } from './connection-registry'
 import { backendProfileArg } from './profile-id-guard'
+import { REMOTE_PROCESS_ARGV_PY } from './remote-process-argv'
 import { REMOTE_MARKER_GATE_PY } from './remote-update-marker-programs'
 import { assertBootstrapNotSuperseded, withRemoteTimeout } from './ssh-connection'
 
@@ -674,31 +675,25 @@ async function pidIsOurDashboard(
     return false
   }
 
+  const py = value => JSON.stringify(String(value || ''))
+
   const script =
-    'import os,shlex,subprocess,sys\n' +
+    'import os,sys\n' +
+    REMOTE_PROCESS_ARGV_PY + '\n' +
     `pid=${Number(pid)}\n` +
-    `expected=os.path.expanduser(${shq(hermesPath)})\n` +
+    `expected=os.path.expanduser(${py(hermesPath)})\n` +
     // The installer-facing launcher is intentionally preserved for invocation
     // (#74411), but it may `exec python <install-dir>/hermes`, leaving neither
     // launcher nor HERMES_HOME-derived entrypoint in argv. The ownership-scoped
     // token path + random nonce + exact profile below are the alternative proof.
-    `hermes_home=os.path.expanduser(${shq(hermesHome)}) if ${shq(hermesHome)} else ""\n` +
+    `hermes_home=os.path.expanduser(${py(hermesHome)}) if ${py(hermesHome)} else ""\n` +
     'expected_entries={expected}\n' +
     'if hermes_home:\n' +
     ' expected_entries.add(os.path.join(hermes_home,"hermes-agent","venv","bin","hermes"))\n' +
-    `expected_token=os.path.expanduser(${shq(ownershipId ? spawnTokenPath(ownershipId, spawnNonce) : '')})\n` +
-    `expected_profile=${shq(profile)}\n` +
-    `nonce=${shq(spawnNonce)}\n` +
-    'try:\n' +
-    ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
-    ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
-    'except OSError:\n' +
-    ' try:\n' +
-    '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
-    ' except subprocess.CalledProcessError:\n' +
-    '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
-    '  print("FOREIGN");sys.exit(0)\n' +
-    ' args=shlex.split(line)\n' +
+    `expected_token=os.path.expanduser(${py(ownershipId ? spawnTokenPath(ownershipId, spawnNonce) : '')})\n` +
+    `expected_profile=${py(profile)}\n` +
+    `nonce=${py(spawnNonce)}\n` +
+    'args=process_argv(pid)\n' +
     'ok=False\n' +
     'try:\n' +
     // A profile literally named "serve" puts the value token before the
@@ -881,7 +876,8 @@ function buildOwnedTerminationCommand(lock, ownershipId) {
   const expectedToken = spawnTokenPath(ownershipId, lock.spawnNonce)
 
   const script = `
-import os,select,shlex,signal,subprocess,sys,time
+import os,select,signal,subprocess,sys,time
+${REMOTE_PROCESS_ARGV_PY}
 pid=${pid}
 expected_creation=${py(lock.creationTime)}
 expected_path=os.path.expanduser(${py(lock.hermesPath)})
@@ -904,27 +900,14 @@ def creation():
   except (OSError,subprocess.CalledProcessError):return ""
  return ""
 
-def argv():
- try:
-  raw=open(f"/proc/{pid}/cmdline","rb").read()
-  return [part.decode("utf-8","surrogateescape") for part in raw.split(b"\\0") if part]
- except OSError:
-  try:return shlex.split(subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip())
-  except (OSError,subprocess.CalledProcessError,ValueError):return []
-
 def identity_before_signal():
- # Darwin's lstart has one-second resolution. Read the start time and the
- # complete argv in one ps call immediately before signalling; the random
- # ownership nonce is the discriminator for a same-second PID reuse. A
- # same-second reuse with a forged/repeated nonce remains a residual limitation.
+ # Bracket the kernel argv read with creation-time checks. Darwin's lstart
+ # remains second-resolution; its signal path below still refuses PID reuse risk.
  if sys.platform=="darwin":
-  try:
-   line=subprocess.check_output(["ps","-ww","-p",str(pid),"-o","lstart=","-o","command="],text=True).strip()
-   prefix=expected_creation.removeprefix("darwin:")
-   if not prefix or not line.startswith(prefix):return "",[]
-   return "darwin:"+prefix,shlex.split(line[len(prefix):].strip())
-  except (OSError,subprocess.CalledProcessError,ValueError):return "",[]
- return creation(),argv()
+  before=creation()
+  args=process_argv(pid)
+  return (before,args) if before and creation()==before else ("",[])
+ return creation(),process_argv(pid)
 
 def owned(args):
  try:
