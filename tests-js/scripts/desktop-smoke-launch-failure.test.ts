@@ -30,7 +30,11 @@ test('an app that dies before Playwright attaches leaves a failed receipt carryi
     expect(receipt.status).toBe('failed')
     expect(receipt.error).toContain('Process failed to launch!')
     expect(receipt.error).toMatch(/<process did exit: exitCode=[1-9]\d*/)
-    expect(receipt.error).toMatch(/\]\[err\] .*bad option: --no-sandbox/)
+    // The first rejected Chromium switch varies by host. Its stderr must
+    // survive, and the recorded launch must contain that same rejected flag.
+    const rejectedFlag = String(receipt.error).match(/\]\[err\] .*bad option: (\S+)/)?.[1]
+    expect(rejectedFlag).toBeTruthy()
+    expect(String(receipt.error).split('\n').find(line => line.includes('<launching>'))).toContain(rejectedFlag)
   } finally {
     fs.rmSync(work, { recursive: true, force: true })
   }
