@@ -169,7 +169,7 @@ def cancel_background_review_for_live_turn(
 
 # Aux-model routing: by default ("auto") the fork runs on the MAIN model and replays the full
 # conversation as warm cache reads. When auxiliary.background_review.{provider,model} routes it
-# to a DIFFERENT model the cache is cold anyway, so the fork replays a compact digest instead.
+# to a DIFFERENT model the cache is cold, but reviews retain the same complete snapshot.
 _REVIEW_MAX_ITERATIONS = 16
 # Aggregate INPUT-token budget for one review fork (checked in conversation_loop's
 # ``_review_input_budget_exhausted``). Request #1 replays the full snapshot as a warm cache read
@@ -984,8 +984,8 @@ def build_cache_parity_fork(
     runtime/credentials as the parent, byte-identical system prompt / tools[] / reasoning config on
     the same-model path, shared session_id for prefix warmth, full persistence detachment (no
     state.db writes, rotation, or external memory providers; in-place-only compaction). Returns
-    ``(fork_agent, runtime_dict, routed)``; ``routed`` means a different model (cache cold —
-    replay a digest). The caller owns registration, whitelisting, running, usage attribution and
+    ``(fork_agent, runtime_dict, routed)``; ``routed`` means a different model (cache cold).
+    The caller chooses the history and owns registration, whitelisting, usage attribution and
     teardown."""
     from run_agent import AIAgent  # local: avoids a circular import at load
     # Inherit the parent's live runtime: AIAgent.__init__'s env auto-resolution fails for
@@ -1222,14 +1222,14 @@ def _run_review_fork(
         _reset_background_review_read_marks()
     try:
         if review_run is None or review_run.begin_request(st.review_agent):
-            # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
+            # Preserve available facts and tool payloads even when the review model differs.
             st.review_agent.run_conversation(
                 user_message=(
                     prompt + "\n\nYou can only call " + memory_phrase_prompt +
                     "management tools. Other tools will be denied "
                     "at runtime — do not attempt them." + prompt_extra
                 ),
-                conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
+                conversation_history=messages_snapshot,
             )
     finally:
         clear_thread_tool_whitelist()
